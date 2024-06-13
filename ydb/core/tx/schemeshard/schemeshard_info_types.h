@@ -2365,6 +2365,8 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
         alterData->IndexKeys.assign(config.GetKeyColumnNames().begin(), config.GetKeyColumnNames().end());
         Y_ABORT_UNLESS(alterData->IndexKeys.size());
         alterData->IndexDataColumns.assign(config.GetDataColumnNames().begin(), config.GetDataColumnNames().end());
+        Y_ABORT_UNLESS(alterData->IndexDataColumns.empty() || config.GetType() != NKikimrSchemeOp::EIndexType::EIndexTypeGlobalVector);
+
         alterData->State = config.HasState() ? config.GetState() : EState::EIndexStateReady;
 
         return result;

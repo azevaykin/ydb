@@ -970,6 +970,7 @@ enum EIndexType {
     EIndexTypeGlobal = 1;
     EIndexTypeGlobalAsync = 2;
     EIndexTypeGlobalUnique = 3;
+    EIndexTypeGlobalVector = 4;
 }
 
 enum EIndexState {
@@ -1848,6 +1849,7 @@ enum EPathSubType {
     EPathSubTypeSyncIndexImplTable = 1;
     EPathSubTypeAsyncIndexImplTable = 2;
     EPathSubTypeStreamImpl = 3;
+    EPathSubTypeVectorIndexImplTable = 4;
 }
 
 enum EPathState {

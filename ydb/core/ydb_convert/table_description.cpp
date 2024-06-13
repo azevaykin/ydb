@@ -860,6 +860,9 @@ void FillIndexDescriptionImpl(TYdbProto& out,
         case NKikimrSchemeOp::EIndexType::EIndexTypeGlobalUnique:
             FillGlobalIndexSettings(*index->mutable_global_unique_index()->mutable_settings(), tableIndex, splitKeyType);
             break;
+        case NKikimrSchemeOp::EIndexType::EIndexTypeGlobalVector:
+            *index->mutable_global_vector_index() = Ydb::Table::GlobalVectorIndex();
+            break;
         default:
             break;
         };
