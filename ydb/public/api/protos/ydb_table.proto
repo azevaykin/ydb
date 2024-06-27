@@ -93,9 +93,7 @@ message GlobalVectorIndex {
     }
 
     Type type = 1;
-
     Distance distance = 2;
-
     Quantization quantization = 3;
 }
 

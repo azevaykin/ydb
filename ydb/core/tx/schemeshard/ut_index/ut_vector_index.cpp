@@ -30,6 +30,9 @@ Y_UNIT_TEST_SUITE(TVectorIndexTests) {
               Name: "idx_vector"
               KeyColumnNames: ["embedding"]
               Type: EIndexTypeGlobalVector
+              VectorIndexDescription {
+                Type: TYPE_CLUSTERS
+              }             
             }
         )");
         env.TestWaitNotification(runtime, txId);
@@ -38,7 +41,9 @@ Y_UNIT_TEST_SUITE(TVectorIndexTests) {
             { NLs::PathExist,
               NLs::IndexType(NKikimrSchemeOp::EIndexTypeGlobalVector),
               NLs::IndexState(NKikimrSchemeOp::EIndexStateReady),
-              NLs::IndexKeys({"embedding"}) });
+              NLs::IndexKeys({"embedding"}),
+              NLs::VectorIndexDescription(Ydb::Table::GlobalVectorIndex::TYPE_CLUSTERS),
+            });
 
         TestDescribeResult(DescribePrivatePath(runtime, "/MyRoot/vectors/idx_vector/indexImplTable"),
             { NLs::PathExist,

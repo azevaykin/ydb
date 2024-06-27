@@ -2369,6 +2369,10 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
 
         alterData->State = config.HasState() ? config.GetState() : EState::EIndexStateReady;
 
+        if (config.GetType() == NKikimrSchemeOp::EIndexType::EIndexTypeGlobalVector) {
+            alterData->VectorIndexDescription = config.GetVectorIndexDescription();
+        }
+
         return result;
     }
 
@@ -2380,6 +2384,8 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
     TVector<TString> IndexDataColumns;
 
     TTableIndexInfo::TPtr AlterData = nullptr;
+
+    NKikimrSchemeOp::TVectorIndexDescription VectorIndexDescription;
 };
 
 struct TCdcStreamInfo : public TSimpleRefCount<TCdcStreamInfo> {

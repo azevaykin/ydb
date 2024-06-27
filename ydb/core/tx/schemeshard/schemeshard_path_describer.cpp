@@ -1250,6 +1250,12 @@ void TSchemeShard::DescribeTableIndex(const TPathId& pathId, const TString& name
     ) {
         *entry.MutableExplicitPartitions()->MutableSplitBoundary() = explicitPartitions;
     }
+
+    if (indexInfo->Type == NKikimrSchemeOp::EIndexTypeGlobalVector) {
+        auto& vectorIndexDescription = *entry.MutableVectorIndexDescription();
+        vectorIndexDescription.SetType(indexInfo->VectorIndexDescription.GetType());
+    }
+    
 }
 
 void TSchemeShard::DescribeCdcStream(const TPathId& pathId, const TString& name,
