@@ -117,28 +117,51 @@ namespace NTypeAnnImpl {
         bool isValid;
         if (atomNode.Flags() & TNodeFlags::BinaryContent) {
             // just deserialize
-            switch (sizeof(T)) {
-            case sizeof(ui16): {
+            switch (slot) {
+            case NKikimr::NUdf::EDataSlot::Date: {
                 ui16 value;
                 ui16 tzId;
                 isValid = NKikimr::NMiniKQL::DeserializeTzDate(atomNode.Content(), value, tzId);
                 plainValue = SerializeTzComponents(isValid, value, tzId);
                 break;
             }
-            case sizeof(ui32): {
+            case NKikimr::NUdf::EDataSlot::Datetime: {
                 ui32 value;
                 ui16 tzId;
                 isValid = NKikimr::NMiniKQL::DeserializeTzDatetime(atomNode.Content(), value, tzId);
                 plainValue = SerializeTzComponents(isValid, value, tzId);
                 break;
             }
-            case sizeof(ui64): {
+            case NKikimr::NUdf::EDataSlot::Timestamp: {
                 ui64 value;
                 ui16 tzId;
                 isValid = NKikimr::NMiniKQL::DeserializeTzTimestamp(atomNode.Content(), value, tzId);
                 plainValue = SerializeTzComponents(isValid, value, tzId);
                 break;
             }
+            case NKikimr::NUdf::EDataSlot::Date32: {
+                i32 value;
+                ui16 tzId;
+                isValid = NKikimr::NMiniKQL::DeserializeTzDate32(atomNode.Content(), value, tzId);
+                plainValue = SerializeTzComponents(isValid, value, tzId);
+                break;
+            }
+            case NKikimr::NUdf::EDataSlot::Datetime64: {
+                i64 value;
+                ui16 tzId;
+                isValid = NKikimr::NMiniKQL::DeserializeTzDatetime64(atomNode.Content(), value, tzId);
+                plainValue = SerializeTzComponents(isValid, value, tzId);
+                break;
+            }
+            case NKikimr::NUdf::EDataSlot::Timestamp64: {
+                i64 value;
+                ui16 tzId;
+                isValid = NKikimr::NMiniKQL::DeserializeTzTimestamp64(atomNode.Content(), value, tzId);
+                plainValue = SerializeTzComponents(isValid, value, tzId);
+                break;
+            }
+            default:
+                Y_ENSURE(false, "Unknown data slot:" << slot);
             }
         } else {
             TStringBuf atom = atomNode.Content();
@@ -740,6 +763,18 @@ namespace NTypeAnnImpl {
                 }
             } else if (input->Content() == "Interval64") {
                 if (!IsValidSmallData<i64>(input->Head(), input->Content(), ctx.Expr, NKikimr::NUdf::EDataSlot::Interval64, textValue)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+            } else if (input->Content() == "TzDate32") {
+                if (!IsValidTzData<i32>(input->Head(), input->Content(), ctx.Expr, NKikimr::NUdf::EDataSlot::Date32, textValue)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+            } else if (input->Content() == "TzDatetime64") {
+                if (!IsValidTzData<i64>(input->Head(), input->Content(), ctx.Expr, NKikimr::NUdf::EDataSlot::Datetime64, textValue)) {
+                    return IGraphTransformer::TStatus::Error;
+                }
+            } else if (input->Content() == "TzTimestamp64") {
+                if (!IsValidTzData<i64>(input->Head(), input->Content(), ctx.Expr, NKikimr::NUdf::EDataSlot::Timestamp64, textValue)) {
                     return IGraphTransformer::TStatus::Error;
                 }
             } else if (input->Content() == "Uuid") {
@@ -2714,7 +2749,9 @@ namespace NTypeAnnImpl {
                 if (!(*dataTypeOne == *dataTypeTwo)) {
                     ctx.Expr.AddError(TIssue(
                         ctx.Expr.GetPosition(input->Pos()),
-                        TStringBuilder() << "Cannot calculate with different decimals."
+                        TStringBuilder() << "Cannot calculate with different decimals: " 
+                            << static_cast<const TTypeAnnotationNode&>(*dataType[0]) << " != " 
+                            << static_cast<const TTypeAnnotationNode&>(*dataType[1])
                     ));
 
                     return IGraphTransformer::TStatus::Error;
@@ -3532,27 +3569,50 @@ namespace NTypeAnnImpl {
     }
 
     IGraphTransformer::TStatus UntagWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
-        Y_UNUSED(output);
         if (!EnsureArgsCount(*input, 2, ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
 
-        if (!EnsureTaggedType(input->Head(), ctx.Expr)) {
-            return IGraphTransformer::TStatus::Error;
+        if (IsNull(input->Head())) {
+            output = input->HeadPtr();
+            return IGraphTransformer::TStatus::Repeat;
+        }
+
+        const TTaggedExprType* taggedType;
+        bool isOptional;
+        if (input->Head().GetTypeAnn() && input->Head().GetTypeAnn()->GetKind() == ETypeAnnotationKind::Optional) {
+            auto itemType = input->Head().GetTypeAnn()->Cast<TOptionalExprType>()->GetItemType();
+            if (!EnsureTaggedType(input->Head().Pos(), *itemType, ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+
+            taggedType = itemType->Cast<TTaggedExprType>();
+            isOptional = true;
+        } else {
+            if (!EnsureTaggedType(input->Head(), ctx.Expr)) {
+                return IGraphTransformer::TStatus::Error;
+            }
+
+            taggedType = input->Head().GetTypeAnn()->Cast<TTaggedExprType>();
+            isOptional = false;
         }
 
         if (!EnsureAtom(input->Tail(), ctx.Expr)) {
             return IGraphTransformer::TStatus::Error;
         }
 
-        auto tagType = input->Head().GetTypeAnn()->Cast<TTaggedExprType>();
-        if (tagType->GetTag() != input->Tail().Content()) {
+        if (taggedType->GetTag() != input->Tail().Content()) {
             ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Tail().Pos()), TStringBuilder() <<
-                "Expected tag: " << tagType->GetTag() << ", but got: " << input->Tail().Content()));
+                "Expected tag: " << taggedType->GetTag() << ", but got: " << input->Tail().Content()));
             return IGraphTransformer::TStatus::Error;
         }
 
-        input->SetTypeAnn(tagType->GetBaseType());
+        if (isOptional) {
+            input->SetTypeAnn(ctx.Expr.MakeType<TOptionalExprType>(taggedType->GetBaseType()));
+        } else {
+            input->SetTypeAnn(taggedType->GetBaseType());
+        }
+
         return IGraphTransformer::TStatus::Ok;
     }
 
@@ -4370,6 +4430,16 @@ namespace NTypeAnnImpl {
             << *sourceType << " into " << *targetType));
 
         return IGraphTransformer::TStatus::Error;
+    }
+
+    IGraphTransformer::TStatus VersionWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TExtContext& ctx) {
+        Y_UNUSED(output);
+        if (!EnsureArgsCount(*input, 0, ctx.Expr)) {
+            return IGraphTransformer::TStatus::Error;
+        }
+
+        input->SetTypeAnn(ctx.Expr.MakeType<TDataExprType>(NKikimr::NUdf::EDataSlot::String));
+        return IGraphTransformer::TStatus::Ok;
     }
 
     IGraphTransformer::TStatus WidenIntegralWrapper(const TExprNode::TPtr& input, TExprNode::TPtr& output, TContext& ctx) {
@@ -11030,7 +11100,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
 
             const auto handlerSlot = dataType->GetSlot();
             const auto castResult = GetCastResult(handlerSlot, resultSlot);
-            if (!castResult.Defined() || *castResult == NUdf::ECastOptions::Impossible) {
+            if (*castResult & NUdf::ECastOptions::Impossible) {
                 ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(node.Pos()),
                     TStringBuilder() << "Cannot cast type of case handler " << handlerSlot << " to the returning type of JSON_VALUE " << resultSlot));
                 return false;
@@ -11825,7 +11895,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         auto resultType = ctx.Expr.MakeType<TOptionalExprType>(dstType);
 
         const auto cast = NUdf::GetCastResult(sSlot, tSlot);
-        if (!cast) {
+        if (*cast & NUdf::ECastOptions::Impossible) {
             ctx.Expr.AddError(TIssue(ctx.Expr.GetPosition(input->Pos()),
                 TStringBuilder() << "Unsupported types in rounding: " << *srcType << " " << input->Content() << " to " << *dstType));
             return IGraphTransformer::TStatus::Error;
@@ -12292,6 +12362,9 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         Functions["RowNumber"] = &WinRowNumberWrapper;
         Functions["Rank"] = &WinRankWrapper;
         Functions["DenseRank"] = &WinRankWrapper;
+        Functions["PercentRank"] = &WinRankWrapper;
+        Functions["CumeDist"] = &WinCumeDistWrapper;
+        Functions["NTile"] = &WinNTileWrapper;
         Functions["Ascending"] = &PresortWrapper;
         Functions["Descending"] = &PresortWrapper;
         Functions["IsKeySwitch"] = &IsKeySwitchWrapper;
@@ -12621,6 +12694,7 @@ template <NKikimr::NUdf::EDataSlot DataSlot>
         ExtFunctions["UnionPositional"] = &UnionAllPositionalWrapper;
         ExtFunctions["SafeCast"] = &CastWrapper<false>;
         ExtFunctions["StrictCast"] = &CastWrapper<true>;
+        ExtFunctions["Version"] = &VersionWrapper;
 
         ExtFunctions["Aggregate"] = &AggregateWrapper;
         ExtFunctions["AggregateCombine"] = &AggregateWrapper;

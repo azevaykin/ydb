@@ -40,7 +40,7 @@ To restart a specific host or subset of hosts, use the `--limit` argument:
 
 ```bash
 ansible-playbook ydb_platform.ydb.restart --limit='<hostname>'
-ansible-playbook ydb_platform.ydb.restart --limit='<hostname-1,hosntname-2>'
+ansible-playbook ydb_platform.ydb.restart --limit='<hostname-1,hostname-2>'
 ```
 
 It can be used together with tags, too:
@@ -50,6 +50,6 @@ ansible-playbook ydb_platform.ydb.restart --tags database --limit='<hostname>'
 
 ## Restart nodes manually
 
-The [ydbops](https://github.com/ydb-platform/ydbops) tool properly implements various {{ ydb-short-name }}cluster manipulations, including restarts. The `ydb_platform.ydb.restart` playbook explained above uses it behind the scenes, but it can be used manually, too.
+The [ydbops](https://github.com/ydb-platform/ydbops) tool properly implements various {{ ydb-short-name }} cluster manipulations, including restarts. The `ydb_platform.ydb.restart` playbook explained above uses it behind the scenes, but it can be used manually, too.
 
 There are more guidelines and information on how this works in the [{#T}](../manual/maintenance-without-downtime.md) article.

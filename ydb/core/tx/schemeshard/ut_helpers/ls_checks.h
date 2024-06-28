@@ -93,6 +93,7 @@ namespace NLs {
     void IsExternalTable(const NKikimrScheme::TEvDescribeSchemeResult& record);
     void IsExternalDataSource(const NKikimrScheme::TEvDescribeSchemeResult& record);
     void IsView(const NKikimrScheme::TEvDescribeSchemeResult& record);
+    void IsResourcePool(const NKikimrScheme::TEvDescribeSchemeResult& record);
     TCheckFunc CheckColumns(const TString& name, const TSet<TString>& columns, const TSet<TString>& droppedColumns, const TSet<TString> keyColumns,
                             NKikimrSchemeOp::EPathState pathState = NKikimrSchemeOp::EPathState::EPathStateNoChanges);
     void CheckBoundaries(const NKikimrScheme::TEvDescribeSchemeResult& record);
@@ -171,9 +172,13 @@ namespace NLs {
         bool Value = false;
     };
 
-    void HasOffloadConfigBase(const NKikimrScheme::TEvDescribeSchemeResult& record, TInverseTag inverse);
-    inline void HasOffloadConfig(const NKikimrScheme::TEvDescribeSchemeResult& record) { return HasOffloadConfigBase(record, {}); };
-    inline void HasNotOffloadConfig(const NKikimrScheme::TEvDescribeSchemeResult& record) { return HasOffloadConfigBase(record, {.Value = true}); };
+    void HasOffloadConfigBase(const NKikimrScheme::TEvDescribeSchemeResult& record, const TString* const config, TInverseTag inverse);
+    inline TCheckFunc HasOffloadConfig(TString config) {
+        return [config] (const NKikimrScheme::TEvDescribeSchemeResult& record) {
+            return HasOffloadConfigBase(record, config ? &config : nullptr, {});
+        };
+    }
+    inline void HasNotOffloadConfig(const NKikimrScheme::TEvDescribeSchemeResult& record) { return HasOffloadConfigBase(record, nullptr, {.Value = true}); }
 
     template<class TCheck>
     void PerformAllChecks(const NKikimrScheme::TEvDescribeSchemeResult& result, TCheck&& check) {

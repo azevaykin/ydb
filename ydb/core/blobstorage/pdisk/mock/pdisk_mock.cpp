@@ -271,14 +271,14 @@ struct TPDiskMockState::TImpl {
 
     void SetReadOnly(const TVDiskID& vDiskId, bool isReadOnly) {
         if (isReadOnly) {
-            ReadOnlyVDisks.insert(vDiskId.GroupID);
+            ReadOnlyVDisks.insert(vDiskId.GroupID.GetRawId());
         } else {
-            ReadOnlyVDisks.erase(vDiskId.GroupID);
+            ReadOnlyVDisks.erase(vDiskId.GroupID.GetRawId());
         }
     }
 
     bool IsReadOnly(const TVDiskID& vDiskId) const {
-        return ReadOnlyVDisks.contains(vDiskId.GroupID);
+        return ReadOnlyVDisks.contains(vDiskId.GroupID.GetRawId());
     }
 };
 
@@ -427,7 +427,7 @@ public:
             const ui64 bulkWriteBlockSize = 65536;
             res = std::make_unique<NPDisk::TEvYardInitResult>(NKikimrProto::OK, seekTimeUs, readSpeedBps, writeSpeedBps,
                 readBlockSize, writeBlockSize, bulkWriteBlockSize, Impl.ChunkSize, Impl.AppendBlockSize, ownerId,
-                owner->OwnerRound, GetStatusFlags(), std::move(ownedChunks), TString());
+                owner->OwnerRound, GetStatusFlags(), std::move(ownedChunks), NPDisk::DEVICE_TYPE_NVME, TString());
             res->StartingPoints = owner->StartingPoints;
         } else {
             res = std::make_unique<NPDisk::TEvYardInitResult>(NKikimrProto::INVALID_ROUND, "invalid owner round");
