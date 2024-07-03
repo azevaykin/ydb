@@ -10,7 +10,7 @@ import ydb.public.api.protos.draft.fq_pb2 as fq
 import ydb.public.api.protos.ydb_value_pb2 as ydb
 import ydb.tests.library.common.yatest_common as yatest_common
 from ydb.tests.tools.datastreams_helpers.test_yds_base import TestYdsBase
-from ydb.tests.tools.fq_runner.kikimr_utils import yq_v1, yq_all
+from ydb.tests.tools.fq_runner.kikimr_utils import yq_v1, yq_v2, yq_all
 
 
 class TestS3(TestYdsBase):
@@ -18,12 +18,8 @@ class TestS3(TestYdsBase):
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_csv(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("fbucket")
@@ -31,10 +27,7 @@ class TestS3(TestYdsBase):
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         fruits = '''Fruit,Price,Weight
@@ -84,14 +77,11 @@ Pear,15,33'''
         assert result_set.rows[2].items[2].int32_value == 33
         assert sum(kikimr.control_plane.get_metering(1)) == 10
 
-    @yq_all
+    @yq_v2
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
-    def test_csv_with_hopping(self, kikimr, s3, client, unique_prefix):
+    def test_inference(self, kikimr, s3, client, unique_prefix):
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("fbucket")
@@ -99,10 +89,67 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
+        )
+
+        fruits = '''Fruit,Price,Weight,Date
+Banana,3,100,2024-01-02
+Apple,2,22,2024-03-04
+Pear,15,33,2024-05-06'''
+        s3_client.put_object(Body=fruits, Bucket='fbucket', Key='fruits.csv', ContentType='text/plain')
+        kikimr.control_plane.wait_bootstrap(1)
+        storage_connection_name = unique_prefix + "fruitbucket"
+        client.create_storage_connection(storage_connection_name, "fbucket")
+
+        sql = f'''
+            SELECT *
+            FROM `{storage_connection_name}`.`fruits.csv`
+            WITH (format=csv_with_names, with_infer='true');
+            '''
+
+        query_id = client.create_query("simple", sql, type=fq.QueryContent.QueryType.ANALYTICS).result.query_id
+        client.wait_query_status(query_id, fq.QueryMeta.COMPLETED)
+
+        data = client.get_result_data(query_id)
+        result_set = data.result.result_set
+        logging.debug(str(result_set))
+        assert len(result_set.columns) == 4
+        assert result_set.columns[0].name == "Date"
+        assert result_set.columns[0].type.type_id == ydb.Type.DATE
+        assert result_set.columns[1].name == "Fruit"
+        assert result_set.columns[1].type.type_id == ydb.Type.UTF8
+        assert result_set.columns[2].name == "Price"
+        assert result_set.columns[2].type.type_id == ydb.Type.INT64
+        assert result_set.columns[3].name == "Weight"
+        assert result_set.columns[3].type.type_id == ydb.Type.INT64
+        assert len(result_set.rows) == 3
+        assert result_set.rows[0].items[0].uint32_value == 19724
+        assert result_set.rows[0].items[1].text_value == "Banana"
+        assert result_set.rows[0].items[2].int64_value == 3
+        assert result_set.rows[0].items[3].int64_value == 100
+        assert result_set.rows[1].items[0].uint32_value == 19786
+        assert result_set.rows[1].items[1].text_value == "Apple"
+        assert result_set.rows[1].items[2].int64_value == 2
+        assert result_set.rows[1].items[3].int64_value == 22
+        assert result_set.rows[2].items[0].uint32_value == 19849
+        assert result_set.rows[2].items[1].text_value == "Pear"
+        assert result_set.rows[2].items[2].int64_value == 15
+        assert result_set.rows[2].items[3].int64_value == 33
+        assert sum(kikimr.control_plane.get_metering(1)) == 10
+
+    @yq_all
+    @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
+    def test_csv_with_hopping(self, kikimr, s3, client, unique_prefix):
+        resource = boto3.resource(
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
+        )
+
+        bucket = resource.Bucket("fbucket")
+        bucket.create(ACL='public-read')
+        bucket.objects.all().delete()
+
+        s3_client = boto3.client(
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         fruits = '''Time,Fruit,Price
@@ -140,12 +187,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_raw(self, kikimr, s3, client, runtime_listing, yq_version, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("rbucket")
@@ -153,10 +196,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         s3_client.put_object(Body="text1", Bucket='rbucket', Key='file1.txt', ContentType='text/plain')
@@ -203,12 +243,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("kikimr_params", [{"raw": 3, "": 4}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_limit(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("lbucket")
@@ -216,10 +252,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         s3_client.put_object(Body="text1", Bucket='lbucket', Key='file1.txt', ContentType='text/plain')
@@ -241,7 +274,9 @@ Pear,15,33'''
 
         query_id = client.create_query("simple", sql).result.query_id
         client.wait_query_status(query_id, fq.QueryMeta.FAILED)
-        assert "Size of object file1.txt = 5 and exceeds limit = 3 specified for format raw" in str(client.describe_query(query_id).result)
+        assert "Size of object file1.txt = 5 and exceeds limit = 3 specified for format raw" in str(
+            client.describe_query(query_id).result
+        )
 
         sql = f'''
             pragma s3.UseRuntimeListing="{runtime_listing}";
@@ -255,18 +290,16 @@ Pear,15,33'''
 
         query_id = client.create_query("simple", sql).result.query_id
         client.wait_query_status(query_id, fq.QueryMeta.FAILED)
-        assert "Size of object file1.txt = 5 and exceeds limit = 4 specified for format csv_with_names" in str(client.describe_query(query_id).result)
+        assert "Size of object file1.txt = 5 and exceeds limit = 4 specified for format csv_with_names" in str(
+            client.describe_query(query_id).result
+        )
 
     @yq_all
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_bad_format(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("bbucket")
@@ -274,10 +307,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         s3_client.put_object(Body="blah blah blah", Bucket='bbucket', Key='file1.txt', ContentType='text/plain')
@@ -301,17 +331,11 @@ Pear,15,33'''
     def test_checkpoints_on_join_s3_with_yds(self, kikimr, s3, client, unique_prefix):
         # Prepare S3
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket_name = "join_s3_with_yds"
@@ -436,10 +460,7 @@ Pear,15,33'''
     @pytest.mark.parametrize("kikimr_params", [{"compute": 3}], indirect=True)
     def test_write_result(self, kikimr, s3, client, unique_prefix):
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("wbucket")
@@ -447,10 +468,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         for i in range(100):
@@ -499,12 +517,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_precompute(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("pbucket")
@@ -512,10 +526,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         s3_client.put_object(Body="text1", Bucket='pbucket', Key='file1.txt', ContentType='text/plain')
@@ -561,12 +572,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_failed_precompute(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("fpbucket")
@@ -613,12 +620,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_missed(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("fbucket")
@@ -626,10 +629,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         fruits = R'''Fruit,Price,Weight
@@ -657,18 +657,16 @@ Pear,15,33'''
 
         query_id = client.create_query("simple", sql, type=fq.QueryContent.QueryType.ANALYTICS).result.query_id
         client.wait_query_status(query_id, fq.QueryMeta.FAILED)
-        assert "Column `Intellect` is marked as not null, but was not found in the csv file" in "{}".format(client.describe_query(query_id).result)
+        assert "Column `Intellect` is marked as not null, but was not found in the csv file" in "{}".format(
+            client.describe_query(query_id).result
+        )
 
     @yq_all
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_simple_hits_47(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("fbucket")
@@ -676,10 +674,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         fruits = R'''Fruit,Price,Weight
@@ -729,12 +724,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("path_pattern", ["exact_file", "directory_scan"])
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_i18n_unpartitioned(self, kikimr, s3, client, raw, path_pattern, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("ibucket")
@@ -742,10 +733,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         i18n_directory = 'dataset/こんにちは/'
@@ -798,12 +786,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("partitioning", ["hive", "projection"])
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_i18n_partitioning(self, kikimr, s3, client, raw, partitioning, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("ibucket")
@@ -811,10 +795,7 @@ Pear,15,33'''
         bucket.objects.all().delete()
 
         s3_client = boto3.client(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         i18n_name = 'fruit and &{+}% непечатное.csv'
@@ -823,9 +804,15 @@ Pear,15,33'''
     101
     102
     103'''
-        s3_client.put_object(Body=fruits, Bucket='ibucket', Key=f"dataset/folder=%こん/{i18n_name}", ContentType='text/plain')
-        s3_client.put_object(Body=fruits, Bucket='ibucket', Key=f"dataset/folder=に ちは/{i18n_name}", ContentType='text/plain')
-        s3_client.put_object(Body=fruits, Bucket='ibucket', Key=f"dataset/folder=に/{i18n_name}", ContentType='text/plain')
+        s3_client.put_object(
+            Body=fruits, Bucket='ibucket', Key=f"dataset/folder=%こん/{i18n_name}", ContentType='text/plain'
+        )
+        s3_client.put_object(
+            Body=fruits, Bucket='ibucket', Key=f"dataset/folder=に ちは/{i18n_name}", ContentType='text/plain'
+        )
+        s3_client.put_object(
+            Body=fruits, Bucket='ibucket', Key=f"dataset/folder=に/{i18n_name}", ContentType='text/plain'
+        )
 
         kikimr.control_plane.wait_bootstrap(1)
         storage_connection_name = unique_prefix + "i18nbucket"
@@ -833,15 +820,18 @@ Pear,15,33'''
 
         format = "raw" if raw else "csv_with_names"
         if partitioning == "projection":
-            sql = f'''
+            sql = (
+                f'''
                 pragma s3.UseRuntimeListing="{runtime_listing}";
-                ''' + R'''
+                '''
+                + R'''
                 $projection = @@ {
                     "projection.enabled" : "true",
                     "storage.location.template" : "/folder=${folder}",
                     "projection.folder.type" : "enum",
                     "projection.folder.values" : "%こん,に ちは,に"
-                } @@;''' + f'''
+                } @@;'''
+                + f'''
                 SELECT count(*) as cnt
                 FROM `{storage_connection_name}`.`dataset`
                 WITH (
@@ -855,6 +845,7 @@ Pear,15,33'''
                 )
                 WHERE folder = 'に ちは' or folder = '%こん';
                 '''
+            )
         elif partitioning == "hive":
             sql = f'''
                 pragma s3.UseRuntimeListing="{runtime_listing}";
@@ -891,12 +882,8 @@ Pear,15,33'''
     @pytest.mark.parametrize("client", [{"folder_id": "my_folder"}], indirect=True)
     @pytest.mark.parametrize("runtime_listing", ["false", "true"])
     def test_huge_source(self, kikimr, s3, client, runtime_listing, unique_prefix):
-
         resource = boto3.resource(
-            "s3",
-            endpoint_url=s3.s3_url,
-            aws_access_key_id="key",
-            aws_secret_access_key="secret_key"
+            "s3", endpoint_url=s3.s3_url, aws_access_key_id="key", aws_secret_access_key="secret_key"
         )
 
         bucket = resource.Bucket("hbucket")

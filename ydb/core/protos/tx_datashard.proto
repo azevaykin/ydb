@@ -769,6 +769,7 @@ message TEvGetTableStats {
     optional uint64 DataSizeResolution = 2;
     optional uint64 RowCountResolution = 3;
     optional bool CollectKeySample = 4;
+    optional uint32 HistogramBucketsCount = 5;
 }
 
 message TEvGetTableStatsResult {
@@ -1546,7 +1547,6 @@ message TEvKqpScan {
     optional NYql.NDqProto.EDqStatsMode StatsMode = 18;
     optional bytes OlapProgram = 19;
     optional NKikimrSchemeOp.EOlapProgramType OlapProgramType = 20;
-    optional bool CostDataOnly = 21[default = false];
     optional TComputeShardingPolicy ComputeShardingPolicy = 23;
 }
 

@@ -1,6 +1,7 @@
 #include "dst_alterer.h"
 #include "dst_creator.h"
 #include "dst_remover.h"
+#include "private_events.h"
 #include "target_base.h"
 #include "util.h"
 
@@ -12,7 +13,7 @@ using ETargetKind = TReplication::ETargetKind;
 using EDstState = TReplication::EDstState;
 using EStreamState = TReplication::EStreamState;
 
-TTargetBase::TTargetBase(TReplication::TPtr replication, ETargetKind kind,
+TTargetBase::TTargetBase(TReplication* replication, ETargetKind kind,
         ui64 id, const TString& srcPath, const TString& dstPath)
     : Replication(replication)
     , Id(id)
@@ -87,6 +88,39 @@ void TTargetBase::SetIssue(const TString& value) {
     TruncatedIssue(Issue);
 }
 
+void TTargetBase::AddWorker(ui64 id) {
+    Workers.emplace(id, TWorker{});
+    TLagProvider::AddPendingLag(id);
+}
+
+void TTargetBase::RemoveWorker(ui64 id) {
+    Workers.erase(id);
+}
+
+const THashMap<ui64, TTargetBase::TWorker>& TTargetBase::GetWorkers() const {
+    return Workers;
+}
+
+void TTargetBase::RemoveWorkers(const TActorContext& ctx) {
+    if (!PendingRemoveWorkers) {
+        PendingRemoveWorkers = true;
+        for (const auto& [id, _] : Workers) {
+            ctx.Send(ctx.SelfID, new TEvPrivate::TEvRemoveWorker(Replication->GetId(), Id, id));
+        }
+    }
+}
+
+void TTargetBase::UpdateLag(ui64 workerId, TDuration lag) {
+    auto it = Workers.find(workerId);
+    if (it == Workers.end()) {
+        return;
+    }
+
+    if (TLagProvider::UpdateLag(it->second, workerId, lag)) {
+        Replication->UpdateLag(GetId(), GetLag().GetRef());
+    }
+}
+
 void TTargetBase::Progress(const TActorContext& ctx) {
     switch (DstState) {
     case EDstState::Creating:
@@ -100,14 +134,18 @@ void TTargetBase::Progress(const TActorContext& ctx) {
         }
         break;
     case EDstState::Alter:
-        if (!DstAlterer) {
+        if (Workers) {
+            RemoveWorkers(ctx);
+        } else if (!DstAlterer) {
             DstAlterer = ctx.Register(CreateDstAlterer(Replication, Id, ctx));
         }
         break;
     case EDstState::Done:
         break;
     case EDstState::Removing:
-        if (!DstRemover) {
+        if (Workers) {
+            RemoveWorkers(ctx);
+        } else if (!DstRemover) {
             DstRemover = ctx.Register(CreateDstRemover(Replication, Id, ctx));
         }
         break;

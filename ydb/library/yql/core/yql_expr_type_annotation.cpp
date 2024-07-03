@@ -407,7 +407,7 @@ IGraphTransformer::TStatus TryConvertToImpl(TExprContext& ctx, TExprNode::TPtr& 
         if (allow) {
             if (!isSafe && !flags.Test(NConvertFlags::AllowUnsafeConvert)) {
                 auto castResult = NKikimr::NUdf::GetCastResult(from, to);
-                if (!castResult || *castResult & NKikimr::NUdf::Impossible) {
+                if (*castResult & NKikimr::NUdf::Impossible) {
                     return IGraphTransformer::TStatus::Error;
                 }
 
@@ -3462,6 +3462,19 @@ bool EnsureTaggedType(const TExprNode& node, TExprContext& ctx) {
     return true;
 }
 
+bool EnsureTaggedType(TPositionHandle position, const TTypeAnnotationNode& type, TExprContext& ctx) {
+    if (HasError(&type, ctx)) {
+        return false;
+    }
+
+    if (type.GetKind() != ETypeAnnotationKind::Tagged) {
+        ctx.AddError(TIssue(ctx.GetPosition(position), TStringBuilder() << "Expected tagged type, but got: " << type));
+        return false;
+    }
+
+    return true;
+}
+
 bool EnsureOneOrTupleOfDataOrOptionalOfData(const TExprNode& node, TExprContext& ctx) {
     if (HasError(node.GetTypeAnn(), ctx)) {
         return false;
@@ -4239,6 +4252,18 @@ EDataSlot WithTzDate(EDataSlot dataSlot) {
         return EDataSlot::TzTimestamp;
     }
 
+    if (dataSlot == EDataSlot::Date32) {
+        return EDataSlot::TzDate32;
+    }
+
+    if (dataSlot == EDataSlot::Datetime64) {
+        return EDataSlot::TzDatetime64;
+    }
+
+    if (dataSlot == EDataSlot::Timestamp64) {
+        return EDataSlot::TzTimestamp64;
+    }
+
     return dataSlot;
 }
 
@@ -4253,6 +4278,18 @@ EDataSlot WithoutTzDate(EDataSlot dataSlot) {
 
     if (dataSlot == EDataSlot::TzTimestamp) {
         return EDataSlot::Timestamp;
+    }
+
+    if (dataSlot == EDataSlot::TzDate32) {
+        return EDataSlot::Date32;
+    }
+
+    if (dataSlot == EDataSlot::TzDatetime64) {
+        return EDataSlot::Datetime64;
+    }
+
+    if (dataSlot == EDataSlot::TzTimestamp64) {
+        return EDataSlot::Timestamp64;
     }
 
     return dataSlot;
@@ -6000,14 +6037,7 @@ bool ExtractPgType(const TTypeAnnotationNode* type, ui32& pgType, bool& convertT
         }
 
         auto slot = unpacked->Cast<TDataExprType>()->GetSlot();
-        auto convertedTypeId = ConvertToPgType(slot);
-        if (!convertedTypeId) {
-            ctx.AddError(TIssue(ctx.GetPosition(pos),
-                TStringBuilder() << "Type is not compatible to PG: " << slot));
-            return false;
-        }
-
-        pgType = *convertedTypeId;
+        pgType = ConvertToPgType(slot);
         convertToPg = true;
         return true;
     } else if (type->GetKind() != ETypeAnnotationKind::Pg) {

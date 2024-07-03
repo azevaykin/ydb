@@ -520,7 +520,7 @@ namespace NKikimr {
             }
 
             TLogoBlobID firstBlobId = LogoBlobIDFromLogoBlobID(record.GetItems(0).GetBlobID());
-            LWTRACK(VDiskSkeletonVMultiPutRecieved, ev->Get()->Orbit, VCtx->NodeId, VCtx->GroupId,
+            LWTRACK(VDiskSkeletonVMultiPutRecieved, ev->Get()->Orbit, VCtx->NodeId, VCtx->GroupId.GetRawId(),
                     VCtx->Top->GetFailDomainOrderNumber(VCtx->ShortSelfVDisk),
                     firstBlobId.TabletID(), ev->Get()->GetSumBlobSize());
 
@@ -686,7 +686,7 @@ namespace NKikimr {
             TInstant now = TAppData::TimeProvider->Now();
             NKikimrBlobStorage::TEvVPut &record = ev->Get()->Record;
             const TLogoBlobID id = LogoBlobIDFromLogoBlobID(record.GetBlobID());
-            LWTRACK(VDiskSkeletonVPutRecieved, ev->Get()->Orbit, VCtx->NodeId, VCtx->GroupId,
+            LWTRACK(VDiskSkeletonVPutRecieved, ev->Get()->Orbit, VCtx->NodeId, VCtx->GroupId.GetRawId(),
                    VCtx->Top->GetFailDomainOrderNumber(VCtx->ShortSelfVDisk), id.TabletID(), id.BlobSize());
             TVPutInfo info(id, ev->Get()->GetBuffer(), record.MutableExtraBlockChecks(), std::move(ev->TraceId));
             const ui64 bufSize = info.Buffer.GetSize();
@@ -1692,7 +1692,7 @@ namespace NKikimr {
             TEvDetectedPhantomBlob *msg = ev->Get();
 
             for (const TLogoBlobID& logoBlobId : msg->Phantoms) {
-                LOG_ERROR_S(ctx, NKikimrServices::BS_SKELETON, VCtx->VDiskLogPrefix
+                LOG_NOTICE_S(ctx, NKikimrServices::BS_SKELETON, VCtx->VDiskLogPrefix
                         << "adding DoNotKeep to phantom LogoBlobId# " << logoBlobId
                         << " Marker# BSVS27");
             }
@@ -2201,13 +2201,21 @@ namespace NKikimr {
                                     TABLED() {str << "VDiskIncarnationGuid";}
                                     TABLED() {str << Db->GetVDiskIncarnationGuid(true);}
                                 }
-                                TABLER() {
-                                    TABLED() {str << "BurstThresholdNs";}
-                                    TABLED() {str << Config->BurstThresholdNs;}
-                                }
-                                TABLER() {
-                                    TABLED() {str << "DiskTimeAvailableScale";}
-                                    TABLED() {str << Config->DiskTimeAvailableScale;}
+
+                                if (PDiskCtx && PDiskCtx->Dsk) {
+                                    NPDisk::EDeviceType trueMedia = PDiskCtx->Dsk->TrueMediaType;
+                                    TABLER() {
+                                        TABLED() {str << "TrueMediaType";}
+                                        TABLED() {str << NPDisk::DeviceTypeStr(trueMedia, true); }
+                                    }
+                                    TABLER() {
+                                        TABLED() {str << "BurstThresholdNs";}
+                                        TABLED() {str << (i64)Config->CostMetricsParametersByMedia[trueMedia].BurstThresholdNs;}
+                                    }
+                                    TABLER() {
+                                        TABLED() {str << "DiskTimeAvailableScale";}
+                                        TABLED() {str << 0.001 * Config->CostMetricsParametersByMedia[trueMedia].DiskTimeAvailableScale;}
+                                    }
                                 }
                             }
                         }
