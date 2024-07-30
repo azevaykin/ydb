@@ -955,8 +955,8 @@ NThreading::TFuture<TTableMetadataResult> TKqpTableMetadataLoader::LoadTableMeta
                 if (!response.StatResponses.size()){
                     return;
                 }
-                auto resp = response.StatResponses[0];
-                auto s = resp.Simple;
+                const NStat::TResponse& resp = response.StatResponses[0];
+                const NStat::TStatBasic& s = std::get<NStat::TStatBasic>(resp.Result);
                 result.Metadata->RecordsCount = s.RowCount;
                 result.Metadata->DataSize = s.BytesSize;
                 result.Metadata->StatsLoaded = response.Success;

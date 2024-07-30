@@ -1018,7 +1018,8 @@ private:
             response.Success = true;
             auto& data = ev->Get()->Data;
             Y_ABORT_UNLESS(data);
-            response.CountMinSketch.CountMin.reset(TCountMinSketch::FromString(data->Data(), data->Size()));
+
+            response.Result = TStatCountMinSketch { TCountMinSketch::FromString(data->Data(), data->Size()) };
         } else {
             response.Success = false;
         }
@@ -1126,7 +1127,7 @@ private:
             rsp.Success = true;
             rsp.Req = req;
 
-            TStatSimple stat;
+            TStatBasic stat;
             auto itStat = statisticsMap.find(req.PathId);
             if (itStat != statisticsMap.end()) {
                 stat.RowCount = itStat->second.RowCount;
@@ -1135,7 +1136,7 @@ private:
                 stat.RowCount = 0;
                 stat.BytesSize = 0;
             }
-            rsp.Simple = stat;
+            rsp.Result = stat;
 
             result->StatResponses.push_back(rsp);
         }
@@ -1165,10 +1166,10 @@ private:
             rsp.Success = false;
             rsp.Req = req;
 
-            TStatSimple stat;
+            TStatBasic stat;
             stat.RowCount = 0;
             stat.BytesSize = 0;
-            rsp.Simple = stat;
+            rsp.Result = stat;
 
             result->StatResponses.push_back(rsp);
         }

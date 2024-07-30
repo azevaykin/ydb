@@ -9,23 +9,23 @@
 namespace NKikimr {
 namespace NStat {
 
-struct TStatSimple {
+struct TStatBasic {
     ui64 RowCount = 0;
     ui64 BytesSize = 0;
 };
 
 struct TStatHyperLogLog {
-    // TODO:
+    // not implemented yet
 };
 
 struct TStatCountMinSketch {
-    std::shared_ptr<TCountMinSketch> CountMin;
+    TCountMinSketch CountMin;
 };
 
 enum EStatType {
     SIMPLE = 0,
-    HYPER_LOG_LOG = 1,
-    COUNT_MIN_SKETCH = 2,
+    COUNT_MIN_SKETCH = 1,
+    HYPER_LOG_LOG = 2,
 };
 
 struct TRequest {
@@ -36,9 +36,11 @@ struct TRequest {
 struct TResponse {
     bool Success = true;
     TRequest Req;
-    TStatSimple Simple;
-    TStatHyperLogLog HyperLogLog;
-    TStatCountMinSketch CountMinSketch;
+    std::variant<
+         TStatBasic
+        ,TStatCountMinSketch
+        ,TStatHyperLogLog
+        > Result;
 };
 
 struct TEvStatistics {

@@ -8,6 +8,7 @@
 namespace NKikimr {
 
 class TCountMinSketch {
+    //TODO complex data alighnment
 private:
     ui64 Width;
     ui64 Depth;

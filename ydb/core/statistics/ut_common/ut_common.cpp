@@ -282,8 +282,8 @@ std::shared_ptr<TCountMinSketch> ExtractCountMin(TTestActorRuntime& runtime, TPa
     UNIT_ASSERT(evResult->Get());
     UNIT_ASSERT(evResult->Get()->StatResponses.size() == 1);
 
-    auto rsp = evResult->Get()->StatResponses[0];
-    auto stat = rsp.CountMinSketch;
+    const auto& rsp = evResult->Get()->StatResponses[0];
+    const auto& stat = std::get<TStatCountMinSketch>(rsp.Result).CountMinSketch;
     UNIT_ASSERT(rsp.Success);
     UNIT_ASSERT(stat.CountMin);
 
@@ -319,7 +319,7 @@ void ValidateCountMinAbsense(TTestActorRuntime& runtime, TPathId pathId) {
     UNIT_ASSERT(evResult->Get());
     UNIT_ASSERT(evResult->Get()->StatResponses.size() == 1);
 
-    auto rsp = evResult->Get()->StatResponses[0];
+    const auto& rsp = evResult->Get()->StatResponses[0];
     UNIT_ASSERT(!rsp.Success);
 }
 
