@@ -62,7 +62,7 @@ bool TTypeRegistry::GetTypeInfo(const TStringBuf& typeName, const TStringBuf& co
     } else if (const auto decimalType = NScheme::TDecimalType::ParseTypeName(typeName)) {
         typeInfo = NScheme::TTypeInfo(NScheme::NTypeIds::Decimal, *decimalType);
     } else if (const auto pgTypeDesc = NPg::TypeDescFromPgTypeName(typeName)) {
-        typeInfo = NScheme::TTypeInfo(NScheme::NTypeIds::Pg, pgTypeDesc);
+        typeInfo = NScheme::TTypeInfo(pgTypeDesc);
     } else {
         errorStr = Sprintf("Type '%s' specified for column '%s' is not supported by storage", typeName.data(), columnName.data());
         return false;
