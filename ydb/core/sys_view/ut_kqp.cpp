@@ -1218,7 +1218,7 @@ Y_UNIT_TEST_SUITE(SystemView) {
         return value.AsList()[0].AsUint64();
     }
 
-    Y_UNIT_TEST(TopPartitionsFields) {
+    Y_UNIT_TEST(TopPartitionsByCpuFields) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         auto nowUs = TInstant::Now().MicroSeconds();
@@ -1270,7 +1270,7 @@ Y_UNIT_TEST_SUITE(SystemView) {
         check.Uint64(0); // InFlightTxCount
     }
 
-    Y_UNIT_TEST(TopPartitionsTables) {
+    Y_UNIT_TEST(TopPartitionsByCpuTables) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         constexpr ui64 partitionCount = 5;
@@ -1300,7 +1300,7 @@ Y_UNIT_TEST_SUITE(SystemView) {
         check("/Root/Tenant1/.sys/top_partitions_one_hour");
     }
 
-    Y_UNIT_TEST(TopPartitionsRanges) {
+    Y_UNIT_TEST(TopPartitionsByCpuRanges) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         constexpr ui64 partitionCount = 5;
@@ -1381,7 +1381,7 @@ Y_UNIT_TEST_SUITE(SystemView) {
         }
     }
 
-    Y_UNIT_TEST(TopPartitionsFollowers) {
+    Y_UNIT_TEST(TopPartitionsByCpuFollowers) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         auto nowUs = TInstant::Now().MicroSeconds();
@@ -2140,6 +2140,59 @@ Y_UNIT_TEST_SUITE(SystemView) {
             [[0u]];
         ])", ysonString);
     }
+
+    Y_UNIT_TEST(TopPartitionsByTliFields) {
+        NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
+
+        auto nowUs = TInstant::Now().MicroSeconds();
+
+        TTestEnv env(1, 4, {.EnableSVP = true});
+        CreateTenantsAndTables(env);
+
+        TTableClient client(env.GetDriver());
+        size_t rowCount = 0;
+        for (size_t iter = 0; iter < 30 && !rowCount; ++iter) {
+            rowCount = GetRowCount(client, "/Root/Tenant1/.sys/top_partitions_one_minute");
+            if (!rowCount) {
+                Sleep(TDuration::Seconds(1));
+            }
+        }
+        ui64 intervalEnd = GetIntervalEnd(client, "/Root/Tenant1/.sys/top_partitions_one_minute");
+
+        TStringBuilder query;
+        query << R"(
+            SELECT
+                IntervalEnd,
+                Rank,
+                TabletId,
+                Path,
+                PeakTime,
+                CPUCores,
+                NodeId,
+                DataSize,
+                RowCount,
+                IndexSize,
+                InFlightTxCount
+            FROM `/Root/Tenant1/.sys/top_partitions_by_tli_one_minute`)"
+            << "WHERE IntervalEnd = CAST(" << intervalEnd << "ul as Timestamp)";
+        auto it = client.StreamExecuteScanQuery(query).GetValueSync();
+        UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
+        auto ysonString = NKqp::StreamResultToYson(it);
+
+        TYsonFieldChecker check(ysonString, 11);
+        check.Uint64(intervalEnd); // IntervalEnd
+        check.Uint64(1); // Rank
+        check.Uint64Greater(0); // TabletId
+        check.String("/Root/Tenant1/Table1"); // Path
+        check.Uint64GreaterOrEquals(nowUs); // PeakTime
+        check.DoubleGreaterOrEquals(0.); // CPUCores
+        check.Uint64Greater(0); // NodeId
+        check.Uint64Greater(0); // DataSize
+        check.Uint64(3); // RowCount
+        check.Uint64(0); // IndexSize
+        check.Uint64(0); // InFlightTxCount
+    }
+
 }
 
 } // NSysView

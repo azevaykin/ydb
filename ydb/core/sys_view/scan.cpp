@@ -220,12 +220,14 @@ THolder<NActors::IActor> CreateSystemViewScan(
         return CreateQueryMetricsScan(ownerId, scanId, tableId, tableRange, columns);
     }
 
-    if (tableId.SysViewInfo == TopPartitions1MinuteName ||
-        tableId.SysViewInfo == TopPartitions1HourName)
+    if (tableId.SysViewInfo == TopPartitionsByCpu1MinuteName ||
+        tableId.SysViewInfo == TopPartitionsByCpu1HourName ||
+        tableId.SysViewInfo == TopPartitionsByTli1MinuteName ||
+        tableId.SysViewInfo == TopPartitionsByTli1HourName)
     {
         return CreateTopPartitionsScan(ownerId, scanId, tableId, tableRange, columns);
     }
-
+    
     if (tableId.SysViewInfo == PgTablesName) {
         return CreatePgTablesScan(ownerId, scanId, tableId, tablePath, tableRange, columns);
     }

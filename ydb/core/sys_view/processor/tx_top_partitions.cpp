@@ -110,8 +110,10 @@ struct TSysViewProcessor::TTxTopPartitions : public TTxBase {
             << "partition count# " << Record.PartitionsSize());
 
         NIceDb::TNiceDb db(txc.DB);
-        ProcessTop(db, NKikimrSysView::TOP_PARTITIONS_ONE_MINUTE, Self->PartitionTopMinute);
-        ProcessTop(db, NKikimrSysView::TOP_PARTITIONS_ONE_HOUR, Self->PartitionTopHour);
+        ProcessTop(db, NKikimrSysView::TOP_PARTITIONS_BY_CPU_ONE_MINUTE, Self->PartitionTopByCpuMinute);
+        ProcessTop(db, NKikimrSysView::TOP_PARTITIONS_BY_CPU_ONE_HOUR, Self->PartitionTopByCpuHour);
+        ProcessTop(db, NKikimrSysView::TOP_PARTITIONS_BY_TLI_ONE_MINUTE, Self->PartitionTopByTliMinute);
+        ProcessTop(db, NKikimrSysView::TOP_PARTITIONS_BY_TLI_ONE_HOUR, Self->PartitionTopByTliHour);
 
         return true;
     }

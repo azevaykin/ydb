@@ -42,8 +42,11 @@ constexpr TStringBuf TablePrimaryIndexPortionStatsName = "primary_index_portion_
 constexpr TStringBuf TablePrimaryIndexGranuleStatsName = "primary_index_granule_stats";
 constexpr TStringBuf TablePrimaryIndexOptimizerStatsName = "primary_index_optimizer_stats";
 
-constexpr TStringBuf TopPartitions1MinuteName = "top_partitions_one_minute";
-constexpr TStringBuf TopPartitions1HourName = "top_partitions_one_hour";
+constexpr TStringBuf TopPartitionsByCpu1MinuteName = "top_partitions_one_minute";
+constexpr TStringBuf TopPartitionsByCpu1HourName = "top_partitions_one_hour";
+
+constexpr TStringBuf TopPartitionsByTli1MinuteName = "top_partitions_by_tli_one_minute";
+constexpr TStringBuf TopPartitionsByTli1HourName = "top_partitions_by_tli_one_hour";
 
 constexpr TStringBuf PgTablesName = "pg_tables";
 constexpr TStringBuf InformationSchemaTablesName = "tables";

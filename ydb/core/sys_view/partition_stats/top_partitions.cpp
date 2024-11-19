@@ -78,17 +78,17 @@ THolder<NActors::IActor> CreateTopPartitionsScan(const NActors::TActorId& ownerI
         ui32
     >;
 
-    auto viewName = tableId.SysViewInfo;
+    static const std::map<TStringBuf, NKikimrSysView::EStatsType> nameToStatus = {
+        {TopPartitionsByCpu1MinuteName, NKikimrSysView::TOP_PARTITIONS_BY_CPU_ONE_MINUTE},
+        {TopPartitionsByCpu1HourName, NKikimrSysView::TOP_PARTITIONS_BY_CPU_ONE_HOUR},
+        {TopPartitionsByTli1MinuteName, NKikimrSysView::TOP_PARTITIONS_BY_TLI_ONE_MINUTE},
+        {TopPartitionsByTli1HourName, NKikimrSysView::TOP_PARTITIONS_BY_TLI_ONE_HOUR},
+    };
 
-    if (viewName == TopPartitions1MinuteName) {
-        return MakeHolder<TTopPartitionsScan>(ownerId, scanId, tableId, tableRange, columns,
-            NKikimrSysView::TOP_PARTITIONS_ONE_MINUTE);
+    auto statusIter = nameToStatus.find(tableId.SysViewInfo.ConstRef());
+    Y_ABORT_UNLESS(statusIter != nameToStatus.end());
 
-    } else if (viewName == TopPartitions1HourName) {
-        return MakeHolder<TTopPartitionsScan>(ownerId, scanId, tableId, tableRange, columns,
-            NKikimrSysView::TOP_PARTITIONS_ONE_HOUR);
-    }
-    return {};
+    return MakeHolder<TTopPartitionsScan>(ownerId, scanId, tableId, tableRange, columns, statusIter->second);
 }
 
 } // NKikimr::NSysView
