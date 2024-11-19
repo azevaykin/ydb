@@ -1611,13 +1611,16 @@ WITH (
                 TxRejectedByOutOfStorage,
                 TxRejectedByOverload,
                 FollowerId,
+                LocksAcquired,
+                LocksWholeShard,
+                LocksBroken,
                 UpdateTime
             FROM `/Root/.sys/partition_stats`;
         )").GetValueSync();
 
         UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
         auto ysonString = NKqp::StreamResultToYson(it);
-        TYsonFieldChecker check(ysonString, 24);
+        TYsonFieldChecker check(ysonString, 27);
 
         check.Uint64GreaterOrEquals(nowUs); // AccessTime
         check.DoubleGreaterOrEquals(0.0); // CPUCores
@@ -1642,6 +1645,9 @@ WITH (
         check.Uint64(0u); // TxRejectedByOutOfStorage
         check.Uint64(0u); // TxRejectedByOverload
         check.Uint64(0u); // FollowerId
+        check.Uint64(0u); // LocksAcquired
+        check.Uint64(0u); // LocksWholeShard
+        check.Uint64(0u); // LocksBroken
         check.Uint64GreaterOrEquals(nowUs); // UpdateTime
     }
 
@@ -2062,7 +2068,7 @@ WITH (
         return value.AsList()[0].AsUint64();
     }
 
-    Y_UNIT_TEST(TopPartitionsFields) {
+    Y_UNIT_TEST(TopPartitionsByCpuFields) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         auto nowUs = TInstant::Now().MicroSeconds();
@@ -2114,7 +2120,7 @@ WITH (
         check.Uint64(0); // InFlightTxCount
     }
 
-    Y_UNIT_TEST(TopPartitionsTables) {
+    Y_UNIT_TEST(TopPartitionsByCpuTables) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         constexpr ui64 partitionCount = 5;
@@ -2144,7 +2150,7 @@ WITH (
         check("/Root/Tenant1/.sys/top_partitions_one_hour");
     }
 
-    Y_UNIT_TEST(TopPartitionsRanges) {
+    Y_UNIT_TEST(TopPartitionsByCpuRanges) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         constexpr ui64 partitionCount = 5;
@@ -2225,7 +2231,7 @@ WITH (
         }
     }
 
-    Y_UNIT_TEST(TopPartitionsFollowers) {
+    Y_UNIT_TEST(TopPartitionsByCpuFollowers) {
         NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
 
         auto nowUs = TInstant::Now().MicroSeconds();
@@ -2398,6 +2404,56 @@ WITH (
             check.Uint64(0); // InFlightTxCount
             check.Uint64Greater(0); // FollowerId
         }
+    }
+
+    Y_UNIT_TEST(TopPartitionsByTliFields) {
+        NDataShard::gDbStatsReportInterval = TDuration::Seconds(0);
+
+        TTestEnv env(1, 4, {.EnableSVP = true});
+        CreateTenantsAndTables(env);
+
+        TTableClient client(env.GetDriver());
+        size_t rowCount = 0;
+        for (size_t iter = 0; iter < 30 && !rowCount; ++iter) {
+            rowCount = GetRowCount(client, "/Root/Tenant1/.sys/top_partitions_by_tli_one_minute");
+            if (!rowCount) {
+                Sleep(TDuration::Seconds(1));
+            }
+        }
+        ui64 intervalEnd = GetIntervalEnd(client, "/Root/Tenant1/.sys/top_partitions_by_tli_one_minute");
+
+        TStringBuilder query;
+        query << R"(
+            SELECT
+                IntervalEnd,
+                Rank,
+                TabletId,
+                Path,
+                LocksAcquired,
+                LocksWholeShard,
+                LocksBroken,
+                NodeId,
+                DataSize,
+                RowCount,
+                IndexSize
+            FROM `/Root/Tenant1/.sys/top_partitions_by_tli_one_minute`)"
+            << "WHERE IntervalEnd = CAST(" << intervalEnd << "ul as Timestamp)";
+        auto it = client.StreamExecuteScanQuery(query).GetValueSync();
+        UNIT_ASSERT_C(it.IsSuccess(), it.GetIssues().ToString());
+        auto ysonString = NKqp::StreamResultToYson(it);
+
+        TYsonFieldChecker check(ysonString, 11);
+        check.Uint64(intervalEnd); // IntervalEnd
+        check.Uint64(1); // Rank
+        check.Uint64Greater(0); // TabletId
+        check.String("/Root/Tenant1/Table1"); // Path
+        check.Uint64GreaterOrEquals(0); // LocksAcquired
+        check.Uint64GreaterOrEquals(0); // LocksWholeShard
+        check.Uint64GreaterOrEquals(0); // LocksBroken
+        check.Uint64Greater(0); // NodeId
+        check.Uint64Greater(0); // DataSize
+        check.Uint64(3); // RowCount
+        check.Uint64(0); // IndexSize
     }
 
     Y_UNIT_TEST(Describe) {

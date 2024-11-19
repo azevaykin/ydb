@@ -3422,6 +3422,9 @@ protected:
             ev->Record.MutableTableStats()->SetLocksAcquired(TabletCounters->Cumulative()[COUNTER_LOCKS_ACQUIRED].Get());
             ev->Record.MutableTableStats()->SetLocksWholeShard(TabletCounters->Cumulative()[COUNTER_LOCKS_WHOLE_SHARD].Get());
             ev->Record.MutableTableStats()->SetLocksBroken(TabletCounters->Cumulative()[COUNTER_LOCKS_BROKEN].Get());
+            ev->Record.MutableTableStats()->SetLocksAcquired(101);
+            ev->Record.MutableTableStats()->SetLocksWholeShard(102);
+            ev->Record.MutableTableStats()->SetLocksBroken(103);
 
             ev->Record.SetNodeId(ctx.SelfID.NodeId());
             ev->Record.SetStartTime(StartTime().MilliSeconds());
