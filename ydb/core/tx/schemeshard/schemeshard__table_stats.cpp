@@ -84,6 +84,9 @@ auto TSchemeShard::BuildStatsForCollector(TPathId pathId, TShardIdx shardIdx, TT
     sysStats.SetPlannedTxCompleted(stats.PlannedTxCompleted);
     sysStats.SetTxRejectedByOverload(stats.TxRejectedByOverload);
     sysStats.SetTxRejectedBySpace(stats.TxRejectedBySpace);
+    sysStats.SetLocksAcquired(stats.LocksAcquired);
+    sysStats.SetLocksWholeShard(stats.LocksWholeShard);
+    sysStats.SetLocksBroken(stats.LocksBroken);
 
     if (nodeId) {
         sysStats.SetNodeId(*nodeId);
@@ -198,6 +201,10 @@ TPartitionStats TTxStoreTableStats::PrepareStats(const TActorContext& ctx,
     newStats.RowReads = tableStats.GetRowReads();
     newStats.RangeReads = tableStats.GetRangeReads();
     newStats.RangeReadRows = tableStats.GetRangeReadRows();
+
+    newStats.LocksAcquired = tableStats.GetLocksAcquired();
+    newStats.LocksWholeShard = tableStats.GetLocksWholeShard();
+    newStats.LocksBroken = tableStats.GetLocksBroken();
 
     TInstant now = AppData(ctx)->TimeProvider->Now();
     newStats.SetCurrentRawCpuUsage(tabletMetrics.GetCPU(), now);
@@ -552,6 +559,8 @@ void TSchemeShard::Handle(TEvDataShard::TEvPeriodicTableStats::TPtr& ev, const T
                                                      << " followerId " << followerId
                                                      << " pathId " << pathId
                                                      << " raw table stats:\n" << tableStats.ShortDebugString());
+
+    Cerr << "SchemeShard datashardId " << datashardId << " GetTableLocalId " << rec.GetTableLocalId() << " LocksAcquired " << tableStats.GetLocksAcquired() << " LocksBroken " << tableStats.GetLocksBroken() << Endl;
 
     TStatsId statsId(pathId, datashardId, followerId);
 

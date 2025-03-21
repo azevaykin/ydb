@@ -932,6 +932,8 @@ void TLockLocker::ScheduleRemoveBrokenRanges(ui64 lockId, const TRowVersion& at)
         CleanupPending.push_back(lockId);
     }
 
+    Cerr << "Locks ScheduleRemoveBrokenRanges" << Endl;
+
     Self->IncCounter(COUNTER_LOCKS_BROKEN);
 }
 
@@ -974,6 +976,8 @@ TLocksUpdate::~TLocksUpdate() {
 // TSysLocks
 
 std::pair<TVector<TSysLocks::TLock>, TVector<ui64>> TSysLocks::ApplyLocks() {
+    Cerr << "ApplyLocks" << Endl;
+
     Y_ABORT_UNLESS(Update);
 
     TMicrosecTimerCounter measureApplyLocks(*Self, COUNTER_APPLY_LOCKS_USEC);
@@ -1108,15 +1112,22 @@ void TSysLocks::UpdateCounters() {
 }
 
 void TSysLocks::UpdateCounters(ui64 counter) {
+    Cerr << "Locks UpdateCounters" << Endl;
+
+
     UpdateCounters();
 
     if (TLock::IsError(counter)) {
+        Cerr << "Locks UpdateCounters IsError" << Endl;
+
         if (TLock::IsBroken(counter)) {
             Self->IncCounter(COUNTER_LOCKS_REJECT_BROKEN);
         } else {
             Self->IncCounter(COUNTER_LOCKS_REJECTED);
         }
     } else {
+        Cerr << "Locks UpdateCounters COUNTER_LOCKS_ACQUIRED" << Endl;
+
         Self->IncCounter(COUNTER_LOCKS_ACQUIRED);
     }
 }
