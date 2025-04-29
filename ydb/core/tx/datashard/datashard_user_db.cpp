@@ -178,6 +178,16 @@ void TDataShardUserDb::EraseRow(
     Counters.EraseRowBytes += keyBytes + 8;
 }
 
+bool TDataShardUserDb::PrechargeRow(
+    const TTableId& tableId,
+    const TArrayRef<const TRawTypeValue> key)
+{
+    auto localTableId = Self.GetLocalTableId(tableId);
+    Y_ABORT_UNLESS(localTableId != 0, "Unexpected PrechargeRow for an unknown table");
+
+    return Db.Precharge(localTableId, key, key, {}, 0, Max<ui64>(), Max<ui64>());     
+}
+
 void TDataShardUserDb::IncreaseUpdateCounters(
     const TArrayRef<const TRawTypeValue> key, 
     const TArrayRef<const NIceDb::TUpdateOp> ops) 
