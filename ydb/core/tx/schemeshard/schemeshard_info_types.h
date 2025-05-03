@@ -2470,6 +2470,8 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
 
         alterData->State = config.HasState() ? config.GetState() : EState::EIndexStateReady;
 
+        alterData->ImplTableDescriptions.assign(config.GetIndexImplTableDescriptions().begin(), config.GetIndexImplTableDescriptions().end());
+
         if (config.GetType() == NKikimrSchemeOp::EIndexType::EIndexTypeGlobalVectorKmeansTree) {
             alterData->SpecializedIndexDescription = config.GetVectorIndexKmeansTreeDescription();
         }
@@ -2485,7 +2487,7 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
     TVector<TString> IndexDataColumns;
 
     TTableIndexInfo::TPtr AlterData = nullptr;
-
+    TVector<NKikimrSchemeOp::TTableDescription> ImplTableDescriptions;
     std::variant<std::monostate, NKikimrSchemeOp::TVectorIndexKmeansTreeDescription> SpecializedIndexDescription;
 };
 

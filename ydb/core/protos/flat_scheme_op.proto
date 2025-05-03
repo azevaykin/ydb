@@ -1134,6 +1134,7 @@ message TGenericTxInFlyExtraData {
 message TIndexAlteringConfig {
     optional string Name = 1;
     optional EIndexState State = 2;
+    repeated TTableDescription IndexImplTableDescriptions = 3;
 }
 
 message TIndexedTableCreationConfig {

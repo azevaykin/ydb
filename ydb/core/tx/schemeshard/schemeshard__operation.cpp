@@ -1422,7 +1422,7 @@ TVector<ISubOperation::TPtr> TDefaultOperationFactory::MakeOperationParts(
     case NKikimrSchemeOp::EOperationType::ESchemeOpApplyIndexBuild:
         return ApplyBuildIndex(op.NextPartId(), tx, context);
     case NKikimrSchemeOp::EOperationType::ESchemeOpAlterTableIndex:
-        Y_ABORT("multipart operations are handled before, also they require transaction details");
+        return CreateAlterIndex(op.NextPartId(), tx, context);
 
     case NKikimrSchemeOp::EOperationType::ESchemeOpInitiateBuildIndexImplTable:
         return {CreateInitializeBuildIndexImplTable(op.NextPartId(), tx)};

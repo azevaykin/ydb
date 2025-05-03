@@ -198,6 +198,7 @@ public:
         TTableIndexInfo::TPtr newIndexData = indexData->CreateNextVersion();
         Y_ABORT_UNLESS(newIndexData);
         newIndexData->State = tableIndexAlter.GetState();
+        newIndexData->MutableIndexImplTableDescriptions->CopyFrom(newIndexData.GetIndexImplTableDescriptions());
 
         Y_ABORT_UNLESS(!context.SS->FindTx(OperationId));
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxAlterTableIndex, indexPath->PathId);
@@ -240,6 +241,60 @@ ISubOperation::TPtr CreateAlterTableIndex(TOperationId id, const TTxTransaction&
 
 ISubOperation::TPtr CreateAlterTableIndex(TOperationId id, TTxState::ETxState state) {
     return MakeSubOperation<TAlterTableIndex>(id, state);
+}
+
+TVector<ISubOperation::TPtr> CreateAlterIndex(TOperationId opId, const TTxTransaction& tx, TOperationContext& context) {
+    Y_ABORT_UNLESS(tx.GetOperationType() == NKikimrSchemeOp::EOperationType::ESchemeOpAlterIndex);
+
+    LOG_D("CreateAlterIndex"
+        << ": opId# " << opId
+        << ", tx# " << tx.ShortDebugString());
+
+    const auto& op = tx.GetAlterIndex();
+    const auto& tableName = op.GetTableName();
+    const auto& streamName = op.GetStreamName();
+
+    const auto workingDirPath = TPath::Resolve(tx.GetWorkingDir(), context.SS);
+
+    const auto checksResult = DoAlterStreamPathChecks(opId, workingDirPath, tableName, streamName);
+    if (std::holds_alternative<ISubOperation::TPtr>(checksResult)) {
+        return {std::get<ISubOperation::TPtr>(checksResult)};
+    }
+
+    const auto [tablePath, streamPath] = std::get<TStreamPaths>(checksResult);
+
+    TString errStr;
+    if (!context.SS->CheckApplyIf(tx, errStr)) {
+        return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed, errStr)};
+    }
+
+    if (!context.SS->CheckLocks(tablePath.Base()->PathId, tx, errStr)) {
+        return {CreateReject(opId, NKikimrScheme::StatusMultipleModifications, errStr)};
+    }
+
+    TVector<ISubOperation::TPtr> result;
+
+    DoAlterStream(result, op, opId, workingDirPath, tablePath);
+
+    if (op.HasGetReady()) {
+        auto outTx = TransactionTemplate(workingDirPath.PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpDropLock);
+        outTx.SetFailOnExist(true);
+        outTx.SetInternal(true);
+        outTx.MutableLockConfig()->SetName(tablePath.LeafName());
+        outTx.MutableLockGuard()->SetOwnerTxId(op.GetGetReady().GetLockTxId());
+
+        result.push_back(DropLock(NextPartId(opId, result), outTx));
+    }
+
+    if (workingDirPath.IsTableIndex()) {
+        auto outTx = TransactionTemplate(workingDirPath.Parent().PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpAlterTableIndex);
+        outTx.MutableAlterTableIndex()->SetName(workingDirPath.LeafName());
+        outTx.MutableAlterTableIndex()->SetState(NKikimrSchemeOp::EIndexState::EIndexStateReady);
+
+        result.push_back(CreateAlterTableIndex(NextPartId(opId, result), outTx));
+    }
+
+    return result;
 }
 
 }

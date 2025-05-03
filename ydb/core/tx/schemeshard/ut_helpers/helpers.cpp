@@ -871,6 +871,9 @@ namespace NSchemeShardUT_Private {
     GENERIC_HELPERS(BackupToYt, NKikimrSchemeOp::EOperationType::ESchemeOpBackup, &NKikimrSchemeOp::TModifyScheme::MutableBackup)
     GENERIC_HELPERS(Restore, NKikimrSchemeOp::EOperationType::ESchemeOpRestore, &NKikimrSchemeOp::TModifyScheme::MutableRestore)
 
+    // index
+    GENERIC_HELPERS(AlterIndex, NKikimrSchemeOp::EOperationType::ESchemeOpAlterIndex, &NKikimrSchemeOp::TModifyScheme::MutableAlterIndex)
+
     // cdc stream
     GENERIC_HELPERS(CreateCdcStream, NKikimrSchemeOp::EOperationType::ESchemeOpCreateCdcStream, &NKikimrSchemeOp::TModifyScheme::MutableCreateCdcStream)
     GENERIC_HELPERS(AlterCdcStream, NKikimrSchemeOp::EOperationType::ESchemeOpAlterCdcStream, &NKikimrSchemeOp::TModifyScheme::MutableAlterCdcStream)

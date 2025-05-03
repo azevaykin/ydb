@@ -416,6 +416,10 @@ ISubOperation::TPtr CreateNewView(TOperationId id, TTxState::ETxState state);
 ISubOperation::TPtr CreateDropView(TOperationId id, const TTxTransaction& tx);
 ISubOperation::TPtr CreateDropView(TOperationId id, TTxState::ETxState state);
 
+// Index
+// Alter
+TVector<ISubOperation::TPtr> CreateAlterIndex(TOperationId id, const TTxTransaction& tx, TOperationContext& context);
+
 /// CDC
 // Create
 TVector<ISubOperation::TPtr> CreateNewCdcStream(TOperationId id, const TTxTransaction& tx, TOperationContext& context);
