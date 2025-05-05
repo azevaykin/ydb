@@ -10,6 +10,7 @@ PEERDIR(
     ydb/library/workload/stock
     ydb/library/workload/tpcds
     ydb/library/workload/tpch
+    ydb/library/workload/vector
 )
 
 END()
