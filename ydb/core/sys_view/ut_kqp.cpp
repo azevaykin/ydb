@@ -2026,6 +2026,51 @@ ALTER TABLE `test_show_create`
         );
     }
 
+    Y_UNIT_TEST(ShowCreateTableAlterIndexTable) {
+        TTestEnv env(1, 4, {.StoragePools = 3, .ShowCreateTable = true});
+        env.GetServer().GetRuntime()->GetAppData().FeatureFlags.SetEnableAccessToIndexImplTables(true);
+        env.GetServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_EXECUTER, NActors::NLog::PRI_DEBUG);
+        env.GetServer().GetRuntime()->SetLogPriority(NKikimrServices::KQP_COMPILE_SERVICE, NActors::NLog::PRI_DEBUG);
+        env.GetServer().GetRuntime()->SetLogPriority(NKikimrServices::FLAT_TX_SCHEMESHARD, NActors::NLog::PRI_TRACE);
+        env.GetServer().GetRuntime()->SetLogPriority(NKikimrServices::TX_PROXY_SCHEME_CACHE, NActors::NLog::PRI_TRACE);
+        env.GetServer().GetRuntime()->SetLogPriority(NKikimrServices::SYSTEM_VIEWS, NActors::NLog::PRI_DEBUG);
+
+        TShowCreateChecker checker(env);
+
+        checker.CheckShowCreateTable(R"(
+            CREATE TABLE test_show_create (
+                Key1 Int64 NOT NULL,
+                Key2 Utf8 NOT NULL,
+                Key3 PgInt2 NOT NULL,
+                Value1 Utf8,
+                Value2 Bool,
+                Value3 String,
+                INDEX Index1 GLOBAL SYNC ON (Key2, Value1, Value2),
+                PRIMARY KEY (Key1, Key2, Key3)
+            );
+            ALTER TABLE `/Root/test_show_create/Index1/indexImplTable` SET (
+                AUTO_PARTITIONING_BY_LOAD = ENABLED,
+                AUTO_PARTITIONING_MAX_PARTITIONS_COUNT = 5000
+            );
+        )", "test_show_create",
+R"(CREATE TABLE `test_show_create` (
+    `Key1` Int64 NOT NULL,
+    `Key2` Utf8 NOT NULL,
+    `Key3` pgint2 NOT NULL,
+    `Value1` Utf8,
+    `Value2` Bool,
+    `Value3` String,
+    INDEX `Index1` GLOBAL SYNC ON (`Key2`, `Value1`, `Value2`),
+    PRIMARY KEY (`Key1`, `Key2`, `Key3`)
+);
+
+ALTER TABLE `test_show_create`
+    ALTER INDEX `Index1` SET (AUTO_PARTITIONING_BY_LOAD = ENABLED, AUTO_PARTITIONING_MAX_PARTITIONS_COUNT = 5000)
+;
+)"
+        );
+    }
+
     Y_UNIT_TEST(ShowCreateTableColumnAlterColumn) {
         TTestEnv env(1, 4, {.StoragePools = 3, .ShowCreateTable = true, .AlterObjectEnabled = true, .EnableSparsedColumns = true, .EnableOlapCompression = true});
 
