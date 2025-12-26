@@ -105,7 +105,7 @@ inline void LogIntegrityTrailsKeys(const NActors::TActorContext& ctx, const ui64
                         case NKikimr::TKeyDesc::ERowOperation::Erase:
                             rowOp = "Erase";
                             break;
-                        default:                   
+                        default:
                             rowOp = "Invalid operation";
                             break;
                     }
@@ -126,29 +126,37 @@ inline void LogIntegrityTrailsKeys(const NActors::TActorContext& ctx, const ui64
     }
 }
 
-inline void LogIntegrityTrailsLocks(const TActorContext& ctx, const ui64 tabletId, const ui64 txId, const TVector<ui64>& locks) {
-    if (locks.empty()) {
+// Unified function that logs lock breaking events to both integrity trails and TLI systems
+inline void LogLocksBroken(const NActors::TActorContext& ctx, const ui64 tabletId, const TString& message,
+                           const TVector<ui64>& brokenLocks, TMaybe<ui64> txId = Nothing()) {
+    if (brokenLocks.empty()) {
         return;
     }
 
-    auto logFn = [&]() {
-        TStringStream ss;
-
-        LogKeyValue("Component", "DataShard", ss);
-        LogKeyValue("Type", "Locks", ss);
-        LogKeyValue("TabletId", ToString(tabletId), ss);
-        LogKeyValue("PhyTxId", ToString(txId), ss);
-
-        ss << "BreakLocks: [";
-        for (const auto& lock : locks) {
-            ss << lock << " ";
+    // Generate the common part of the log message
+    TStringStream ss;
+    LogKeyValue("Component", "DataShard", ss);
+    LogKeyValue("TabletId", ToString(tabletId), ss);
+    if (txId) {
+        LogKeyValue("PhyTxId", ToString(*txId), ss);
+    }
+    LogKeyValue("Message", message, ss);
+    ss << "BrokenLocks: [";
+    for (size_t i = 0; i < brokenLocks.size(); ++i) {
+        ss << brokenLocks[i];
+        if (i + 1 < brokenLocks.size()) {
+            ss << " ";
         }
-        ss << "]";
+    }
+    ss << "]";
 
-        return ss.Str();
-    };
+    // Log to TLI service
+    LOG_INFO_S(ctx, NKikimrServices::TLI, ss.Str());
 
-    LOG_INFO_S(ctx, NKikimrServices::DATA_INTEGRITY, logFn());
+    LogKeyValue("Type", "Locks", ss);
+
+    // Log to DATA_INTEGRITY
+    LOG_INFO_S(ctx, NKikimrServices::DATA_INTEGRITY, ss.Str());
 
 }
 
