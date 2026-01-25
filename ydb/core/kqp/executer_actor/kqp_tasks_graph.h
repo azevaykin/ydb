@@ -266,6 +266,12 @@ struct TGraphMeta {
     void SetLockMode(NKikimrDataEvents::ELockMode lockMode) {
         LockMode = lockMode;
     }
+
+    void SetQueryTraceId(ui64 queryTraceId) {
+        QueryTraceId = queryTraceId;
+    }
+
+    ui64 QueryTraceId = 0;
 };
 
 struct TTaskInputMeta {
