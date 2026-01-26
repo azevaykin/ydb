@@ -3092,7 +3092,12 @@ private:
                     if (TxManager) {
                         TxManager->AddShard(lock.GetDataShard(), stageInfo.Meta.TableKind == ETableKind::Olap, stageInfo.Meta.TablePath);
                         TxManager->AddAction(lock.GetDataShard(), IKqpTransactionManager::EAction::READ);
-                        TxManager->AddLock(lock.GetDataShard(), lock);
+                        if (!TxManager->AddLock(lock.GetDataShard(), lock)) {
+                            // Store the broken lock's QueryTraceId for TLI logging
+                            if (lock.HasQueryTraceId() && lock.GetQueryTraceId() != 0) {
+                                TxManager->SetBrokenLockQueryTraceId(lock.GetQueryTraceId());
+                            }
+                        }
                     }
                 }
 
@@ -3126,7 +3131,12 @@ private:
 
                         TxManager->AddShard(lock.GetDataShard(), stageInfo.Meta.TableKind == ETableKind::Olap, stageInfo.Meta.TablePath);
                         TxManager->AddAction(lock.GetDataShard(), flags);
-                        TxManager->AddLock(lock.GetDataShard(), lock);
+                        if (!TxManager->AddLock(lock.GetDataShard(), lock)) {
+                            // Store the broken lock's QueryTraceId for TLI logging
+                            if (lock.HasQueryTraceId() && lock.GetQueryTraceId() != 0) {
+                                TxManager->SetBrokenLockQueryTraceId(lock.GetQueryTraceId());
+                            }
+                        }
                     }
                 }
             }
