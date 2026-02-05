@@ -24,6 +24,8 @@ items:
   href: secondary_indexes.md
 - name: Векторный поиск
   href: vector_search.md
+- name: Полнотекстовый поиск
+  href: fulltext_search.md
 - name: Спиллинг
   href: spilling.md
 - name: Change Data Capture (CDC)

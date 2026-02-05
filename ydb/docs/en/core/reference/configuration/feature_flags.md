@@ -1,10 +1,11 @@
 # feature_flags
 
-The `feature_flags` section enables or disables specific {{ ydb-short-name }} features using boolean flags. To enable a feature, set the corresponding feature flag to `true` in the cluster configuration. For example, to enable support for vector indexes and auto-partitioning of topics in the CDC, you need to add the following lines to the configuration:
+The `feature_flags` section enables or disables specific {{ ydb-short-name }} features using boolean flags. To enable a feature, set the corresponding feature flag to `true` in the cluster configuration. For example, to enable support for vector and fulltext indexes and auto-partitioning of topics in the CDC, you need to add the following lines to the configuration:
 
 ```yaml
 feature_flags:
   enable_vector_index: true
+  enable_fulltext_index: true
   enable_topic_autopartitioning_for_cdc: true
 ```
 
@@ -13,6 +14,7 @@ feature_flags:
 | Flag          | Feature |
 |---------------------------| ----------------------------------------------------|
 | `enable_vector_index`                                    | Support for [vector indexes](../../dev/vector-indexes.md) for approximate vector similarity search |
+| `enable_fulltext_index`                                  | Support for [fulltext indexes](../../dev/fulltext-indexes.md) for fulltext search |
 | `enable_batch_updates`                                   | Support for `BATCH UPDATE` and `BATCH DELETE` statements |
 | `enable_topic_autopartitioning_for_cdc`                  | [Auto-partitioning topics](../../concepts/cdc.md#topic-partitions) for row-oriented tables in CDC |
 | `enable_access_to_index_impl_tables`                     | Support for [followers (read replicas)](../../yql/reference/syntax/alter_table/indexes.md) for covered secondary indexes |
