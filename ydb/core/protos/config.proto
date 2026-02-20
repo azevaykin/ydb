@@ -2977,6 +2977,10 @@ message TClusterDiagnosticsConfig {
     optional uint64 CountersMaxInflight = 2 [default = 100];
 }
 
+message TTliConfig {
+    repeated string IgnoredTablePaths = 1;
+}
+
 message TAppConfig {
     option (NMarkers.Root) = true;
     optional TActorSystemConfig ActorSystemConfig = 1;
@@ -3091,6 +3095,8 @@ message TAppConfig {
     optional TRecoveryShardConfig RecoveryShardConfig = 117;
 
     optional TClusterDiagnosticsConfig ClusterDiagnosticsConfig = 118;
+
+    optional TTliConfig TliConfig = 119;
 }
 
 message TYdbVersion {
