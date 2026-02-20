@@ -43,6 +43,7 @@
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/cms/console/feature_flags_configurator.h>
 #include <ydb/core/cms/console/immediate_controls_configurator.h>
+#include <ydb/core/cms/console/tli_config_configurator.h>
 #include <ydb/core/cms/console/jaeger_tracing_configurator.h>
 #include <ydb/core/cms/console/log_settings_configurator.h>
 #include <ydb/core/cms/console/validators/core_validators.h>
@@ -2800,6 +2801,10 @@ void TConfigsDispatcherInitializer::InitializeServices(NActors::TActorSystemSetu
     setup->LocalServices.emplace_back(
         MakeFeatureFlagsServiceID(),
         TActorSetupCmd(NConsole::CreateFeatureFlagsConfigurator(), TMailboxType::HTSwap, appData->UserPoolId));
+
+    setup->LocalServices.emplace_back(
+        TActorId(),
+        TActorSetupCmd(NConsole::CreateTliConfigConfigurator(), TMailboxType::HTSwap, appData->UserPoolId));
 }
 
 TConfigsCacheInitializer::TConfigsCacheInitializer(const TKikimrRunConfig& runConfig)

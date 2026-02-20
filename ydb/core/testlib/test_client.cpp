@@ -56,6 +56,7 @@
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/cms/console/feature_flags_configurator.h>
 #include <ydb/core/cms/console/immediate_controls_configurator.h>
+#include <ydb/core/cms/console/tli_config_configurator.h>
 #include <ydb/core/cms/console/jaeger_tracing_configurator.h>
 #include <ydb/core/formats/clickhouse_block.h>
 #include <ydb/core/client/server/msgbus_server.h>
@@ -1223,6 +1224,7 @@ namespace Tests {
                     Runtime->Register(NConsole::CreateFeatureFlagsConfigurator(), nodeIdx),
                     nodeIdx);
             }
+            Runtime->Register(NConsole::CreateTliConfigConfigurator(), nodeIdx);
         }
         if (Settings->IsEnableMetadataProvider()) {
             NKikimrConfig::TMetadataProviderConfig cfgProto;

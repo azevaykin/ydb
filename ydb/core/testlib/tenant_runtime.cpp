@@ -5,6 +5,7 @@
 #include <ydb/core/cms/console/configs_dispatcher.h>
 #include <ydb/core/cms/console/console.h>
 #include <ydb/core/cms/console/feature_flags_configurator.h>
+#include <ydb/core/cms/console/tli_config_configurator.h>
 #include <ydb/core/mind/bscontroller/bsc.h>
 #include <ydb/core/mind/labels_maintainer.h>
 #include <ydb/core/mind/tenant_pool.h>
@@ -1054,6 +1055,7 @@ void TTenantTestRuntime::Setup(bool createTenantPools)
                     MakeFeatureFlagsServiceID(),
                     Register(CreateFeatureFlagsConfigurator()));
             }
+            Register(CreateTliConfigConfigurator());
         }
 
         Register(NKikimr::CreateLabelsMaintainer(Extension.GetMonitoringConfig()),

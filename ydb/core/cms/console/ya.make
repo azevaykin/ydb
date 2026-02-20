@@ -75,6 +75,8 @@ SRCS(
     modifications_validator.cpp
     modifications_validator.h
     net_classifier_updater.cpp
+    tli_config_configurator.cpp
+    tli_config_configurator.h
     tx_processor.cpp
     tx_processor.h
     util.cpp
