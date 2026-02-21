@@ -1,6 +1,8 @@
 #include "kqp_executer_stats.h"
 
 #include <ydb/core/protos/kqp_stats.pb.h>
+#include <ydb/library/actors/core/log.h>
+#include <ydb/library/services/services.pb.h>
 
 namespace NKikimr::NKqp {
 
@@ -860,6 +862,14 @@ ui64 TQueryExecutionStats::EstimateFinishMem() {
 }
 
 void TQueryExecutionStats::CollectLockStats(const NKikimrQueryStats::TTxStats& txStats) {
+    if (txStats.GetLocksBrokenAsBreaker() > 0 || txStats.GetLocksBrokenAsVictim() > 0) {
+        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+            "TLI TRACE CollectLockStats(DataShard): incoming LocksBrokenAsBreaker=" << txStats.GetLocksBrokenAsBreaker()
+            << " LocksBrokenAsVictim=" << txStats.GetLocksBrokenAsVictim()
+            << " BreakerQuerySpanIds.size=" << txStats.BreakerQuerySpanIdsSize()
+            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
+            << " accumulated BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size());
+    }
     LocksBrokenAsBreaker += txStats.GetLocksBrokenAsBreaker();
     LocksBrokenAsVictim += txStats.GetLocksBrokenAsVictim();
     if (txStats.GetLocksBrokenAsBreaker() > 0) {
@@ -906,6 +916,12 @@ void TQueryExecutionStats::AddDatashardStats(NKikimrQueryStats::TTxStats&& txSta
 void TQueryExecutionStats::AddBufferStats(NYql::NDqProto::TDqTaskStats&& taskStats) {
     NKqpProto::TKqpTaskExtraStats extraStats;
     if (taskStats.GetExtra().UnpackTo(&extraStats)) {
+        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+            "TLI TRACE AddBufferStats: incoming BrokenAsBreaker=" << extraStats.GetLockStats().GetBrokenAsBreaker()
+            << " BrokenAsVictim=" << extraStats.GetLockStats().GetBrokenAsVictim()
+            << " BreakerQuerySpanIds.size=" << extraStats.GetLockStats().BreakerQuerySpanIdsSize()
+            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
+            << " accumulated BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size());
         LocksBrokenAsBreaker += extraStats.GetLockStats().GetBrokenAsBreaker();
         LocksBrokenAsVictim += extraStats.GetLockStats().GetBrokenAsVictim();
         for (auto id : extraStats.GetLockStats().GetBreakerQuerySpanIds()) {
@@ -913,6 +929,9 @@ void TQueryExecutionStats::AddBufferStats(NYql::NDqProto::TDqTaskStats&& taskSta
                 BreakerQuerySpanIds.push_back(id);
             }
         }
+    } else {
+        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+            "TLI TRACE AddBufferStats: failed to unpack TKqpTaskExtraStats from buffer");
     }
     UpdateStorageTables(taskStats, nullptr);
 }

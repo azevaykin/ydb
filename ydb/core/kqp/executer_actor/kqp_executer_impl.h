@@ -7,6 +7,7 @@
 
 #include <ydb/core/kqp/common/kqp_ru_calc.h>
 #include <ydb/core/kqp/common/kqp_lwtrace_probes.h>
+#include <ydb/library/services/services.pb.h>
 #include <ydb/core/kqp/common/kqp_types.h>
 #include <ydb/core/kqp/runtime/kqp_transport.h>
 #include <ydb/core/kqp/runtime/scheduler/kqp_compute_scheduler_service.h>
@@ -1486,6 +1487,14 @@ protected:
                 }
             }
         }
+
+        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+            "TLI TRACE Executer MakeResponseAndPassAway:"
+            << " Stats->LocksBrokenAsBreaker=" << Stats->LocksBrokenAsBreaker
+            << " Stats->LocksBrokenAsVictim=" << Stats->LocksBrokenAsVictim
+            << " Stats->BreakerQuerySpanIds.size=" << Stats->BreakerQuerySpanIds.size()
+            << " ResponseEv->BreakerQuerySpanIds.size=" << ResponseEv->BreakerQuerySpanIds.size()
+            << " ResponseEv->DeferredBreakers.size=" << ResponseEv->DeferredBreakers.size());
 
         Request.Transactions.crop(0);
         this->Send(Target, ResponseEv.release());
