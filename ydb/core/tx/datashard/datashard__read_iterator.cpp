@@ -2660,10 +2660,76 @@ private:
         }
     }
 
+    // Log TLI for a broken lock found by ApplyLocks or TTxReadContinue when
+    // HandleDeferredLockBreak was not called (read was consistent, but lock was
+    // broken by a concurrent write on different keys).
+    void HandleBrokenLockTli(TReadIteratorState& state, TSysLocks& sysLocks,
+                             const TSysTables::TLocksTable::TLock& lock, const TActorContext& ctx) {
+        TMaybe<ui64> victimQuerySpanId = sysLocks.GetVictimQuerySpanIdForLock(lock.LockId);
+        if (!victimQuerySpanId && state.QuerySpanId) {
+            victimQuerySpanId = state.QuerySpanId;
+        }
+
+        LOG_TRACE_S(ctx, NKikimrServices::TLI,
+            "TLI TRACE DataShard " << Self->TabletID()
+            << ": broken lock in ApplyLocks, lockId=" << lock.LockId
+            << " victimQuerySpanId=" << (victimQuerySpanId ? ToString(*victimQuerySpanId) : "none"));
+
+        NDataIntegrity::LogVictimDetected(ctx, Self->TabletID(),
+            "Read transaction was a victim of broken locks",
+            victimQuerySpanId,
+            state.QuerySpanId ? TMaybe<ui64>(state.QuerySpanId) : Nothing());
+
+        if (victimQuerySpanId) {
+            Result->Record.SetDeferredVictimQuerySpanId(*victimQuerySpanId);
+
+            auto rawLock = sysLocks.GetRawLock(lock.LockId);
+            if (rawLock && rawLock->GetBreakVersion()) {
+                auto breakerInfos = Self->FindBreakerInfoForTliAtVersion(*rawLock->GetBreakVersion());
+                TVector<ui64> victimIds = {*victimQuerySpanId};
+                for (const auto& info : breakerInfos) {
+                    NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                        "Write transaction broke other locks (deferred)",
+                        {},
+                        TMaybe<ui64>(info.QuerySpanId),
+                        victimIds);
+                    Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
+                    Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                }
+                if (breakerInfos.empty()) {
+                    auto breakerInfosByVersion = Self->FindBreakerInfoForTli(state.ReadVersion);
+                    for (const auto& info : breakerInfosByVersion) {
+                        NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                            "Write transaction broke other locks (deferred)",
+                            {},
+                            TMaybe<ui64>(info.QuerySpanId),
+                            victimIds);
+                        Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
+                        Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                    }
+                }
+            } else {
+                auto breakerInfos = Self->FindBreakerInfoForTli(state.ReadVersion);
+                TVector<ui64> victimIds = {*victimQuerySpanId};
+                for (const auto& info : breakerInfos) {
+                    NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                        "Write transaction broke other locks (deferred)",
+                        {},
+                        TMaybe<ui64>(info.QuerySpanId),
+                        victimIds);
+                    Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
+                    Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                }
+            }
+        }
+    }
+
     void AcquireLock(TReadIteratorState& state, const TActorContext& ctx) {
         auto& sysLocks = Self->SysLocksTable();
 
         TTableId tableId(state.PathId.OwnerId, state.PathId.LocalPathId, state.SchemaVersion);
+
+        bool handledDeferredBreak = false;
 
         switch (state.LockMode) {
         case NKikimrDataEvents::OPTIMISTIC:
@@ -2692,6 +2758,7 @@ private:
 
             if (Reader->HadInvisibleRowSkips() || Reader->HadInconsistentResult()) {
                 HandleDeferredLockBreak(state, sysLocks, ctx);
+                handledDeferredBreak = true;
             }
 
             break;
@@ -2699,6 +2766,7 @@ private:
         case NKikimrDataEvents::OPTIMISTIC_SNAPSHOT_ISOLATION:
             if (Reader->HadInconsistentResult()) {
                 HandleDeferredLockBreak(state, sysLocks, ctx);
+                handledDeferredBreak = true;
             }
 
             break;
@@ -2714,6 +2782,10 @@ private:
             NKikimrDataEvents::TLock* addLock;
             if (lock.IsError()) {
                 addLock = Result->Record.AddBrokenTxLocks();
+
+                if (!handledDeferredBreak) {
+                    HandleBrokenLockTli(state, sysLocks, lock, ctx);
+                }
             } else {
                 addLock = Result->Record.AddTxLocks();
             }
@@ -3336,6 +3408,65 @@ public:
 
                 LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, Self->TabletID() << " read iterator# " << state.ReadId
                     << " TTxReadContinue::Execute() found broken lock# " << state.Lock->GetLockId());
+
+                // Emit TLI for victim and breaker
+                {
+                    TMaybe<ui64> victimQuerySpanId = state.Lock->GetVictimQuerySpanId()
+                        ? TMaybe<ui64>(state.Lock->GetVictimQuerySpanId())
+                        : (state.QuerySpanId ? TMaybe<ui64>(state.QuerySpanId) : Nothing());
+
+                    LOG_TRACE_S(ctx, NKikimrServices::TLI,
+                        "TLI TRACE DataShard " << Self->TabletID()
+                        << ": broken lock in TTxReadContinue, lockId=" << state.Lock->GetLockId()
+                        << " victimQuerySpanId=" << (victimQuerySpanId ? ToString(*victimQuerySpanId) : "none"));
+
+                    NDataIntegrity::LogVictimDetected(ctx, Self->TabletID(),
+                        "Read transaction was a victim of broken locks",
+                        victimQuerySpanId,
+                        state.QuerySpanId ? TMaybe<ui64>(state.QuerySpanId) : Nothing());
+
+                    if (victimQuerySpanId) {
+                        Result->Record.SetDeferredVictimQuerySpanId(*victimQuerySpanId);
+
+                        TVector<ui64> victimIds = {*victimQuerySpanId};
+                        auto breakVersion = state.Lock->GetBreakVersion();
+                        if (breakVersion) {
+                            auto breakerInfos = Self->FindBreakerInfoForTliAtVersion(*breakVersion);
+                            for (const auto& info : breakerInfos) {
+                                NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                                    "Write transaction broke other locks (deferred)",
+                                    {},
+                                    TMaybe<ui64>(info.QuerySpanId),
+                                    victimIds);
+                                Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
+                                Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                            }
+                            if (breakerInfos.empty()) {
+                                auto breakerInfosByVersion = Self->FindBreakerInfoForTli(state.ReadVersion);
+                                for (const auto& info : breakerInfosByVersion) {
+                                    NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                                        "Write transaction broke other locks (deferred)",
+                                        {},
+                                        TMaybe<ui64>(info.QuerySpanId),
+                                        victimIds);
+                                    Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
+                                    Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                                }
+                            }
+                        } else {
+                            auto breakerInfos = Self->FindBreakerInfoForTli(state.ReadVersion);
+                            for (const auto& info : breakerInfos) {
+                                NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                                    "Write transaction broke other locks (deferred)",
+                                    {},
+                                    TMaybe<ui64>(info.QuerySpanId),
+                                    victimIds);
+                                Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
+                                Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                            }
+                        }
+                    }
+                }
 
                 // A broken write lock means we are reading inconsistent results and must abort
                 if (state.Lock->IsWriteLock()) {
