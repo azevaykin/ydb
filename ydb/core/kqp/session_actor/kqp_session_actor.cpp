@@ -2580,7 +2580,6 @@ public:
             switch (status) {
                 case Ydb::StatusIds::ABORTED: {
                     if (QueryState->TxCtx->TxManager && QueryState->TxCtx->TxManager->BrokenLocks()) {
-                        YQL_ENSURE(!issues.Empty());
                         auto brokenLockQuerySpanId = QueryState->TxCtx->TxManager->GetVictimQuerySpanId();
                         // Use TxManager's broken locks count as fallback when executer stats don't
                         // carry LocksBrokenAsVictim (e.g. lock invalidation detected via AddLock
