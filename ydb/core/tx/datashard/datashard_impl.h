@@ -3155,17 +3155,6 @@ public:
         return result;
     }
 
-    // Find breaker info for the write that happened at exactly the given version
-    TVector<TBreakerInfo> FindBreakerInfoForTliAtVersion(const TRowVersion& breakVersion) const {
-        TVector<TBreakerInfo> result;
-        for (const auto& entry : RecentWritesForTli) {
-            if (entry.WriteVersion == breakVersion) {
-                result.push_back({entry.QuerySpanId, entry.SenderNodeId});
-            }
-        }
-        return result;
-    }
-
     auto& GetLockChangeRecords() {
         return LockChangeRecords;
     }

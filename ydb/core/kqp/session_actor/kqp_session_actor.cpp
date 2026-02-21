@@ -2294,9 +2294,9 @@ public:
     }
 
     // Emit TLI breaker logs for direct lock breaks (one log per shard that broke locks).
-    void EmitBreakerTliLogs(TEvKqpExecuter::TEvTxResponse* ev) {
+    void EmitBreakerLogs(TEvKqpExecuter::TEvTxResponse* ev) {
         LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-            "TLI TRACE EmitBreakerTliLogs: LocksBrokenAsBreaker=" << ev->LocksBrokenAsBreaker
+            "TLI TRACE EmitBreakerLogs: LocksBrokenAsBreaker=" << ev->LocksBrokenAsBreaker
             << " BreakerQuerySpanIds.size=" << ev->BreakerQuerySpanIds.size()
             << " IS_INFO_LOG_ENABLED=" << IS_INFO_LOG_ENABLED(NKikimrServices::TLI)
             << " Action=" << static_cast<int>(QueryState->GetAction())
@@ -2304,7 +2304,7 @@ public:
 
         if (ev->LocksBrokenAsBreaker == 0 || !IS_INFO_LOG_ENABLED(NKikimrServices::TLI)) {
             LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                "TLI TRACE EmitBreakerTliLogs: skipped"
+                "TLI TRACE EmitBreakerLogs: skipped"
                 << " LocksBrokenAsBreaker=" << ev->LocksBrokenAsBreaker
                 << " IS_INFO=" << IS_INFO_LOG_ENABLED(NKikimrServices::TLI));
             return;
@@ -2316,7 +2316,7 @@ public:
         if (!ev->BreakerQuerySpanIds.empty()) {
             TString combinedQueryTexts = QueryState->TxCtx ? QueryState->TxCtx->QueryTextCollector.CombineQueryTexts() : TString();
             LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                "TLI TRACE EmitBreakerTliLogs: emitting " << ev->BreakerQuerySpanIds.size()
+                "TLI TRACE EmitBreakerLogs: emitting " << ev->BreakerQuerySpanIds.size()
                 << " breaker records, isCommitAction=" << isCommitAction
                 << " hasTxCtx=" << (QueryState->TxCtx != nullptr)
                 << " combinedQueryTexts.size=" << combinedQueryTexts.size());
@@ -2326,13 +2326,13 @@ public:
                     breakerQueryText = QueryState->TxCtx->QueryTextCollector.GetQueryTextBySpanId(breakerQuerySpanId);
                 }
                 LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                    "TLI TRACE EmitBreakerTliLogs: spanId=" << breakerQuerySpanId
+                    "TLI TRACE EmitBreakerLogs: spanId=" << breakerQuerySpanId
                     << " queryTextFromCollector=" << (breakerQueryText.empty() ? "empty" : "found")
                     << " queryTextLen=" << breakerQueryText.size());
                 if (breakerQueryText.empty()) {
                     breakerQueryText = QueryState->ExtractQueryText();
                     LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                        "TLI TRACE EmitBreakerTliLogs: fallback to ExtractQueryText, len=" << breakerQueryText.size());
+                        "TLI TRACE EmitBreakerLogs: fallback to ExtractQueryText, len=" << breakerQueryText.size());
                 }
 
                 NDataIntegrity::LogTli(NDataIntegrity::TTliLogParams{
@@ -2347,7 +2347,7 @@ public:
             }
         } else {
             LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                "TLI TRACE EmitBreakerTliLogs: fallback path (no BreakerQuerySpanIds)"
+                "TLI TRACE EmitBreakerLogs: fallback path (no BreakerQuerySpanIds)"
                 << " currentQuerySpanId=" << QueryState->GetQuerySpanId());
             NDataIntegrity::LogTli(NDataIntegrity::TTliLogParams{
                 .Component = "SessionActor",
@@ -2362,13 +2362,13 @@ public:
     }
 
     // Emit TLI breaker logs for deferred lock scenarios (lock broken between snapshot and re-read).
-    void EmitDeferredBreakerTliLogs(TEvKqpExecuter::TEvTxResponse* ev) {
+    void EmitDeferredBreakerLogs(TEvKqpExecuter::TEvTxResponse* ev) {
         LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-            "TLI TRACE EmitDeferredBreakerTliLogs: DeferredBreakers.size=" << ev->DeferredBreakers.size());
+            "TLI TRACE EmitDeferredBreakerLogs: DeferredBreakers.size=" << ev->DeferredBreakers.size());
 
         if (ev->DeferredBreakers.empty() || !IS_INFO_LOG_ENABLED(NKikimrServices::TLI)) {
             LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                "TLI TRACE EmitDeferredBreakerTliLogs: skipped"
+                "TLI TRACE EmitDeferredBreakerLogs: skipped"
                 << " DeferredBreakers.empty=" << ev->DeferredBreakers.empty());
             return;
         }
@@ -2381,7 +2381,7 @@ public:
             TString breakerQueryText = NDataIntegrity::TNodeQueryTextCache::Instance().Get(breaker.QuerySpanId);
 
             LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                "TLI TRACE EmitDeferredBreakerTliLogs: breaker spanId=" << breaker.QuerySpanId
+                "TLI TRACE EmitDeferredBreakerLogs: breaker spanId=" << breaker.QuerySpanId
                 << " nodeId=" << breaker.NodeId
                 << " localNodeId=" << localNodeId
                 << " cacheHit=" << !breakerQueryText.empty()
@@ -2395,7 +2395,7 @@ public:
                 }
 
                 LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                    "TLI TRACE EmitDeferredBreakerTliLogs: emitting local deferred breaker log"
+                    "TLI TRACE EmitDeferredBreakerLogs: emitting local deferred breaker log"
                     << " spanId=" << breaker.QuerySpanId);
 
                 NDataIntegrity::LogTli(NDataIntegrity::TTliLogParams{
@@ -2409,7 +2409,7 @@ public:
                 }, TlsActivationContext->AsActorContext());
             } else {
                 LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-                    "TLI TRACE EmitDeferredBreakerTliLogs: spawning TDeferredTliLogActor"
+                    "TLI TRACE EmitDeferredBreakerLogs: spawning TDeferredTliLogActor"
                     << " spanId=" << breaker.QuerySpanId
                     << " remoteNodeId=" << breaker.NodeId);
                 Register(new TDeferredTliLogActor(
@@ -2552,8 +2552,8 @@ public:
             << " status=" << response->GetStatus()
             << " TraceId=" << TraceId());
 
-        EmitBreakerTliLogs(ev);
-        EmitDeferredBreakerTliLogs(ev);
+        EmitBreakerLogs(ev);
+        EmitDeferredBreakerLogs(ev);
 
         if (QueryState->TxCtx->TxManager) {
             QueryState->ParticipantNodes = QueryState->TxCtx->TxManager->GetParticipantNodes();

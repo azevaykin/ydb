@@ -2608,19 +2608,22 @@ private:
     // Handle deferred lock break detection: determine victim, log TLI events, and
     // pass breaker info to SessionActor via the result proto.
     void HandleDeferredLockBreak(TReadIteratorState& state, TSysLocks& sysLocks, const TActorContext& ctx) {
-        // Check if lock was already broken before we call BreakSetLocks
         bool lockWasAlreadyBroken = false;
+        ui64 storedBreakerSpanId = 0;
+        ui32 storedBreakerNodeId = 0;
+        TLockInfo::TPtr rawLockPtr;
+
         if (state.LockId) {
-            if (auto rawLock = sysLocks.GetRawLock(state.LockId)) {
-                lockWasAlreadyBroken = rawLock->IsBroken();
+            rawLockPtr = sysLocks.GetRawLock(state.LockId);
+            if (rawLockPtr) {
+                lockWasAlreadyBroken = rawLockPtr->IsBroken();
+                storedBreakerSpanId = rawLockPtr->GetBreakerQuerySpanId();
+                storedBreakerNodeId = rawLockPtr->GetBreakerNodeId();
             }
         }
 
         sysLocks.BreakSetLocks();
 
-        // Determine victim query trace ID:
-        // - If lock was already broken (e.g., breaker wrote to same key), use the original victim
-        // - If lock wasn't broken before (deferred scenario), use current query as victim
         TMaybe<ui64> victimQuerySpanId;
         if (lockWasAlreadyBroken) {
             victimQuerySpanId = state.LockId ? sysLocks.GetVictimQuerySpanIdForLock(state.LockId) : Nothing();
@@ -2629,7 +2632,6 @@ private:
                 ? TMaybe<ui64>(state.QuerySpanId)
                 : (state.LockId ? sysLocks.GetVictimQuerySpanIdForLock(state.LockId) : Nothing());
 
-            // Update the lock's VictimQuerySpanId so SessionActor receives the correct victim info
             if (state.LockId && state.QuerySpanId) {
                 if (auto rawLock = sysLocks.GetRawLock(state.LockId)) {
                     rawLock->SetVictimQuerySpanId(state.QuerySpanId);
@@ -2642,20 +2644,41 @@ private:
             victimQuerySpanId,
             state.QuerySpanId ? TMaybe<ui64>(state.QuerySpanId) : Nothing());
 
-        // In deferred lock scenarios, emit breaker logs and pass info to SessionActor
         if (victimQuerySpanId) {
             Result->Record.SetDeferredVictimQuerySpanId(*victimQuerySpanId);
 
-            auto breakerInfos = Self->FindBreakerInfoForTli(state.ReadVersion);
             TVector<ui64> victimIds = {*victimQuerySpanId};
-            for (const auto& info : breakerInfos) {
+            bool foundBreaker = false;
+
+            if (storedBreakerSpanId) {
                 NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
                     "Write transaction broke other locks (deferred)",
-                    {}, // No specific lock IDs in deferred scenario
-                    TMaybe<ui64>(info.QuerySpanId),
+                    {},
+                    TMaybe<ui64>(storedBreakerSpanId),
                     victimIds);
-                Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
-                Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                Result->Record.AddDeferredBreakerQuerySpanIds(storedBreakerSpanId);
+                Result->Record.AddDeferredBreakerNodeIds(storedBreakerNodeId);
+                foundBreaker = true;
+            }
+
+            if (!foundBreaker) {
+                auto breakerInfos = Self->FindBreakerInfoForTli(state.ReadVersion);
+                for (const auto& info : breakerInfos) {
+                    if (rawLockPtr) {
+                        rawLockPtr->SetBreakerInfo(info.QuerySpanId, info.SenderNodeId);
+                    }
+                    NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                        "Write transaction broke other locks (deferred)",
+                        {},
+                        TMaybe<ui64>(info.QuerySpanId),
+                        victimIds);
+                    Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
+                    Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
+                }
+            }
+
+            if (rawLockPtr) {
+                rawLockPtr->ConsumeBreakerInfo();
             }
         }
     }
@@ -2684,42 +2707,15 @@ private:
             Result->Record.SetDeferredVictimQuerySpanId(*victimQuerySpanId);
 
             auto rawLock = sysLocks.GetRawLock(lock.LockId);
-            if (rawLock && rawLock->GetBreakVersion()) {
-                auto breakerInfos = Self->FindBreakerInfoForTliAtVersion(*rawLock->GetBreakVersion());
+            if (rawLock && rawLock->GetBreakerQuerySpanId() && !rawLock->IsBreakerConsumed()) {
                 TVector<ui64> victimIds = {*victimQuerySpanId};
-                for (const auto& info : breakerInfos) {
-                    NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
-                        "Write transaction broke other locks (deferred)",
-                        {},
-                        TMaybe<ui64>(info.QuerySpanId),
-                        victimIds);
-                    Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
-                    Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
-                }
-                if (breakerInfos.empty()) {
-                    auto breakerInfosByVersion = Self->FindBreakerInfoForTli(state.ReadVersion);
-                    for (const auto& info : breakerInfosByVersion) {
-                        NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
-                            "Write transaction broke other locks (deferred)",
-                            {},
-                            TMaybe<ui64>(info.QuerySpanId),
-                            victimIds);
-                        Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
-                        Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
-                    }
-                }
-            } else {
-                auto breakerInfos = Self->FindBreakerInfoForTli(state.ReadVersion);
-                TVector<ui64> victimIds = {*victimQuerySpanId};
-                for (const auto& info : breakerInfos) {
-                    NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
-                        "Write transaction broke other locks (deferred)",
-                        {},
-                        TMaybe<ui64>(info.QuerySpanId),
-                        victimIds);
-                    Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
-                    Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
-                }
+                NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                    "Write transaction broke other locks (deferred)",
+                    {},
+                    TMaybe<ui64>(rawLock->GetBreakerQuerySpanId()),
+                    victimIds);
+                Result->Record.AddDeferredBreakerQuerySpanIds(rawLock->GetBreakerQuerySpanId());
+                Result->Record.AddDeferredBreakerNodeIds(rawLock->GetBreakerNodeId());
             }
         }
     }
@@ -3428,42 +3424,15 @@ public:
                     if (victimQuerySpanId) {
                         Result->Record.SetDeferredVictimQuerySpanId(*victimQuerySpanId);
 
-                        TVector<ui64> victimIds = {*victimQuerySpanId};
-                        auto breakVersion = state.Lock->GetBreakVersion();
-                        if (breakVersion) {
-                            auto breakerInfos = Self->FindBreakerInfoForTliAtVersion(*breakVersion);
-                            for (const auto& info : breakerInfos) {
-                                NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
-                                    "Write transaction broke other locks (deferred)",
-                                    {},
-                                    TMaybe<ui64>(info.QuerySpanId),
-                                    victimIds);
-                                Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
-                                Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
-                            }
-                            if (breakerInfos.empty()) {
-                                auto breakerInfosByVersion = Self->FindBreakerInfoForTli(state.ReadVersion);
-                                for (const auto& info : breakerInfosByVersion) {
-                                    NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
-                                        "Write transaction broke other locks (deferred)",
-                                        {},
-                                        TMaybe<ui64>(info.QuerySpanId),
-                                        victimIds);
-                                    Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
-                                    Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
-                                }
-                            }
-                        } else {
-                            auto breakerInfos = Self->FindBreakerInfoForTli(state.ReadVersion);
-                            for (const auto& info : breakerInfos) {
-                                NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
-                                    "Write transaction broke other locks (deferred)",
-                                    {},
-                                    TMaybe<ui64>(info.QuerySpanId),
-                                    victimIds);
-                                Result->Record.AddDeferredBreakerQuerySpanIds(info.QuerySpanId);
-                                Result->Record.AddDeferredBreakerNodeIds(info.SenderNodeId);
-                            }
+                        if (state.Lock->GetBreakerQuerySpanId() && !state.Lock->IsBreakerConsumed()) {
+                            TVector<ui64> victimIds = {*victimQuerySpanId};
+                            NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
+                                "Write transaction broke other locks (deferred)",
+                                {},
+                                TMaybe<ui64>(state.Lock->GetBreakerQuerySpanId()),
+                                victimIds);
+                            Result->Record.AddDeferredBreakerQuerySpanIds(state.Lock->GetBreakerQuerySpanId());
+                            Result->Record.AddDeferredBreakerNodeIds(state.Lock->GetBreakerNodeId());
                         }
                     }
                 }

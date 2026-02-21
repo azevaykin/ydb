@@ -43,12 +43,12 @@ public:
 
     void FillDeferredBreakerInfo(ui64 lockTxId, NKikimrQueryStats::TTxStats* txStats) {
         auto lockInfo = DataShard.SysLocksTable().GetRawLock(lockTxId);
-        if (lockInfo && lockInfo->GetBreakVersion()) {
-            auto breakers = DataShard.FindBreakerInfoForTliAtVersion(*lockInfo->GetBreakVersion());
-            for (const auto& breaker : breakers) {
-                txStats->AddDeferredBreakerQuerySpanIds(breaker.QuerySpanId);
-                txStats->AddDeferredBreakerNodeIds(breaker.SenderNodeId);
-            }
+        if (!lockInfo || !lockInfo->GetBreakVersion()) {
+            return;
+        }
+        if (lockInfo->GetBreakerQuerySpanId() && !lockInfo->IsBreakerConsumed()) {
+            txStats->AddDeferredBreakerQuerySpanIds(lockInfo->GetBreakerQuerySpanId());
+            txStats->AddDeferredBreakerNodeIds(lockInfo->GetBreakerNodeId());
         }
     }
 

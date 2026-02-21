@@ -110,6 +110,8 @@ TLockInfo::TLockInfo(TLockLocker * locker, const ILocksDb::TLockRow& row)
     , CreationTime(TInstant::MicroSeconds(row.CreateTs))
     , Flags(ELockFlags(row.Flags))
     , VictimQuerySpanId(row.VictimQuerySpanId)
+    , BreakerQuerySpanId_(row.BreakerQuerySpanId)
+    , BreakerNodeId_(row.BreakerNodeId)
 {
     if (row.BreakVersion != TRowVersion::Max()) {
         BreakVersion.emplace(row.BreakVersion);
@@ -417,6 +419,8 @@ void TLockInfo::CleanupConflicts() {
 }
 
 bool TLockInfo::RestoreInMemoryState(const ILocksDb::TLockRow& lockRow) {
+    SetBreakerInfo(lockRow.BreakerQuerySpanId, lockRow.BreakerNodeId);
+
     auto flags = ELockFlags(lockRow.Flags);
     if (!!(flags & ELockFlags::Persistent)) {
         Y_ENSURE(IsPersistent());
@@ -922,6 +926,7 @@ TLockInfo::TPtr TLockLocker::RestoreInMemoryLock(const ILocksDb::TLockRow& row) 
                 // Lock was broken in the previous generation, but that break
                 // has failed to commit. Since subsequent reads may not have
                 // detected conflicts we need to repeat the break.
+                it->second->SetBreakerInfo(row.BreakerQuerySpanId, row.BreakerNodeId);
                 PendingRestoreBreakQueue.PushBack(it->second.Get());
                 return nullptr;
             }
@@ -1148,7 +1153,13 @@ std::pair<TVector<TSysLocks::TLock>, TVector<ui64>> TSysLocks::ApplyLocks() {
     brokenLocks.reserve(Update->BreakLocks.Size());
     if (Update->BreakLocks) {
         Locker.BreakLocks(Update->BreakLocks, breakVersion);
-        for (const auto& lock : Update->BreakLocks) {
+        bool isWriteOp = !Update->WriteTables.Empty();
+        ui64 breakerSpanId = isWriteOp ? Update->GetEffectiveBreakerQuerySpanId() : 0;
+        ui32 breakerNodeId = isWriteOp ? Update->LockNodeId : 0;
+        for (auto& lock : Update->BreakLocks) {
+            if (breakerSpanId) {
+                lock.SetBreakerInfo(breakerSpanId, breakerNodeId);
+            }
             brokenLocks.push_back(lock.GetLockId());
         }
     }
