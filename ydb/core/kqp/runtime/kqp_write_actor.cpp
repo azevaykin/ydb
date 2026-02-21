@@ -1011,7 +1011,6 @@ public:
             UpdateStats(ev->Get()->Record.GetTxStats());
             TxManager->BreakLock(brokenShardId);
             YQL_ENSURE(TxManager->BrokenLocks());
-            TxManager->SetError(brokenShardId);
 
             SetVictimQuerySpanIdFromBrokenLocks(brokenShardId, ev->Get()->Record.GetTxLocks(), TxManager);
             if (TableWriteActorSpan) {
@@ -4905,11 +4904,28 @@ public:
             << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
                            : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
-        if (FlushDeferredLocksBrokenIfPending()) return;
+        if (PendingLocksBrokenError) {
+            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+                "TLI TRACE BufferWriteActor OnLocksBrokenError: second LOCKS_BROKEN while deferred, consuming commit result for shard=" << shardId);
+            if (CurrentStateFunc() == &TThis::StateCommit) {
+                if (TxManager->ConsumeCommitResult(shardId)) {
+                    FlushPendingLocksBrokenError();
+                }
+            } else if (CurrentStateFunc() == &TThis::StatePrepare) {
+                if (PendingPrepareShards > 0) {
+                    --PendingPrepareShards;
+                }
+                if (PendingPrepareShards == 0) {
+                    FlushPendingLocksBrokenError();
+                }
+            }
+            return;
+        }
         if (CurrentStateFunc() == &TThis::StatePrepare && PendingPrepareShards > 0) {
             --PendingPrepareShards;
         }
         if (TryDeferLocksBrokenError(shardId, std::move(issues))) return;
+        TxManager->SetError(shardId);
         ReplyError(statusCode, std::move(issues));
     }
 
@@ -4922,7 +4938,11 @@ public:
             << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
                            : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
-        if (FlushDeferredLocksBrokenIfPending()) return;
+        if (PendingLocksBrokenError) {
+            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+                "TLI TRACE BufferWriteActor OnError: suppressed (LOCKS_BROKEN deferred)");
+            return;
+        }
         ReplyError(statusCode, id, message, subIssues);
     }
 
@@ -4935,7 +4955,11 @@ public:
             << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
                            : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
-        if (FlushDeferredLocksBrokenIfPending()) return;
+        if (PendingLocksBrokenError) {
+            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+                "TLI TRACE BufferWriteActor OnError: suppressed (LOCKS_BROKEN deferred)");
+            return;
+        }
         ReplyError(statusCode, std::move(issues));
     }
 
