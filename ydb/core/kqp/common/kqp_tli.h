@@ -226,7 +226,14 @@ inline void LogTli(const TTliLogParams& params, const NActors::TActorContext& ct
         LogKeyValue("VictimQueryTexts", EscapeC(params.QueryTexts), ss, true);
     }
 
-    LOG_INFO_S(ctx, NKikimrServices::TLI, ss.Str());
+    auto infoMsg = ss.Str();
+    LOG_TRACE_S(ctx, NKikimrServices::TLI,
+        "TLI TRACE LogTli: emitting INFO record"
+        << " isBreaker=" << isBreaker
+        << " msgLen=" << infoMsg.size()
+        << " BreakerQuerySpanId=" << (params.BreakerQuerySpanId.Defined() ? ToString(*params.BreakerQuerySpanId) : "none")
+        << " VictimQuerySpanId=" << (params.VictimQuerySpanId.Defined() ? ToString(*params.VictimQuerySpanId) : "none"));
+    LOG_INFO_S(ctx, NKikimrServices::TLI, infoMsg);
 }
 
 }

@@ -2364,15 +2364,12 @@ public:
     // Emit TLI breaker logs for deferred lock scenarios (lock broken between snapshot and re-read).
     void EmitDeferredBreakerTliLogs(TEvKqpExecuter::TEvTxResponse* ev) {
         LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
-            "TLI TRACE EmitDeferredBreakerTliLogs: DeferredBreakers.size=" << ev->DeferredBreakers.size()
-            << " IS_INFO_LOG_ENABLED=" << IS_INFO_LOG_ENABLED(NKikimrServices::TLI)
-            << " TraceId=" << TraceId());
+            "TLI TRACE EmitDeferredBreakerTliLogs: DeferredBreakers.size=" << ev->DeferredBreakers.size());
 
         if (ev->DeferredBreakers.empty() || !IS_INFO_LOG_ENABLED(NKikimrServices::TLI)) {
             LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
                 "TLI TRACE EmitDeferredBreakerTliLogs: skipped"
-                << " DeferredBreakers.empty=" << ev->DeferredBreakers.empty()
-                << " IS_INFO=" << IS_INFO_LOG_ENABLED(NKikimrServices::TLI));
+                << " DeferredBreakers.empty=" << ev->DeferredBreakers.empty());
             return;
         }
 
