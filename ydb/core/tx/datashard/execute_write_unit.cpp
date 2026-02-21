@@ -455,6 +455,15 @@ public:
                     NDataIntegrity::LogVictimDetected(ctx, tabletId, "Write transaction was a victim of broken locks",
                                                       DataShard.SysLocksTable().GetVictimQuerySpanIdForLock(guardLocks.LockTxId),
                                                       guardLocks.QuerySpanId ? TMaybe<ui64>(guardLocks.QuerySpanId) : Nothing());
+                    auto lockInfo = sysLocks.GetRawLock(guardLocks.LockTxId);
+                    if (lockInfo && lockInfo->GetBreakVersion()) {
+                        auto breakers = DataShard.FindBreakerInfoForTliAtVersion(*lockInfo->GetBreakVersion());
+                        auto* txStats = writeOp->GetWriteResult()->Record.MutableTxStats();
+                        for (const auto& breaker : breakers) {
+                            txStats->AddDeferredBreakerQuerySpanIds(breaker.QuerySpanId);
+                            txStats->AddDeferredBreakerNodeIds(breaker.SenderNodeId);
+                        }
+                    }
                     return EExecutionStatus::Executed;
                 };
 
@@ -513,6 +522,27 @@ public:
                 NDataIntegrity::LogVictimDetected(ctx, tabletId, "Write transaction was a victim of broken locks",
                                                   victimQuerySpanId,
                                                   guardLocks.QuerySpanId ? TMaybe<ui64>(guardLocks.QuerySpanId) : Nothing());
+
+                // Look up deferred breaker info before locks are erased
+                {
+                    auto* txStats = writeOp->GetWriteResult()->Record.MutableTxStats();
+                    for (const auto& brokenLock : brokenLocks) {
+                        auto lockInfo = sysLocks.GetRawLock(brokenLock.GetLockId());
+                        if (lockInfo && lockInfo->GetBreakVersion()) {
+                            auto breakers = DataShard.FindBreakerInfoForTliAtVersion(*lockInfo->GetBreakVersion());
+                            for (const auto& breaker : breakers) {
+                                txStats->AddDeferredBreakerQuerySpanIds(breaker.QuerySpanId);
+                                txStats->AddDeferredBreakerNodeIds(breaker.SenderNodeId);
+                            }
+                        }
+                    }
+                    if (txStats->DeferredBreakerQuerySpanIdsSize() > 0) {
+                        LOG_TRACE_S(ctx, NKikimrServices::TLI,
+                            "TLI TRACE DataShard " << tabletId
+                            << ": victim commit found " << txStats->DeferredBreakerQuerySpanIdsSize()
+                            << " deferred breakers");
+                    }
+                }
 
                 for (auto& brokenLock : brokenLocks) {
                     writeOp->GetWriteResult()->Record.MutableTxLocks()->Add()->Swap(&brokenLock);

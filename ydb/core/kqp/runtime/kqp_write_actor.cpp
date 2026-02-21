@@ -246,6 +246,8 @@ struct TKqpTableWriterStatistics {
     ui64 LocksBrokenAsBreaker = 0;
     ui64 LocksBrokenAsVictim = 0;
     TVector<ui64> BreakerQuerySpanIds;
+    TVector<ui64> DeferredBreakerQuerySpanIds;
+    TVector<ui32> DeferredBreakerNodeIds;
 
     THashSet<ui64> AffectedPartitions;
 
@@ -282,9 +284,23 @@ struct TKqpTableWriterStatistics {
                 BreakerQuerySpanIds.push_back(id);
             }
         }
+        if (txStats.DeferredBreakerQuerySpanIdsSize() > 0) {
+            for (size_t i = 0; i < static_cast<size_t>(txStats.DeferredBreakerQuerySpanIdsSize()); ++i) {
+                DeferredBreakerQuerySpanIds.push_back(txStats.GetDeferredBreakerQuerySpanIds(i));
+                DeferredBreakerNodeIds.push_back(
+                    i < static_cast<size_t>(txStats.DeferredBreakerNodeIdsSize()) ? txStats.GetDeferredBreakerNodeIds(i) : 0u);
+            }
+            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+                "TLI TRACE WriteActor UpdateStats: collected " << txStats.DeferredBreakerQuerySpanIdsSize()
+                << " deferred breakers, accumulated=" << DeferredBreakerQuerySpanIds.size());
+        }
     }
 
-    static void AddLockStats(NYql::NDqProto::TDqTaskStats* stats, ui64 brokenAsBreaker, ui64 brokenAsVictim, const TVector<ui64>& breakerQuerySpanIds = {}) {
+    static void AddLockStats(NYql::NDqProto::TDqTaskStats* stats, ui64 brokenAsBreaker, ui64 brokenAsVictim,
+        const TVector<ui64>& breakerQuerySpanIds = {},
+        const TVector<ui64>& deferredBreakerQuerySpanIds = {},
+        const TVector<ui32>& deferredBreakerNodeIds = {})
+    {
         NKqpProto::TKqpTaskExtraStats extraStats;
         if (stats->HasExtra()) {
             stats->GetExtra().UnpackTo(&extraStats);
@@ -296,6 +312,11 @@ struct TKqpTableWriterStatistics {
         for (ui64 id : breakerQuerySpanIds) {
             extraStats.MutableLockStats()->AddBreakerQuerySpanIds(id);
         }
+        for (size_t i = 0; i < deferredBreakerQuerySpanIds.size(); ++i) {
+            extraStats.MutableLockStats()->AddDeferredBreakerQuerySpanIds(deferredBreakerQuerySpanIds[i]);
+            extraStats.MutableLockStats()->AddDeferredBreakerNodeIds(
+                i < deferredBreakerNodeIds.size() ? deferredBreakerNodeIds[i] : 0u);
+        }
         stats->MutableExtra()->PackFrom(extraStats);
     }
 
@@ -305,12 +326,16 @@ struct TKqpTableWriterStatistics {
                 "TLI TRACE WriteActor FillStats: LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
                 << " LocksBrokenAsVictim=" << LocksBrokenAsVictim
                 << " BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size()
+                << " DeferredBreakerQuerySpanIds.size=" << DeferredBreakerQuerySpanIds.size()
                 << " tablePath=" << tablePath);
         }
-        AddLockStats(stats, LocksBrokenAsBreaker, LocksBrokenAsVictim, BreakerQuerySpanIds);
+        AddLockStats(stats, LocksBrokenAsBreaker, LocksBrokenAsVictim, BreakerQuerySpanIds,
+                     DeferredBreakerQuerySpanIds, DeferredBreakerNodeIds);
         LocksBrokenAsBreaker = 0;
         LocksBrokenAsVictim = 0;
         BreakerQuerySpanIds.clear();
+        DeferredBreakerQuerySpanIds.clear();
+        DeferredBreakerNodeIds.clear();
 
         if (ReadRows + WriteRows + EraseRows == 0) {
             // Avoid empty table_access stats

@@ -867,14 +867,26 @@ void TQueryExecutionStats::CollectLockStats(const NKikimrQueryStats::TTxStats& t
             "TLI TRACE CollectLockStats(DataShard): incoming LocksBrokenAsBreaker=" << txStats.GetLocksBrokenAsBreaker()
             << " LocksBrokenAsVictim=" << txStats.GetLocksBrokenAsVictim()
             << " BreakerQuerySpanIds.size=" << txStats.BreakerQuerySpanIdsSize()
+            << " DeferredBreakerQuerySpanIds.size=" << txStats.DeferredBreakerQuerySpanIdsSize()
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
-            << " accumulated BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size());
+            << " accumulated BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size()
+            << " accumulated DeferredBreakers.size=" << DeferredBreakers.size());
     }
     LocksBrokenAsBreaker += txStats.GetLocksBrokenAsBreaker();
     LocksBrokenAsVictim += txStats.GetLocksBrokenAsVictim();
     if (txStats.GetLocksBrokenAsBreaker() > 0) {
         for (ui64 id : txStats.GetBreakerQuerySpanIds()) {
             BreakerQuerySpanIds.push_back(id);
+        }
+    }
+    if (txStats.DeferredBreakerQuerySpanIdsSize() > 0) {
+        for (size_t i = 0; i < static_cast<size_t>(txStats.DeferredBreakerQuerySpanIdsSize()); ++i) {
+            if (txStats.GetDeferredBreakerQuerySpanIds(i) != 0) {
+                DeferredBreakers.push_back({
+                    txStats.GetDeferredBreakerQuerySpanIds(i),
+                    i < static_cast<size_t>(txStats.DeferredBreakerNodeIdsSize()) ? txStats.GetDeferredBreakerNodeIds(i) : 0u
+                });
+            }
         }
     }
 }
@@ -920,13 +932,27 @@ void TQueryExecutionStats::AddBufferStats(NYql::NDqProto::TDqTaskStats&& taskSta
             "TLI TRACE AddBufferStats: incoming BrokenAsBreaker=" << extraStats.GetLockStats().GetBrokenAsBreaker()
             << " BrokenAsVictim=" << extraStats.GetLockStats().GetBrokenAsVictim()
             << " BreakerQuerySpanIds.size=" << extraStats.GetLockStats().BreakerQuerySpanIdsSize()
+            << " DeferredBreakerQuerySpanIds.size=" << extraStats.GetLockStats().DeferredBreakerQuerySpanIdsSize()
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
-            << " accumulated BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size());
+            << " accumulated BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size()
+            << " accumulated DeferredBreakers.size=" << DeferredBreakers.size());
         LocksBrokenAsBreaker += extraStats.GetLockStats().GetBrokenAsBreaker();
         LocksBrokenAsVictim += extraStats.GetLockStats().GetBrokenAsVictim();
         for (auto id : extraStats.GetLockStats().GetBreakerQuerySpanIds()) {
             if (id != 0) {
                 BreakerQuerySpanIds.push_back(id);
+            }
+        }
+        {
+            const auto& deferredIds = extraStats.GetLockStats().GetDeferredBreakerQuerySpanIds();
+            const auto& deferredNodeIds = extraStats.GetLockStats().GetDeferredBreakerNodeIds();
+            for (size_t i = 0; i < static_cast<size_t>(deferredIds.size()); ++i) {
+                if (deferredIds[i] != 0) {
+                    DeferredBreakers.push_back({
+                        deferredIds[i],
+                        i < static_cast<size_t>(deferredNodeIds.size()) ? deferredNodeIds[i] : 0u
+                    });
+                }
             }
         }
     } else {
@@ -1039,6 +1065,16 @@ void TQueryExecutionStats::UpdateTaskStats(ui64 taskId, const NYql::NDqProto::TD
                 for (auto id : extraStats.GetLockStats().GetBreakerQuerySpanIds()) {
                     if (id != 0) {
                         BreakerQuerySpanIds.push_back(id);
+                    }
+                }
+                const auto& deferredIds = extraStats.GetLockStats().GetDeferredBreakerQuerySpanIds();
+                const auto& deferredNodeIds = extraStats.GetLockStats().GetDeferredBreakerNodeIds();
+                for (size_t i = 0; i < static_cast<size_t>(deferredIds.size()); ++i) {
+                    if (deferredIds[i] != 0) {
+                        DeferredBreakers.push_back({
+                            deferredIds[i],
+                            i < static_cast<size_t>(deferredNodeIds.size()) ? deferredNodeIds[i] : 0u
+                        });
                     }
                 }
             }

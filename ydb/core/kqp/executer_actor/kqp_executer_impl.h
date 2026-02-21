@@ -1487,6 +1487,15 @@ protected:
                 }
             }
         }
+        // Transfer deferred breaker info from stats to response
+        {
+            THashSet<ui64> seen;
+            for (const auto& breaker : Stats->DeferredBreakers) {
+                if (seen.insert(breaker.QuerySpanId).second) {
+                    ResponseEv->DeferredBreakers.push_back({breaker.QuerySpanId, breaker.NodeId});
+                }
+            }
+        }
 
         LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
             "TLI TRACE Executer MakeResponseAndPassAway:"
@@ -1494,6 +1503,7 @@ protected:
             << " Stats->LocksBrokenAsVictim=" << Stats->LocksBrokenAsVictim
             << " Stats->BreakerQuerySpanIds.size=" << Stats->BreakerQuerySpanIds.size()
             << " ResponseEv->BreakerQuerySpanIds.size=" << ResponseEv->BreakerQuerySpanIds.size()
+            << " Stats->DeferredBreakers.size=" << Stats->DeferredBreakers.size()
             << " ResponseEv->DeferredBreakers.size=" << ResponseEv->DeferredBreakers.size());
 
         Request.Transactions.crop(0);
