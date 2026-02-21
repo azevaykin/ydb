@@ -3691,6 +3691,7 @@ public:
         CA_LOG_D("Start immediate commit");
         YQL_ENSURE(CurrentStateFunc() == &TThis::StateWaitTasks);
         Become(&TThis::StateCommit);
+        PendingCommitShards = TxManager->GetShardsCount();
 
         IsImmediateCommit = true;
         CheckQueuesEmpty();
@@ -3712,6 +3713,7 @@ public:
         CA_LOG_D("Start distributed commit with TxId=" << *TxId);
         YQL_ENSURE(CurrentStateFunc() == &TThis::StatePrepare);
         Become(&TThis::StateCommit);
+        PendingCommitShards = TxManager->GetShardsCount();
         CheckQueuesEmpty();
         ForEachWriteActor([](TKqpTableWriteActor* actor, const TActorId) {
             actor->SetDistributedCommit();
@@ -4575,6 +4577,9 @@ public:
             CA_LOG_T("TLI TRACE BufferWriteActor STATUS_LOCKS_BROKEN: shard=" << ev->Get()->Record.GetOrigin()
                 << " hasTxStats=" << ev->Get()->Record.HasTxStats()
                 << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
+            if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
+                --PendingCommitShards;
+            }
             CollectTliStats(ev->Get()->Record);
             TxManager->BreakLock(ev->Get()->Record.GetOrigin());
             YQL_ENSURE(TxManager->BrokenLocks());
@@ -4724,6 +4729,9 @@ public:
     }
 
     void OnCommitted(ui64 shardId, ui64) override {
+        if (PendingCommitShards > 0) {
+            --PendingCommitShards;
+        }
         if (TxManager->ConsumeCommitResult(shardId)) {
             if (FlushDeferredLocksBrokenIfPending()) return;
             CA_LOG_D("Committed TxId=" << TxId.value_or(0));
@@ -4860,14 +4868,19 @@ public:
         return true;
     }
 
-    // Handle a deferred LOCKS_BROKEN error during commit phase.
     bool HandleDeferredLocksBrokenOnCommit(const NKikimrDataEvents::TEvWriteResult& record) {
         if (!PendingLocksBrokenError) return false;
+        if (PendingCommitShards > 0) {
+            --PendingCommitShards;
+        }
         CA_LOG_T("TLI TRACE BufferWriteActor HandleDeferredLocksBrokenOnCommit:"
             << " shard=" << record.GetOrigin()
+            << " PendingCommitShards=" << PendingCommitShards
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         CollectTliStats(record);
         if (TxManager->ConsumeCommitResult(record.GetOrigin())) {
+            FlushPendingLocksBrokenError();
+        } else if (PendingCommitShards == 0) {
             FlushPendingLocksBrokenError();
         }
         return true;
@@ -4890,6 +4903,7 @@ public:
         auto error = std::move(*PendingLocksBrokenError);
         PendingLocksBrokenError.reset();
         PendingPrepareShards = 0;
+        PendingCommitShards = 0;
         ReplyErrorImpl(error.first, std::move(error.second));
     }
     // --- End TLI helpers ---
@@ -4900,15 +4914,19 @@ public:
             << " shard=" << shardId
             << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode)
             << " PendingPrepareShards=" << PendingPrepareShards
+            << " PendingCommitShards=" << PendingCommitShards
             << " hasPendingError=" << PendingLocksBrokenError.has_value()
             << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
                            : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
+        if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
+            --PendingCommitShards;
+        }
         if (PendingLocksBrokenError) {
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                "TLI TRACE BufferWriteActor OnLocksBrokenError: second LOCKS_BROKEN while deferred, consuming commit result for shard=" << shardId);
             if (CurrentStateFunc() == &TThis::StateCommit) {
                 if (TxManager->ConsumeCommitResult(shardId)) {
+                    FlushPendingLocksBrokenError();
+                } else if (PendingCommitShards == 0) {
                     FlushPendingLocksBrokenError();
                 }
             } else if (CurrentStateFunc() == &TThis::StatePrepare) {
@@ -4934,13 +4952,18 @@ public:
             "TLI TRACE BufferWriteActor OnError(id):"
             << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode)
             << " PendingPrepareShards=" << PendingPrepareShards
+            << " PendingCommitShards=" << PendingCommitShards
             << " hasPendingError=" << PendingLocksBrokenError.has_value()
             << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
                            : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
+        if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
+            --PendingCommitShards;
+        }
         if (PendingLocksBrokenError) {
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                "TLI TRACE BufferWriteActor OnError: suppressed (LOCKS_BROKEN deferred)");
+            if (PendingCommitShards == 0 && CurrentStateFunc() == &TThis::StateCommit) {
+                FlushPendingLocksBrokenError();
+            }
             return;
         }
         ReplyError(statusCode, id, message, subIssues);
@@ -4951,13 +4974,18 @@ public:
             "TLI TRACE BufferWriteActor OnError(issues):"
             << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode)
             << " PendingPrepareShards=" << PendingPrepareShards
+            << " PendingCommitShards=" << PendingCommitShards
             << " hasPendingError=" << PendingLocksBrokenError.has_value()
             << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
                            : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
             << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
+        if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
+            --PendingCommitShards;
+        }
         if (PendingLocksBrokenError) {
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                "TLI TRACE BufferWriteActor OnError: suppressed (LOCKS_BROKEN deferred)");
+            if (PendingCommitShards == 0 && CurrentStateFunc() == &TThis::StateCommit) {
+                FlushPendingLocksBrokenError();
+            }
             return;
         }
         ReplyError(statusCode, std::move(issues));
@@ -5146,6 +5174,7 @@ private:
     // Used together with PendingLocksBrokenError to know when all shards
     // have responded and the deferred error can be flushed.
     ui64 PendingPrepareShards = 0;
+    ui64 PendingCommitShards = 0;
 
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc;
     std::shared_ptr<NMiniKQL::TTypeEnvironment> TypeEnv;
