@@ -541,12 +541,6 @@ public:
                     for (const auto& brokenLock : brokenLocks) {
                         FillDeferredBreakerInfo(brokenLock.GetLockId(), txStats);
                     }
-                    if (txStats->DeferredBreakerQuerySpanIdsSize() > 0) {
-                        LOG_TRACE_S(ctx, NKikimrServices::TLI,
-                            "TLI TRACE DataShard " << tabletId
-                            << ": victim commit found " << txStats->DeferredBreakerQuerySpanIdsSize()
-                            << " deferred breakers");
-                    }
                 }
 
                 for (auto& brokenLock : brokenLocks) {

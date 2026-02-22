@@ -269,14 +269,6 @@ struct TKqpTableWriterStatistics {
             AffectedPartitions.insert(perShardStats.GetShardId());
         }
 
-        if (txStats.GetLocksBrokenAsBreaker() > 0 || txStats.GetLocksBrokenAsVictim() > 0) {
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                "TLI TRACE WriteActor UpdateStats: incoming LocksBrokenAsBreaker=" << txStats.GetLocksBrokenAsBreaker()
-                << " LocksBrokenAsVictim=" << txStats.GetLocksBrokenAsVictim()
-                << " BreakerQuerySpanIds.size=" << txStats.BreakerQuerySpanIdsSize()
-                << " tableId=" << tableId.PathId.LocalPathId
-                << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
-        }
         LocksBrokenAsBreaker += txStats.GetLocksBrokenAsBreaker();
         LocksBrokenAsVictim += txStats.GetLocksBrokenAsVictim();
         if (txStats.GetLocksBrokenAsBreaker() > 0 && txStats.BreakerQuerySpanIdsSize() > 0) {
@@ -290,9 +282,6 @@ struct TKqpTableWriterStatistics {
                 DeferredBreakerNodeIds.push_back(
                     i < static_cast<size_t>(txStats.DeferredBreakerNodeIdsSize()) ? txStats.GetDeferredBreakerNodeIds(i) : 0u);
             }
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                "TLI TRACE WriteActor UpdateStats: collected " << txStats.DeferredBreakerQuerySpanIdsSize()
-                << " deferred breakers, accumulated=" << DeferredBreakerQuerySpanIds.size());
         }
     }
 
@@ -321,14 +310,6 @@ struct TKqpTableWriterStatistics {
     }
 
     void FillStats(NYql::NDqProto::TDqTaskStats* stats, const TString& tablePath) {
-        if (LocksBrokenAsBreaker > 0 || LocksBrokenAsVictim > 0) {
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                "TLI TRACE WriteActor FillStats: LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
-                << " LocksBrokenAsVictim=" << LocksBrokenAsVictim
-                << " BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size()
-                << " DeferredBreakerQuerySpanIds.size=" << DeferredBreakerQuerySpanIds.size()
-                << " tablePath=" << tablePath);
-        }
         AddLockStats(stats, LocksBrokenAsBreaker, LocksBrokenAsVictim, BreakerQuerySpanIds,
                      DeferredBreakerQuerySpanIds, DeferredBreakerNodeIds);
         LocksBrokenAsBreaker = 0;
@@ -1027,12 +1008,6 @@ public:
 
             const ui64 brokenShardId = ev->Get()->Record.GetOrigin();
 
-            LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                "TLI TRACE TableWriteActor STATUS_LOCKS_BROKEN: table=" << TablePath
-                << " shard=" << brokenShardId
-                << " mode=" << static_cast<int>(Mode)
-                << " accumulated LocksBrokenAsBreaker=" << Stats.LocksBrokenAsBreaker);
-
             UpdateStats(ev->Get()->Record.GetTxStats());
             TxManager->BreakLock(brokenShardId);
             YQL_ENSURE(TxManager->BrokenLocks());
@@ -1066,12 +1041,6 @@ public:
         YQL_ENSURE(Mode == EMode::PREPARE);
         const auto& record = ev->Get()->Record;
         AFL_ENSURE(record.GetTxLocks().empty());
-
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE TableWriteActor ProcessWritePreparedShard: table=" << TablePath
-            << " shard=" << record.GetOrigin()
-            << " hasTxStats=" << record.HasTxStats()
-            << " breakerInResponse=" << (record.HasTxStats() ? record.GetTxStats().GetLocksBrokenAsBreaker() : 0));
 
         UpdateStats(record.GetTxStats());
 
@@ -4599,9 +4568,6 @@ public:
                     << " ShardID=" << ev->Get()->Record.GetOrigin() << ","
                     << " Sink=" << this->SelfId() << "."
                     << getIssues().ToOneLineString());
-            CA_LOG_T("TLI TRACE BufferWriteActor STATUS_LOCKS_BROKEN: shard=" << ev->Get()->Record.GetOrigin()
-                << " hasTxStats=" << ev->Get()->Record.HasTxStats()
-                << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
             if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
                 --PendingCommitShards;
             }
@@ -4713,9 +4679,6 @@ public:
                 return builder;
             }());
 
-        CA_LOG_T("TLI TRACE BufferWriteActor ProcessWriteCompletedShard: shard=" << ev->Get()->Record.GetOrigin()
-            << " hasTxStats=" << ev->Get()->Record.HasTxStats()
-            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         CollectTliStats(ev->Get()->Record);
 
         OnCommitted(ev->Get()->Record.GetOrigin(), 0);
@@ -4726,11 +4689,6 @@ public:
     }
 
     void OnPrepared(IKqpTransactionManager::TPrepareResult&& preparedInfo, ui64) override {
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE BufferWriteActor OnPrepared: shard=" << preparedInfo.ShardId
-            << " PendingPrepareShards=" << PendingPrepareShards
-            << " hasPendingError=" << PendingLocksBrokenError.has_value()
-            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         if (HandleDeferredLocksBrokenOnPrepare()) return;
         if (!preparedInfo.Coordinator || (TxManager->GetCoordinator() && preparedInfo.Coordinator != TxManager->GetCoordinator())) {
             CA_LOG_E("Handle TEvWriteResult: unable to select coordinator. Tx canceled, actorId: " << SelfId()
@@ -4831,15 +4789,6 @@ public:
     void CollectTliStats(const NKikimrDataEvents::TEvWriteResult& record) {
         if (record.HasTxStats()) {
             const auto& txStats = record.GetTxStats();
-            if (txStats.GetLocksBrokenAsBreaker() > 0 || txStats.GetLocksBrokenAsVictim() > 0) {
-                LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-                    "TLI TRACE BufferWriteActor CollectTliStats: shard=" << record.GetOrigin()
-                    << " LocksBrokenAsBreaker=" << txStats.GetLocksBrokenAsBreaker()
-                    << " LocksBrokenAsVictim=" << txStats.GetLocksBrokenAsVictim()
-                    << " BreakerQuerySpanIds.size=" << txStats.BreakerQuerySpanIdsSize()
-                    << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
-                    << " accumulated BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size());
-            }
             LocksBrokenAsBreaker += txStats.GetLocksBrokenAsBreaker();
             LocksBrokenAsVictim += txStats.GetLocksBrokenAsVictim();
             for (ui64 id : txStats.GetBreakerQuerySpanIds()) {
@@ -4887,10 +4836,6 @@ public:
             --PendingPrepareShards;
         }
         if (!PendingLocksBrokenError) return false;
-        CA_LOG_T("TLI TRACE BufferWriteActor HandleDeferredLocksBrokenOnPrepare:"
-            << " hasRecord=" << (record != nullptr)
-            << " PendingPrepareShards=" << PendingPrepareShards
-            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         if (record) CollectTliStats(*record);
         if (PendingPrepareShards == 0) {
             FlushPendingLocksBrokenError();
@@ -4903,10 +4848,6 @@ public:
         if (PendingCommitShards > 0) {
             --PendingCommitShards;
         }
-        CA_LOG_T("TLI TRACE BufferWriteActor HandleDeferredLocksBrokenOnCommit:"
-            << " shard=" << record.GetOrigin()
-            << " PendingCommitShards=" << PendingCommitShards
-            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         CollectTliStats(record);
         if (TxManager->ConsumeCommitResult(record.GetOrigin())) {
             FlushPendingLocksBrokenError();
@@ -4925,11 +4866,6 @@ public:
 
     void FlushPendingLocksBrokenError() {
         Y_ABORT_UNLESS(PendingLocksBrokenError);
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE BufferWriteActor FlushPendingLocksBrokenError:"
-            << " LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
-            << " LocksBrokenAsVictim=" << LocksBrokenAsVictim
-            << " BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size());
         auto error = std::move(*PendingLocksBrokenError);
         PendingLocksBrokenError.reset();
         PendingPrepareShards = 0;
@@ -4939,16 +4875,6 @@ public:
     // --- End TLI helpers ---
 
     void OnLocksBrokenError(ui64 shardId, NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::TIssues&& issues) override {
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE BufferWriteActor OnLocksBrokenError:"
-            << " shard=" << shardId
-            << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode)
-            << " PendingPrepareShards=" << PendingPrepareShards
-            << " PendingCommitShards=" << PendingCommitShards
-            << " hasPendingError=" << PendingLocksBrokenError.has_value()
-            << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
-                           : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
-            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
             --PendingCommitShards;
         }
@@ -4978,15 +4904,6 @@ public:
     }
 
     void OnError(NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::EYqlIssueCode id, const TString& message, const NYql::TIssues& subIssues) override {
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE BufferWriteActor OnError(id):"
-            << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode)
-            << " PendingPrepareShards=" << PendingPrepareShards
-            << " PendingCommitShards=" << PendingCommitShards
-            << " hasPendingError=" << PendingLocksBrokenError.has_value()
-            << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
-                           : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
-            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
             --PendingCommitShards;
         }
@@ -5000,15 +4917,6 @@ public:
     }
 
     void OnError(NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::TIssues&& issues) override {
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE BufferWriteActor OnError(issues):"
-            << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode)
-            << " PendingPrepareShards=" << PendingPrepareShards
-            << " PendingCommitShards=" << PendingCommitShards
-            << " hasPendingError=" << PendingLocksBrokenError.has_value()
-            << " state=" << (CurrentStateFunc() == &TThis::StatePrepare ? "Prepare"
-                           : CurrentStateFunc() == &TThis::StateCommit ? "Commit" : "Other")
-            << " accumulated LocksBrokenAsBreaker=" << LocksBrokenAsBreaker);
         if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
             --PendingCommitShards;
         }
@@ -5069,15 +4977,6 @@ public:
     void ReplyErrorImpl(NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::TIssues&& issues) {
         CA_LOG_E("statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode) << ". Issue=" << issues.ToString() << ". sessionActorId=" << SessionActorId << ".");
 
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE BufferWriteActor ReplyErrorImpl:"
-            << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(statusCode)
-            << " LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
-            << " LocksBrokenAsVictim=" << LocksBrokenAsVictim
-            << " BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size()
-            << " PendingPrepareShards=" << PendingPrepareShards
-            << " sendingTo=" << (ExecuterActorId ? "executer" : "session"));
-
         TxManager->SetError();
         CancelProposal();
         Become(&TKqpBufferWriteActor::StateError);
@@ -5111,12 +5010,6 @@ public:
         ForEachLookupActor([&](IKqpBufferTableLookup* actor, const TActorId) {
             actor->FillStats(&result);
         });
-        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
-            "TLI TRACE BufferWriteActor BuildStats:"
-            << " LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
-            << " LocksBrokenAsVictim=" << LocksBrokenAsVictim
-            << " BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size()
-            << " DeferredBreakerQuerySpanIds.size=" << DeferredBreakerQuerySpanIds.size());
         TKqpTableWriterStatistics::AddLockStats(&result, LocksBrokenAsBreaker, LocksBrokenAsVictim, BreakerQuerySpanIds,
                                                 DeferredBreakerQuerySpanIds, DeferredBreakerNodeIds);
         return result;

@@ -2693,11 +2693,6 @@ private:
             victimQuerySpanId = state.QuerySpanId;
         }
 
-        LOG_TRACE_S(ctx, NKikimrServices::TLI,
-            "TLI TRACE DataShard " << Self->TabletID()
-            << ": broken lock in ApplyLocks, lockId=" << lock.LockId
-            << " victimQuerySpanId=" << (victimQuerySpanId ? ToString(*victimQuerySpanId) : "none"));
-
         NDataIntegrity::LogVictimDetected(ctx, Self->TabletID(),
             "Read transaction was a victim of broken locks",
             victimQuerySpanId,
@@ -3410,11 +3405,6 @@ public:
                     TMaybe<ui64> victimQuerySpanId = state.Lock->GetVictimQuerySpanId()
                         ? TMaybe<ui64>(state.Lock->GetVictimQuerySpanId())
                         : (state.QuerySpanId ? TMaybe<ui64>(state.QuerySpanId) : Nothing());
-
-                    LOG_TRACE_S(ctx, NKikimrServices::TLI,
-                        "TLI TRACE DataShard " << Self->TabletID()
-                        << ": broken lock in TTxReadContinue, lockId=" << state.Lock->GetLockId()
-                        << " victimQuerySpanId=" << (victimQuerySpanId ? ToString(*victimQuerySpanId) : "none"));
 
                     NDataIntegrity::LogVictimDetected(ctx, Self->TabletID(),
                         "Read transaction was a victim of broken locks",
