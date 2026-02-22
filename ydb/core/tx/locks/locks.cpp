@@ -1206,7 +1206,7 @@ std::pair<TVector<TSysLocks::TLock>, TVector<ui64>> TSysLocks::ApplyLocks() {
         } else {
             lock = Locker.GetOrAddLock(Update->LockTxId, Update->LockNodeId);
         }
-        if (lock && Update->QuerySpanId != 0) {
+        if (lock && Update->QuerySpanId != 0 && lock->GetVictimQuerySpanId() == 0) {
             lock->SetVictimQuerySpanId(Update->QuerySpanId);
         }
         if (!lock) {
@@ -1641,7 +1641,7 @@ EEnsureCurrentLock TSysLocks::EnsureCurrentLock(bool createMissing) {
     if (!Update->Lock) {
         return EEnsureCurrentLock::TooMany;
     }
-    if (Update->QuerySpanId != 0) {
+    if (Update->QuerySpanId != 0 && Update->Lock->GetVictimQuerySpanId() == 0) {
         Update->Lock->SetVictimQuerySpanId(Update->QuerySpanId);
     }
 
