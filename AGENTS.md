@@ -24,10 +24,10 @@ Building and testing are performed using the Ya utility (`ya-tool`), which is lo
 To build a project, from the **repository root** run:
 
 ```bash
-./ya make path/to/project
+./ya make --build "relwithdebinfo" path/to/project
 ```
 
-Alternatively, `cd path/to/project` then run `/ya make`.
+Alternatively, `cd path/to/project` then run `/ya make --build "relwithdebinfo"`.
 
 ### Running tests with ya make (recommended for C++ unit tests, gtest, py3tests)
 
