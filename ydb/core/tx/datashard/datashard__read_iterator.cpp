@@ -2747,7 +2747,8 @@ private:
 
         ui64 breakerQuerySpanId = 0;
         ui32 breakerNodeId = 0;
-        if (auto rawLock = sysLocks.GetRawLock(lock.LockId); rawLock && rawLock->GetBreakerQuerySpanId() && !rawLock->IsBreakerConsumed()) {
+        auto rawLock = sysLocks.GetRawLock(lock.LockId);
+        if (rawLock && rawLock->GetBreakerQuerySpanId() && !rawLock->IsBreakerConsumed()) {
             breakerQuerySpanId = rawLock->GetBreakerQuerySpanId();
             breakerNodeId = rawLock->GetBreakerNodeId();
         }
@@ -2760,6 +2761,10 @@ private:
             state.QuerySpanId,
             breakerQuerySpanId,
             breakerNodeId);
+
+        if (rawLock) {
+            rawLock->ConsumeBreakerInfo();
+        }
     }
 
     void AcquireLock(TReadIteratorState& state, const TActorContext& ctx) {
@@ -3466,6 +3471,7 @@ public:
                     state.QuerySpanId,
                     breakerQuerySpanId,
                     breakerNodeId);
+                state.Lock->ConsumeBreakerInfo();
 
                 // A broken write lock means we are reading inconsistent results and must abort
                 if (state.Lock->IsWriteLock()) {
