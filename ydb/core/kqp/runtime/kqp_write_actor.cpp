@@ -4872,27 +4872,37 @@ public:
         PendingCommitShards = 0;
         ReplyErrorImpl(error.first, std::move(error.second));
     }
-    // --- End TLI helpers ---
 
-    void OnLocksBrokenError(ui64 shardId, NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::TIssues&& issues) override {
+    // Common accounting for non-success shard replies while a deferred
+    // LOCKS_BROKEN error may already be pending.
+    bool HandlePendingLocksBrokenErrorOnShardFailure(std::optional<ui64> commitShardId = std::nullopt) {
         if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
             --PendingCommitShards;
         }
-        if (PendingLocksBrokenError) {
-            if (CurrentStateFunc() == &TThis::StateCommit) {
-                if (TxManager->ConsumeCommitResult(shardId)) {
-                    FlushPendingLocksBrokenError();
-                } else if (PendingCommitShards == 0) {
-                    FlushPendingLocksBrokenError();
-                }
-            } else if (CurrentStateFunc() == &TThis::StatePrepare) {
-                if (PendingPrepareShards > 0) {
-                    --PendingPrepareShards;
-                }
-                if (PendingPrepareShards == 0) {
-                    FlushPendingLocksBrokenError();
-                }
+        if (!PendingLocksBrokenError) {
+            return false;
+        }
+
+        if (CurrentStateFunc() == &TThis::StateCommit) {
+            const bool commitConsumed = commitShardId && TxManager->ConsumeCommitResult(*commitShardId);
+            if (commitConsumed || PendingCommitShards == 0) {
+                FlushPendingLocksBrokenError();
             }
+        } else if (CurrentStateFunc() == &TThis::StatePrepare) {
+            if (PendingPrepareShards > 0) {
+                --PendingPrepareShards;
+            }
+            if (PendingPrepareShards == 0) {
+                FlushPendingLocksBrokenError();
+            }
+        }
+
+        return true;
+    }
+    // --- End TLI helpers ---
+
+    void OnLocksBrokenError(ui64 shardId, NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::TIssues&& issues) override {
+        if (HandlePendingLocksBrokenErrorOnShardFailure(shardId)) {
             return;
         }
         if (CurrentStateFunc() == &TThis::StatePrepare && PendingPrepareShards > 0) {
@@ -4904,26 +4914,14 @@ public:
     }
 
     void OnError(NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::EYqlIssueCode id, const TString& message, const NYql::TIssues& subIssues) override {
-        if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
-            --PendingCommitShards;
-        }
-        if (PendingLocksBrokenError) {
-            if (PendingCommitShards == 0 && CurrentStateFunc() == &TThis::StateCommit) {
-                FlushPendingLocksBrokenError();
-            }
+        if (HandlePendingLocksBrokenErrorOnShardFailure()) {
             return;
         }
         ReplyError(statusCode, id, message, subIssues);
     }
 
     void OnError(NYql::NDqProto::StatusIds::StatusCode statusCode, NYql::TIssues&& issues) override {
-        if (CurrentStateFunc() == &TThis::StateCommit && PendingCommitShards > 0) {
-            --PendingCommitShards;
-        }
-        if (PendingLocksBrokenError) {
-            if (PendingCommitShards == 0 && CurrentStateFunc() == &TThis::StateCommit) {
-                FlushPendingLocksBrokenError();
-            }
+        if (HandlePendingLocksBrokenErrorOnShardFailure()) {
             return;
         }
         ReplyError(statusCode, std::move(issues));
