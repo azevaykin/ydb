@@ -4845,6 +4845,11 @@ public:
             for (ui64 id : txStats.GetBreakerQuerySpanIds()) {
                 BreakerQuerySpanIds.push_back(id);
             }
+            for (size_t i = 0; i < static_cast<size_t>(txStats.DeferredBreakerQuerySpanIdsSize()); ++i) {
+                DeferredBreakerQuerySpanIds.push_back(txStats.GetDeferredBreakerQuerySpanIds(i));
+                DeferredBreakerNodeIds.push_back(
+                    i < static_cast<size_t>(txStats.DeferredBreakerNodeIdsSize()) ? txStats.GetDeferredBreakerNodeIds(i) : 0u);
+            }
         }
     }
 
@@ -5110,8 +5115,10 @@ public:
             "TLI TRACE BufferWriteActor BuildStats:"
             << " LocksBrokenAsBreaker=" << LocksBrokenAsBreaker
             << " LocksBrokenAsVictim=" << LocksBrokenAsVictim
-            << " BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size());
-        TKqpTableWriterStatistics::AddLockStats(&result, LocksBrokenAsBreaker, LocksBrokenAsVictim, BreakerQuerySpanIds);
+            << " BreakerQuerySpanIds.size=" << BreakerQuerySpanIds.size()
+            << " DeferredBreakerQuerySpanIds.size=" << DeferredBreakerQuerySpanIds.size());
+        TKqpTableWriterStatistics::AddLockStats(&result, LocksBrokenAsBreaker, LocksBrokenAsVictim, BreakerQuerySpanIds,
+                                                DeferredBreakerQuerySpanIds, DeferredBreakerNodeIds);
         return result;
     }
 
@@ -5189,6 +5196,8 @@ private:
     ui64 LocksBrokenAsBreaker = 0;
     ui64 LocksBrokenAsVictim = 0;
     TVector<ui64> BreakerQuerySpanIds;
+    TVector<ui64> DeferredBreakerQuerySpanIds;
+    TVector<ui32> DeferredBreakerNodeIds;
 
     // Deferred error for STATUS_LOCKS_BROKEN during distributed prepare/commit.
     // Allows remaining shards to respond (with breaker TLI stats) before

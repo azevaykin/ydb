@@ -1153,9 +1153,8 @@ std::pair<TVector<TSysLocks::TLock>, TVector<ui64>> TSysLocks::ApplyLocks() {
     brokenLocks.reserve(Update->BreakLocks.Size());
     if (Update->BreakLocks) {
         Locker.BreakLocks(Update->BreakLocks, breakVersion);
-        bool isWriteOp = !Update->WriteTables.Empty();
-        ui64 breakerSpanId = isWriteOp ? Update->GetEffectiveBreakerQuerySpanId() : 0;
-        ui32 breakerNodeId = isWriteOp ? Update->LockNodeId : 0;
+        ui64 breakerSpanId = Update->GetEffectiveBreakerQuerySpanId();
+        ui32 breakerNodeId = breakerSpanId != 0 ? Update->LockNodeId : 0;
         for (auto& lock : Update->BreakLocks) {
             if (breakerSpanId) {
                 lock.SetBreakerInfo(breakerSpanId, breakerNodeId);

@@ -105,6 +105,13 @@ public:
 
             NDataIntegrity::LogLocksBroken(ctx, DataShard.TabletID(), message,
                 otherLocksBroken, primaryBreakerSpanId, victimQuerySpanIds);
+
+            for (ui64 lockId : otherLocksBroken) {
+                auto lockInfo = DataShard.SysLocksTable().GetRawLock(lockId);
+                if (lockInfo) {
+                    lockInfo->ConsumeBreakerInfo();
+                }
+            }
         }
         return otherLocksBroken.size();
     }
