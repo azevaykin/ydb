@@ -206,11 +206,13 @@ private:
     }
 
     void HandleUndelivered(TEvents::TEvUndelivered::TPtr&) {
+        // Target node unreachable, emit log with empty query text
         EmitLog("");
         PassAway();
     }
 
     void HandleTimeout() {
+        // Lookup timed out, emit log with empty query text to avoid leaking actors
         EmitLog("");
         PassAway();
     }
@@ -2312,6 +2314,7 @@ public:
                 }, TlsActivationContext->AsActorContext());
             }
         } else {
+            // Fallback: no BreakerQuerySpanIds from DataShard, use current query
             NDataIntegrity::LogTli(NDataIntegrity::TTliLogParams{
                 .Component = "SessionActor",
                 .Message = isCommitAction ? "Commit had broken other locks" : "Query had broken other locks",
