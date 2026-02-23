@@ -153,7 +153,7 @@ void EmitVictimAndDeferredBreakerTli(
 
     record.SetDeferredVictimQuerySpanId(*victimQuerySpanId);
 
-    if (!breakerQuerySpanId) {
+    if (!breakerQuerySpanId || breakerQuerySpanId == *victimQuerySpanId) {
         return;
     }
 
@@ -2712,7 +2712,7 @@ private:
             TVector<ui64> victimIds = {*victimQuerySpanId};
             bool foundBreaker = false;
 
-            if (storedBreakerSpanId) {
+            if (storedBreakerSpanId && storedBreakerSpanId != *victimQuerySpanId) {
                 NDataIntegrity::LogLocksBroken(ctx, Self->TabletID(),
                     "Write transaction broke other locks (deferred)",
                     {},
@@ -2726,6 +2726,9 @@ private:
             if (!foundBreaker) {
                 auto breakerInfos = Self->FindBreakerInfoForTli(state.ReadVersion);
                 for (const auto& info : breakerInfos) {
+                    if (info.QuerySpanId == *victimQuerySpanId) {
+                        continue;
+                    }
                     if (rawLockPtr) {
                         rawLockPtr->SetBreakerInfo(info.QuerySpanId, info.SenderNodeId);
                     }

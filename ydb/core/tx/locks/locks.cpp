@@ -1170,11 +1170,6 @@ std::pair<TVector<TSysLocks::TLock>, TVector<ui64>> TSysLocks::ApplyLocks() {
             << " breakLocksCount=" << Update->BreakLocks.Size());
         for (auto& lock : Update->BreakLocks) {
             if (breakerSpanId) {
-                if (breakerSpanId == lock.GetVictimQuerySpanId() && breakerSpanId != 0) {
-                    LOG_TRACE_S(LockLoggerContext, NKikimrServices::TLI,
-                        "TLI TRACE ApplyLocks ANOMALY: breakerSpanId==victimSpanId="
-                        << breakerSpanId << " lockId=" << lock.GetLockId());
-                }
                 lock.SetBreakerInfo(breakerSpanId, breakerNodeId);
             }
             brokenLocks.push_back(lock.GetLockId());
