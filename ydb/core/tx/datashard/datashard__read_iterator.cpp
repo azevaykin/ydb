@@ -133,6 +133,15 @@ void EmitVictimAndDeferredBreakerTli(
     ui64 breakerQuerySpanId,
     ui32 breakerNodeId)
 {
+    LOG_TRACE_S(ctx, NKikimrServices::TLI,
+        "TLI TRACE DataShard " << tabletId
+        << ": EmitVictimAndDeferredBreakerTli, "
+        << " record=" << record.GetTypeName()
+        << " currentQuerySpanId=" << currentQuerySpanId
+        << " breakerQuerySpanId=" << breakerQuerySpanId
+        << " breakerNodeId=" << breakerNodeId
+        << " victimQuerySpanId=" << (victimQuerySpanId ? ToString(*victimQuerySpanId) : "none"));
+
     NDataIntegrity::LogVictimDetected(ctx, tabletId,
         "Read transaction was a victim of broken locks",
         victimQuerySpanId,

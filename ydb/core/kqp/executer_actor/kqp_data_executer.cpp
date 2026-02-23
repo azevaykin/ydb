@@ -314,6 +314,9 @@ public:
     }
 
     void HandleFinalize(TEvKqpBuffer::TEvResult::TPtr& ev) {
+        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+            "TLI TRACE DataExecuter HandleFinalize: hasStats=" << (ev->Get()->Stats.has_value())
+            << " hasStatsObj=" << (Stats != nullptr));
         if (ev->Get()->Stats && Stats) {
             Stats->AddBufferStats(std::move(*ev->Get()->Stats));
         }
@@ -1262,6 +1265,9 @@ private:
 
     void Handle(TEvKqpBuffer::TEvError::TPtr& ev) {
         auto& msg = *ev->Get();
+        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+            "TLI TRACE DataExecuter Handle(TEvError): hasStats=" << msg.Stats.has_value()
+            << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(msg.StatusCode));
         if (msg.Stats && Stats) {
             Stats->AddBufferStats(std::move(*msg.Stats));
         }
@@ -3117,7 +3123,17 @@ private:
                 {
                     const auto& traceIds = info.GetDeferredBreakerQuerySpanIds();
                     const auto& nodeIds = info.GetDeferredBreakerNodeIds();
+                    if (!traceIds.empty()) {
+                        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+                            "TLI TRACE DataExecuter: collecting " << traceIds.size()
+                            << " deferred breakers from read actor result"
+                            << " nodeIds.size=" << nodeIds.size());
+                    }
                     for (int i = 0; i < traceIds.size(); ++i) {
+                        LOG_TRACE_S(*TlsActivationContext, NKikimrServices::TLI,
+                            "TLI TRACE DataExecuter: deferred breaker[" << i
+                            << "] spanId=" << traceIds[i]
+                            << " nodeId=" << (i < nodeIds.size() ? nodeIds[i] : 0u));
                         ResponseEv->DeferredBreakers.push_back({
                             traceIds[i],
                             i < nodeIds.size() ? nodeIds[i] : 0u

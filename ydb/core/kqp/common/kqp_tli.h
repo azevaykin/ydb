@@ -91,6 +91,13 @@ public:
                 QueryTexts.pop_front();
             }
         }
+
+        if (IS_LOG_PRIORITY_ENABLED(NActors::NLog::PRI_TRACE, NKikimrServices::TLI)) {
+            LOG_TRACE_S(*NActors::TlsActivationContext, NKikimrServices::TLI,
+                "TLI TRACE AddQueryText: querySpanId=" << querySpanId
+                << " queryTextLen=" << queryText.size()
+                << " totalCollected=" << QueryTexts.size());
+        }
     }
 
     // Combine all query texts into a single string for logging
@@ -175,6 +182,15 @@ struct TTliLogParams {
 };
 
 inline void LogTli(const TTliLogParams& params, const NActors::TActorContext& ctx) {
+    LOG_TRACE_S(ctx, NKikimrServices::TLI,
+        "TLI TRACE LogTli: Component=" << params.Component
+        << " Message=" << params.Message
+        << " BreakerQuerySpanId=" << (params.BreakerQuerySpanId.Defined() ? ToString(*params.BreakerQuerySpanId) : "none")
+        << " VictimQuerySpanId=" << (params.VictimQuerySpanId.Defined() ? ToString(*params.VictimQuerySpanId) : "none")
+        << " CurrentQuerySpanId=" << (params.CurrentQuerySpanId.Defined() ? ToString(*params.CurrentQuerySpanId) : "none")
+        << " QueryText=" << params.QueryText.size() << "ch"
+        << " IsCommitAction=" << params.IsCommitAction);
+
     if (!IS_INFO_LOG_ENABLED(NKikimrServices::TLI)) {
         return;
     }
@@ -209,7 +225,14 @@ inline void LogTli(const TTliLogParams& params, const NActors::TActorContext& ct
         LogKeyValue("VictimQueryTexts", EscapeC(params.QueryTexts), ss, true);
     }
 
-    LOG_INFO_S(ctx, NKikimrServices::TLI, ss.Str());
+    auto infoMsg = ss.Str();
+    LOG_TRACE_S(ctx, NKikimrServices::TLI,
+        "TLI TRACE LogTli: emitting INFO record"
+        << " isBreaker=" << isBreaker
+        << " msgLen=" << infoMsg.size()
+        << " BreakerQuerySpanId=" << (params.BreakerQuerySpanId.Defined() ? ToString(*params.BreakerQuerySpanId) : "none")
+        << " VictimQuerySpanId=" << (params.VictimQuerySpanId.Defined() ? ToString(*params.VictimQuerySpanId) : "none"));
+    LOG_INFO_S(ctx, NKikimrServices::TLI, infoMsg);
 }
 
 }

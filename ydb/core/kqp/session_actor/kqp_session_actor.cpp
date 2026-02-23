@@ -201,18 +201,30 @@ private:
     }
 
     void HandleResponse(TEvLookupQueryTextResponse::TPtr& ev) {
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE TDeferredTliLogActor: response received"
+            << " spanId=" << BreakerQuerySpanId
+            << " queryTextLen=" << ev->Get()->Record.GetQueryText().size());
         EmitLog(ev->Get()->Record.GetQueryText());
         PassAway();
     }
 
     void HandleUndelivered(TEvents::TEvUndelivered::TPtr&) {
         // Target node unreachable, emit log with empty query text
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE TDeferredTliLogActor: undelivered"
+            << " spanId=" << BreakerQuerySpanId
+            << " targetNode=" << BreakerNodeId);
         EmitLog("");
         PassAway();
     }
 
     void HandleTimeout() {
         // Lookup timed out, emit log with empty query text to avoid leaking actors
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE TDeferredTliLogActor: timeout"
+            << " spanId=" << BreakerQuerySpanId
+            << " targetNode=" << BreakerNodeId);
         EmitLog("");
         PassAway();
     }
@@ -2285,7 +2297,18 @@ public:
 
     // Emit TLI breaker logs for direct lock breaks (one log per shard that broke locks).
     void EmitBreakerLogs(TEvKqpExecuter::TEvTxResponse* ev) {
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE EmitBreakerLogs: LocksBrokenAsBreaker=" << ev->LocksBrokenAsBreaker
+            << " BreakerQuerySpanIds.size=" << ev->BreakerQuerySpanIds.size()
+            << " IS_INFO_LOG_ENABLED=" << IS_INFO_LOG_ENABLED(NKikimrServices::TLI)
+            << " Action=" << static_cast<int>(QueryState->GetAction())
+            << " TraceId=" << TraceId());
+
         if (ev->LocksBrokenAsBreaker == 0 || !IS_INFO_LOG_ENABLED(NKikimrServices::TLI)) {
+            LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                "TLI TRACE EmitBreakerLogs: skipped"
+                << " LocksBrokenAsBreaker=" << ev->LocksBrokenAsBreaker
+                << " IS_INFO=" << IS_INFO_LOG_ENABLED(NKikimrServices::TLI));
             return;
         }
 
@@ -2294,13 +2317,24 @@ public:
 
         if (!ev->BreakerQuerySpanIds.empty()) {
             TString combinedQueryTexts = QueryState->TxCtx ? QueryState->TxCtx->QueryTextCollector.CombineQueryTexts() : TString();
+            LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                "TLI TRACE EmitBreakerLogs: emitting " << ev->BreakerQuerySpanIds.size()
+                << " breaker records, isCommitAction=" << isCommitAction
+                << " hasTxCtx=" << (QueryState->TxCtx != nullptr)
+                << " combinedQueryTexts.size=" << combinedQueryTexts.size());
             for (ui64 breakerQuerySpanId : ev->BreakerQuerySpanIds) {
                 TString breakerQueryText;
                 if (QueryState->TxCtx) {
                     breakerQueryText = QueryState->TxCtx->QueryTextCollector.GetQueryTextBySpanId(breakerQuerySpanId);
                 }
+                LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                    "TLI TRACE EmitBreakerLogs: spanId=" << breakerQuerySpanId
+                    << " queryTextFromCollector=" << (breakerQueryText.empty() ? "empty" : "found")
+                    << " queryTextLen=" << breakerQueryText.size());
                 if (breakerQueryText.empty()) {
                     breakerQueryText = QueryState->ExtractQueryText();
+                    LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                        "TLI TRACE EmitBreakerLogs: fallback to ExtractQueryText, len=" << breakerQueryText.size());
                 }
 
                 NDataIntegrity::LogTli(NDataIntegrity::TTliLogParams{
@@ -2315,6 +2349,9 @@ public:
             }
         } else {
             // Fallback: no BreakerQuerySpanIds from DataShard, use current query
+            LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                "TLI TRACE EmitBreakerLogs: fallback path (no BreakerQuerySpanIds)"
+                << " currentQuerySpanId=" << QueryState->GetQuerySpanId());
             NDataIntegrity::LogTli(NDataIntegrity::TTliLogParams{
                 .Component = "SessionActor",
                 .Message = isCommitAction ? "Commit had broken other locks" : "Query had broken other locks",
@@ -2329,7 +2366,13 @@ public:
 
     // Emit TLI breaker logs for deferred lock scenarios (lock broken between snapshot and re-read).
     void EmitDeferredBreakerLogs(TEvKqpExecuter::TEvTxResponse* ev) {
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE EmitDeferredBreakerLogs: DeferredBreakers.size=" << ev->DeferredBreakers.size());
+
         if (ev->DeferredBreakers.empty() || !IS_INFO_LOG_ENABLED(NKikimrServices::TLI)) {
+            LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                "TLI TRACE EmitDeferredBreakerLogs: skipped"
+                << " DeferredBreakers.empty=" << ev->DeferredBreakers.empty());
             return;
         }
 
@@ -2340,12 +2383,23 @@ public:
         for (const auto& breaker : ev->DeferredBreakers) {
             TString breakerQueryText = NDataIntegrity::TNodeQueryTextCache::Instance().Get(breaker.QuerySpanId);
 
+            LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                "TLI TRACE EmitDeferredBreakerLogs: breaker spanId=" << breaker.QuerySpanId
+                << " nodeId=" << breaker.NodeId
+                << " localNodeId=" << localNodeId
+                << " cacheHit=" << !breakerQueryText.empty()
+                << " queryTextLen=" << breakerQueryText.size());
+
             if (!breakerQueryText.empty() || breaker.NodeId == 0 || breaker.NodeId == localNodeId) {
                 TString breakerQueryTexts;
                 if (!breakerQueryText.empty()) {
                     breakerQueryTexts = TStringBuilder() << "[QuerySpanId=" << breaker.QuerySpanId
                         << " QueryText=" << breakerQueryText << "]";
                 }
+
+                LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                    "TLI TRACE EmitDeferredBreakerLogs: emitting local deferred breaker log"
+                    << " spanId=" << breaker.QuerySpanId);
 
                 NDataIntegrity::LogTli(NDataIntegrity::TTliLogParams{
                     .Component = "SessionActor",
@@ -2357,6 +2411,10 @@ public:
                     .IsCommitAction = isCommitAction,
                 }, TlsActivationContext->AsActorContext());
             } else {
+                LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                    "TLI TRACE EmitDeferredBreakerLogs: spawning TDeferredTliLogActor"
+                    << " spanId=" << breaker.QuerySpanId
+                    << " remoteNodeId=" << breaker.NodeId);
                 Register(new TDeferredTliLogActor(
                     breaker.QuerySpanId, breaker.NodeId, TraceId(), isCommitAction));
             }
@@ -2427,7 +2485,18 @@ public:
         std::optional<ui64> brokenLockQuerySpanId,
         ui64 locksBrokenAsVictim)
     {
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE EmitVictimTliLog: txManagerQuerySpanId=" << (txManagerQuerySpanId ? ToString(*txManagerQuerySpanId) : "none")
+            << " brokenLockQuerySpanId=" << (brokenLockQuerySpanId ? ToString(*brokenLockQuerySpanId) : "none")
+            << " locksBrokenAsVictim=" << locksBrokenAsVictim
+            << " TraceId=" << TraceId());
+
         auto [victimQuerySpanId, victimQueryText] = GetVictimQueryInfo(txManagerQuerySpanId, brokenLockQuerySpanId);
+
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE EmitVictimTliLog: resolved victimQuerySpanId=" << (victimQuerySpanId.Defined() ? ToString(*victimQuerySpanId) : "none")
+            << " victimQueryTextLen=" << victimQueryText.size()
+            << " IS_INFO=" << IS_INFO_LOG_ENABLED(NKikimrServices::TLI));
 
         if (IS_INFO_LOG_ENABLED(NKikimrServices::TLI)) {
             const bool isCommitAction = QueryState->GetAction() == NKikimrKqp::QUERY_ACTION_COMMIT_TX ||
@@ -2476,6 +2545,15 @@ public:
 
         QueryState->QueryStats.LocksBrokenAsBreaker += ev->LocksBrokenAsBreaker;
         QueryState->QueryStats.LocksBrokenAsVictim += ev->LocksBrokenAsVictim;
+
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE ProcessExecuterResult: LocksBrokenAsBreaker=" << ev->LocksBrokenAsBreaker
+            << " LocksBrokenAsVictim=" << ev->LocksBrokenAsVictim
+            << " BreakerQuerySpanIds.size=" << ev->BreakerQuerySpanIds.size()
+            << " DeferredBreakers.size=" << ev->DeferredBreakers.size()
+            << " BrokenLockQuerySpanId=" << (ev->BrokenLockQuerySpanId ? ToString(*ev->BrokenLockQuerySpanId) : "none")
+            << " status=" << response->GetStatus()
+            << " TraceId=" << TraceId());
 
         EmitBreakerLogs(ev);
         EmitDeferredBreakerLogs(ev);
@@ -2627,6 +2705,13 @@ public:
         TString logMsg = TStringBuilder() << "got TEvKqpBuffer::TEvError in " << CurrentStateFuncName()
             << ", status: " << NYql::NDqProto::StatusIds_StatusCode_Name(msg.StatusCode) << " send to: " << ExecuterId << " from: " << ev->Sender;
 
+        LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+            "TLI TRACE SessionActor Handle(TEvError):"
+            << " statusCode=" << NYql::NDqProto::StatusIds_StatusCode_Name(msg.StatusCode)
+            << " hasStats=" << msg.Stats.has_value()
+            << " hasExecuter=" << (bool)ExecuterId
+            << " TraceId=" << TraceId());
+
         if (!QueryState || !QueryState->TxCtx || QueryState->TxCtx->BufferActorId != ev->Sender) {
             STLOG_E(logMsg << ": Ignored error.",
                 (trace_id, TraceId()));
@@ -2637,6 +2722,8 @@ public:
         }
 
         if (ExecuterId) {
+            LOG_TRACE_S(TlsActivationContext->AsActorContext(), NKikimrServices::TLI,
+                "TLI TRACE SessionActor Handle(TEvError): forwarding to executer " << ExecuterId);
             Send(ExecuterId, new TEvKqpBuffer::TEvError{msg.StatusCode, std::move(msg.Issues), std::move(msg.Stats)}, IEventHandle::FlagTrackDelivery);
         } else {
             // No executer to forward to; emit victim TLI stats directly since
