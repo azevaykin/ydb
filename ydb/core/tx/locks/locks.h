@@ -360,6 +360,8 @@ public:
     ui32 GetBreakerNodeId() const { return BreakerNodeId_; }
     void ConsumeBreakerInfo() { BreakerConsumed_ = true; }
     bool IsBreakerConsumed() const { return BreakerConsumed_; }
+    void MarkBreakerReportedByWriter() { BreakerReportedByWriter_ = true; }
+    bool IsBreakerReportedByWriter() const { return BreakerReportedByWriter_; }
 
     size_t NumPoints() const { return Points.size(); }
     size_t NumRanges() const { return Ranges.size(); }
@@ -490,6 +492,7 @@ private:
     ui64 BreakerQuerySpanId_ = 0;
     ui32 BreakerNodeId_ = 0;
     bool BreakerConsumed_ = false;
+    bool BreakerReportedByWriter_ = false;
 
     THashMap<TLockInfo*, TConflictLockInfo> ConflictLocks;  // Locks to break on commit
     absl::flat_hash_set<ui64> VolatileDependencies;

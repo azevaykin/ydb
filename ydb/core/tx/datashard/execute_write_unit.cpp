@@ -47,7 +47,7 @@ public:
             return;
         }
         ui64 breakerQuerySpanId = lockInfo->GetBreakerQuerySpanId();
-        if (breakerQuerySpanId && !lockInfo->IsBreakerConsumed() && breakerQuerySpanId != lockInfo->GetVictimQuerySpanId()) {
+        if (breakerQuerySpanId && !lockInfo->IsBreakerReportedByWriter() && breakerQuerySpanId != lockInfo->GetVictimQuerySpanId()) {
             txStats->AddDeferredBreakerQuerySpanIds(breakerQuerySpanId);
             txStats->AddDeferredBreakerNodeIds(lockInfo->GetBreakerNodeId());
         }
@@ -111,6 +111,7 @@ public:
                 auto lockInfo = DataShard.SysLocksTable().GetRawLock(lockId);
                 if (lockInfo) {
                     lockInfo->ConsumeBreakerInfo();
+                    lockInfo->MarkBreakerReportedByWriter();
                 }
             }
         }

@@ -1169,7 +1169,7 @@ std::pair<TVector<TSysLocks::TLock>, TVector<ui64>> TSysLocks::ApplyLocks() {
             << " lockTxId=" << Update->LockTxId
             << " breakLocksCount=" << Update->BreakLocks.Size());
         for (auto& lock : Update->BreakLocks) {
-            if (breakerSpanId) {
+            if (breakerSpanId && (Update->LockTxId == 0 || lock.GetLockId() != Update->LockTxId)) {
                 lock.SetBreakerInfo(breakerSpanId, breakerNodeId);
             }
             brokenLocks.push_back(lock.GetLockId());
