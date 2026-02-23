@@ -347,7 +347,9 @@ bool TLockInfo::AddConflict(TLockInfo* otherLock, ILocksDb* db, ui64 breakerQuer
     auto& conflictInfo = ConflictLocks[otherLock];
     if (!(conflictInfo.Flags & ELockConflictFlags::BreakThemOnOurCommit)) {
         conflictInfo.Flags |= ELockConflictFlags::BreakThemOnOurCommit;
-        if (breakerQuerySpanId != 0 && conflictInfo.BreakerQuerySpanId == 0) {
+        if (breakerQuerySpanId != 0 && conflictInfo.BreakerQuerySpanId == 0
+            && breakerQuerySpanId != otherLock->GetVictimQuerySpanId())
+        {
             conflictInfo.BreakerQuerySpanId = breakerQuerySpanId;
             LOG_TRACE_S(LockLoggerContext, NKikimrServices::TLI,
                 "TLI TRACE AddConflict: lockId=" << LockId
@@ -1439,7 +1441,10 @@ void TSysLocks::CommitLock(const TArrayRef<const TCell>& key) {
                     << " updateQuerySpanId=" << Update->QuerySpanId
                     << " updateBreakerQSI=" << Update->BreakerQuerySpanId
                     << " conflictBreakerQSI=" << Update->ConflictBreakerQuerySpanId);
-                if (pr.second.BreakerQuerySpanId != 0 && !foundStoredBreakerQuerySpanId) {
+                if (pr.second.BreakerQuerySpanId != 0
+                    && pr.second.BreakerQuerySpanId != pr.first->GetVictimQuerySpanId()
+                    && !foundStoredBreakerQuerySpanId)
+                {
                     Update->BreakerQuerySpanId = pr.second.BreakerQuerySpanId;
                     foundStoredBreakerQuerySpanId = true;
                 }
