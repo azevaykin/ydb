@@ -347,9 +347,13 @@ bool TLockInfo::AddConflict(TLockInfo* otherLock, ILocksDb* db, ui64 breakerQuer
     auto& conflictInfo = ConflictLocks[otherLock];
     if (!(conflictInfo.Flags & ELockConflictFlags::BreakThemOnOurCommit)) {
         conflictInfo.Flags |= ELockConflictFlags::BreakThemOnOurCommit;
-        // Store the BreakerQuerySpanId if provided (only set once, when the conflict is first added)
         if (breakerQuerySpanId != 0 && conflictInfo.BreakerQuerySpanId == 0) {
             conflictInfo.BreakerQuerySpanId = breakerQuerySpanId;
+            LOG_TRACE_S(LockLoggerContext, NKikimrServices::TLI,
+                "TLI TRACE AddConflict: lockId=" << LockId
+                << " victimLockId=" << otherLock->LockId
+                << " victimQuerySpanId=" << otherLock->GetVictimQuerySpanId()
+                << " storedBreakerQSI=" << breakerQuerySpanId);
         }
         auto& otherConflictInfo = otherLock->ConflictLocks[this];
         otherConflictInfo.Flags |= ELockConflictFlags::BreakUsOnTheirCommit;
@@ -1155,8 +1159,20 @@ std::pair<TVector<TSysLocks::TLock>, TVector<ui64>> TSysLocks::ApplyLocks() {
         Locker.BreakLocks(Update->BreakLocks, breakVersion);
         ui64 breakerSpanId = Update->GetEffectiveBreakerQuerySpanId();
         ui32 breakerNodeId = breakerSpanId != 0 ? Update->LockNodeId : 0;
+        LOG_TRACE_S(LockLoggerContext, NKikimrServices::TLI,
+            "TLI TRACE ApplyLocks: breakerSpanId=" << breakerSpanId
+            << " BreakerQSI=" << Update->BreakerQuerySpanId
+            << " ConflictBreakerQSI=" << Update->ConflictBreakerQuerySpanId
+            << " QuerySpanId=" << Update->QuerySpanId
+            << " lockTxId=" << Update->LockTxId
+            << " breakLocksCount=" << Update->BreakLocks.Size());
         for (auto& lock : Update->BreakLocks) {
             if (breakerSpanId) {
+                if (breakerSpanId == lock.GetVictimQuerySpanId() && breakerSpanId != 0) {
+                    LOG_TRACE_S(LockLoggerContext, NKikimrServices::TLI,
+                        "TLI TRACE ApplyLocks ANOMALY: breakerSpanId==victimSpanId="
+                        << breakerSpanId << " lockId=" << lock.GetLockId());
+                }
                 lock.SetBreakerInfo(breakerSpanId, breakerNodeId);
             }
             brokenLocks.push_back(lock.GetLockId());
@@ -1415,7 +1431,14 @@ void TSysLocks::CommitLock(const TArrayRef<const TCell>& key) {
         for (auto& pr : lock->ConflictLocks) {
             if (!!(pr.second.Flags & ELockConflictFlags::BreakThemOnOurCommit) && !pr.first->IsRemoved()) {
                 Update->AddBreakLock(pr.first);
-                // Prefer the conflict-stored ID (actual breaker query) over the default.
+                LOG_TRACE_S(LockLoggerContext, NKikimrServices::TLI,
+                    "TLI TRACE CommitLock: lockId=" << lock->GetLockId()
+                    << " breaking victimLockId=" << pr.first->GetLockId()
+                    << " victimQuerySpanId=" << pr.first->GetVictimQuerySpanId()
+                    << " storedBreakerQSI=" << pr.second.BreakerQuerySpanId
+                    << " updateQuerySpanId=" << Update->QuerySpanId
+                    << " updateBreakerQSI=" << Update->BreakerQuerySpanId
+                    << " conflictBreakerQSI=" << Update->ConflictBreakerQuerySpanId);
                 if (pr.second.BreakerQuerySpanId != 0 && !foundStoredBreakerQuerySpanId) {
                     Update->BreakerQuerySpanId = pr.second.BreakerQuerySpanId;
                     foundStoredBreakerQuerySpanId = true;

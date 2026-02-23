@@ -103,6 +103,14 @@ public:
                 }
             }
 
+            for (ui64 vid : victimQuerySpanIds) {
+                if (primaryBreakerSpanId != 0 && vid == primaryBreakerSpanId) {
+                    LOG_TRACE_S(ctx, NKikimrServices::TLI,
+                        "TLI TRACE HandleBreakerLocks ANOMALY: BreakerQuerySpanId==VictimQuerySpanId="
+                        << primaryBreakerSpanId << " tabletId=" << DataShard.TabletID());
+                }
+            }
+
             NDataIntegrity::LogLocksBroken(ctx, DataShard.TabletID(), message,
                 otherLocksBroken, primaryBreakerSpanId, victimQuerySpanIds);
 
@@ -574,6 +582,14 @@ public:
             const bool isArbiter = op->HasVolatilePrepareFlag() && KqpLocksIsArbiter(tabletId, kqpLocks);
 
             KqpCommitLocks(tabletId, kqpLocks, sysLocks, userDb);
+            LOG_TRACE_S(ctx, NKikimrServices::TLI,
+                "TLI TRACE ExecuteWrite: afterCommitLocks"
+                << " tabletId=" << tabletId
+                << " guardLocks.QuerySpanId=" << guardLocks.QuerySpanId
+                << " guardLocks.BreakerQuerySpanId=" << guardLocks.BreakerQuerySpanId
+                << " guardLocks.ConflictBreakerQuerySpanId=" << guardLocks.ConflictBreakerQuerySpanId
+                << " hasOps=" << writeTx->HasOperations()
+                << " breakLocksSize=" << guardLocks.BreakLocks.Size());
 
             if (writeTx->HasOperations()) {
                 for (validatedOperationIndex = 0; validatedOperationIndex < writeTx->GetOperations().size(); ++validatedOperationIndex) {
@@ -592,6 +608,11 @@ public:
                 }
                 validatedOperationIndex = SIZE_MAX;
                 DataShard.AddRecentWriteForTli(mvccVersion, guardLocks.QuerySpanId, writeOp->GetTarget().NodeId());
+                LOG_TRACE_S(ctx, NKikimrServices::TLI,
+                    "TLI TRACE ExecuteWrite: afterWriteOps"
+                    << " tabletId=" << tabletId
+                    << " guardLocks.QuerySpanId=" << guardLocks.QuerySpanId
+                    << " opsCount=" << writeTx->GetOperations().size());
             } else {
                 LOG_DEBUG_S(ctx, NKikimrServices::TX_DATASHARD, "Skip empty write operation for " << *writeOp << " at " << DataShard.TabletID());
             }
