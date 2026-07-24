@@ -7,6 +7,7 @@
 #include <ydb/core/protos/analyze_operation.pb.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
 
+#include <ydb/core/base/counters.h>
 #include <ydb/core/base/hive.h>
 #include <ydb/core/base/tablet_pipe.h>
 #include <ydb/core/base/tablet_pipecache.h>
@@ -21,6 +22,8 @@
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
 #include <yql/essentials/core/minsketch/count_min_sketch.h>
 #include <ydb/core/util/intrusive_heap.h>
+
+#include <library/cpp/monlib/dynamic_counters/counters.h>
 
 #include <util/generic/intrlist.h>
 
@@ -195,10 +198,18 @@ private:
     void StartTraversal(NIceDb::TNiceDb& db);
     void FinishTraversal(
         NIceDb::TNiceDb& db,
+        NKikimrStat::TEvAnalyzeResponse::EStatus status,
         std::optional<Ydb::Table::AnalyzeState::State> forceTerminalState,
         NYql::TIssues issues = {});
 
     void ReportBaseStatisticsCounters();
+    void ReportAnalyzeCounters();
+    void InitAnalyzeCounters();
+
+    bool IsChangeRatioAboveThreshold(
+        ui64 lastAnalyzeRowModifications, ui64 currentRowModifications, ui64 rowCount) const;
+    std::pair<ui64, ui64> GetCurrentChangeCounters(const TPathId& pathId) const;
+    THashMap<TPathId, std::pair<ui64, ui64>> CollectCurrentChangeCounters() const;
 
     std::optional<bool> IsKnownTable(const TPathId& pathId) const;
     std::optional<bool> IsColumnTable(const TPathId& pathId) const;
@@ -272,6 +283,11 @@ private:
     TTabletCountersBase* TabletCounters;
     TAutoPtr<TTabletCountersBase> TabletCountersPtr;
 
+    // Dynamic counters for background ANALYZE monitoring (with status label via GetSubgroup)
+    NMonitoring::TDynamicCounters::TCounterPtr BackgroundAnalyzePendingCounter;
+    NMonitoring::TDynamicCounters::TCounterPtr BackgroundAnalyzeCompletedCounter;
+    NMonitoring::TDynamicCounters::TCounterPtr BackgroundAnalyzeFailedCounter;
+
     TInstant AggregationRequestBeginTime;
 
     bool EnableStatistics = false;
@@ -340,6 +356,8 @@ private:
         TInstant LastUpdateTime;
         bool IsColumnTable = false;
 
+        ui64 LastAnalyzeRowModifications = Max<ui64>();
+
         size_t HeapIndexByTime = -1;
 
         struct THeapIndexByTime {
@@ -354,6 +372,11 @@ private:
             }
         };
     };
+
+    // Returns the column table analyzed longest ago whose statistics are stale by
+    // change ratio, or nullptr if none is stale. Declared after TScheduleTraversal
+    // because it returns a pointer into ScheduleTraversals.
+    TScheduleTraversal* FindStaleColumnTable();
 
     size_t ResolveRound = 0;
     static constexpr size_t MaxResolveRoundCount = 5;

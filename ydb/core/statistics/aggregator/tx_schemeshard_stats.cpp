@@ -47,6 +47,7 @@ struct TStatisticsAggregator::TTxSchemeShardStats : public TTxBase {
 
             struct TOldStats {
                 ui64 RowCount = 0;
+                ui64 RowModifications = 0;
                 ui64 BytesSize = 0;
             };
             THashMap<TPathId, TOldStats> oldStatsMap;
@@ -54,6 +55,7 @@ struct TStatisticsAggregator::TTxSchemeShardStats : public TTxBase {
             for (const auto& entry : oldStatRecord.GetEntries()) {
                 auto& oldEntry = oldStatsMap[TPathId::FromProto(entry.GetPathId())];
                 oldEntry.RowCount = entry.GetRowCount();
+                oldEntry.RowModifications = entry.GetRowModifications();
                 oldEntry.BytesSize = entry.GetBytesSize();
             }
 
@@ -66,14 +68,17 @@ struct TStatisticsAggregator::TTxSchemeShardStats : public TTxBase {
 
                 if (entry.GetAreStatsFull()) {
                     newEntry->SetRowCount(entry.GetRowCount());
+                    newEntry->SetRowModifications(entry.GetRowModifications());
                     newEntry->SetBytesSize(entry.GetBytesSize());
                 } else {
                     auto oldIter = oldStatsMap.find(TPathId::FromProto(entry.GetPathId()));
                     if (oldIter != oldStatsMap.end()) {
                         newEntry->SetRowCount(oldIter->second.RowCount);
+                        newEntry->SetRowModifications(oldIter->second.RowModifications);
                         newEntry->SetBytesSize(oldIter->second.BytesSize);
                     } else {
                         newEntry->SetRowCount(0);
+                        newEntry->SetRowModifications(0);
                         newEntry->SetBytesSize(0);
                     }
                 }
@@ -103,6 +108,7 @@ struct TStatisticsAggregator::TTxSchemeShardStats : public TTxBase {
                 traversalTable.SchemeShardId = schemeShardId;
                 traversalTable.LastUpdateTime = TInstant::MicroSeconds(0);
                 traversalTable.IsColumnTable = entry.GetIsColumnTable();
+                traversalTable.LastAnalyzeRowModifications = Max<ui64>();
                 auto [it, _] = Self->ScheduleTraversals.emplace(pathId, traversalTable);
                 if (!Self->ScheduleTraversalsByTime.Has(&it->second)) {
                     Self->ScheduleTraversalsByTime.Add(&it->second);
@@ -110,7 +116,8 @@ struct TStatisticsAggregator::TTxSchemeShardStats : public TTxBase {
                 db.Table<Schema::ScheduleTraversals>().Key(pathId.OwnerId, pathId.LocalPathId).Update(
                     NIceDb::TUpdate<Schema::ScheduleTraversals::SchemeShardId>(schemeShardId),
                     NIceDb::TUpdate<Schema::ScheduleTraversals::LastUpdateTime>(0),
-                    NIceDb::TUpdate<Schema::ScheduleTraversals::IsColumnTable>(entry.GetIsColumnTable()));
+                    NIceDb::TUpdate<Schema::ScheduleTraversals::IsColumnTable>(entry.GetIsColumnTable()),
+                    NIceDb::TUpdate<Schema::ScheduleTraversals::LastAnalyzeRowModifications>(Max<ui64>()));
             }
         }
 
@@ -137,6 +144,7 @@ struct TStatisticsAggregator::TTxSchemeShardStats : public TTxBase {
             {"tabletId", Self->TabletID()});
         Self->BaseStatistics[Record.GetSchemeShardId()].Committed = UpdatedStats;
         Self->ReportBaseStatisticsCounters();
+        Self->ReportAnalyzeCounters();
     }
 };
 
