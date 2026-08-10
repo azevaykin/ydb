@@ -468,6 +468,7 @@ public:
     ::NMonitoring::TDynamicCounters::TCounterPtr WriteActorImmediateWrites;
     ::NMonitoring::TDynamicCounters::TCounterPtr WriteActorImmediateWritesRetries;
     ::NMonitoring::TDynamicCounters::TCounterPtr WriteActorPrepareWrites;
+    ::NMonitoring::TDynamicCounters::TCounterPtr WriteActorPrepareWritesRetries;
 
     ::NMonitoring::TDynamicCounters::TCounterPtr WriteActorWriteOnlyOperations;
     ::NMonitoring::TDynamicCounters::TCounterPtr WriteActorReadWriteOperations;

@@ -5183,5 +5183,60 @@ Y_UNIT_TEST_SUITE(DataShardWrite) {
             NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST);
     }
 
+    Y_UNIT_TEST(VolatilePrepareDuplicateNotVolatile) {
+        TPortManager pm;
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableDataShardVolatileTransactions(true);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+
+        InitRoot(server, sender);
+
+        Cerr << "========= Creating the table =========" << Endl;
+        TShardedTableOptions opts;
+        const auto [shards, tableId] = CreateShardedTable(server, sender, "/Root", "table-1", opts);
+        const ui64 shard = shards.at(0);
+        const auto& columns = opts.Columns_;
+
+        const ui64 txId = 100;
+
+        Cerr << "========= Sending MODE_PREPARE write =========" << Endl;
+        {
+            auto req = MakeWriteRequestOneKeyValue(txId,
+                NKikimrDataEvents::TEvWrite::MODE_PREPARE,
+                NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT,
+                tableId, columns, 1, 11);
+            const auto writeResult = Write(runtime, sender, shard, std::move(req));
+            UNIT_ASSERT_VALUES_EQUAL(writeResult.GetStatus(),
+                NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED);
+        }
+
+        Cerr << "========= Sending duplicate MODE_VOLATILE_PREPARE write =========" << Endl;
+        {
+            auto req = MakeWriteRequestOneKeyValue(txId,
+                NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE,
+                NKikimrDataEvents::TEvWrite::TOperation::OPERATION_UPSERT,
+                tableId, columns, 2, 22);
+            const auto writeResult = Write(runtime, sender, shard, std::move(req),
+                NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST);
+            UNIT_ASSERT_VALUES_EQUAL(writeResult.GetStatus(),
+                NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST);
+        }
+
+        Cerr << "========= Verifying tablet is alive =========" << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+            )"),
+            "");
+    }
+
 } // Y_UNIT_TEST_SUITE(DataShardWrite)
 } // namespace NKikimr

@@ -46,13 +46,41 @@ EExecutionStatus TCheckWriteUnit::Execute(TOperation::TPtr op,
 {
     Y_ENSURE(!op->IsAborted());
 
+    TWriteOperation* writeOp = TWriteOperation::CastWriteOperation(op);
+
+    // Replay a duplicate volatile prepare: answer PREPARED from the stored
+    // operation instead of crashing in AddTxInFly. The !op->IsImmediate()
+    // guard is load-bearing — immediate TEvWrite carries TxId = 0.
+    if (!op->IsImmediate()) {
+        if (auto existing = Pipeline.FindOp(op->GetTxId())) {
+            if (existing->IsWriteTx() && existing->HasVolatilePrepareFlag() && !existing->IsAborted()) {
+                op->SetMinStep(existing->GetMinStep());
+                op->SetMaxStep(existing->GetMaxStep());
+                writeOp->SetWriteResult(NEvents::TDataEvents::TEvWriteResult::BuildPrepared(
+                    DataShard.TabletID(),
+                    op->GetTxId(),
+                    {
+                        op->GetMinStep(),
+                        op->GetMaxStep(),
+                        DataShard.GetProcessingParams() ? DataShard.GetProcessingParams()->GetCoordinators() : google::protobuf::RepeatedField<ui64>{}
+                    }));
+            } else {
+                TString err = TStringBuilder()
+                    << "Duplicate txId " << op->GetTxId()
+                    << " at tablet " << DataShard.TabletID()
+                    << " is not a volatile prepare write tx";
+                writeOp->SetError(NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST, err);
+            }
+            op->Abort(EExecutionUnitKind::FinishProposeWrite);
+            return EExecutionStatus::Executed;
+        }
+    }
+
     if (CheckRejectDataTx(op, ctx)) {
         op->Abort(EExecutionUnitKind::FinishProposeWrite);
 
         return EExecutionStatus::Executed;
     }
-
-    TWriteOperation* writeOp = TWriteOperation::CastWriteOperation(op);
     auto writeTx = writeOp->GetWriteTx();
     Y_ENSURE(writeTx);
     Y_ENSURE(writeTx->Ready() || writeTx->RequirePrepare());

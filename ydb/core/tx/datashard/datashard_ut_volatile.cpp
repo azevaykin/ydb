@@ -3238,8 +3238,16 @@ Y_UNIT_TEST_SUITE(DataShardVolatile) {
                 )"),
             "<empty>");
 
-        TBlockEvents<TEvDataShard::TEvProposeTransaction> blockedPrepare(runtime);
-        TBlockEvents<NKikimr::NEvents::TDataEvents::TEvWrite> blockedEvWrite(runtime);
+        const auto shard0Actor = ResolveTablet(runtime, shards.at(0));
+        TBlockEvents<NKikimr::NEvents::TDataEvents::TEvWrite> blockedEvWrite(runtime,
+            [shard0Actor](const auto& ev) {
+                return ev->GetRecipientRewrite() == shard0Actor
+                    && ev->Get()->Record.GetTxMode() == NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE;
+            });
+
+        auto kqpCounters = GetServiceCounters(runtime.GetAppData().Counters, "kqp");
+        auto prepareRetries = kqpCounters->GetCounter("SinkWrites/WriteActorPrepareWritesRetries", true);
+        const auto retriesBefore = prepareRetries->Val();
 
         Cerr << "========= Starting upsert 1 =========" << Endl;
         auto upsertFuture1 = KqpSimpleSend(runtime, R"(
@@ -3247,18 +3255,30 @@ Y_UNIT_TEST_SUITE(DataShardVolatile) {
             VALUES (2, 2), (12, 12);
             )");
 
-        runtime.WaitFor("prepare requests", [&]{ return blockedPrepare.size() + blockedEvWrite.size() >= 2; });
-        UNIT_ASSERT_VALUES_EQUAL(blockedPrepare.size() + blockedEvWrite.size(), 2u);
+        runtime.WaitFor("shard 0 prepare request", [&]{ return blockedEvWrite.size() >= 1; });
+        UNIT_ASSERT_VALUES_EQUAL(blockedEvWrite.size(), 1u);
 
-        blockedPrepare.Stop();
-        blockedEvWrite.Stop();
+        blockedEvWrite.Stop().clear();
 
-        Cerr << "========= Restarting shard 1 =========" << Endl;
+        Cerr << "========= Restarting shard 0 =========" << Endl;
         GracefulRestartTablet(runtime, shards.at(0), sender);
 
         UNIT_ASSERT_VALUES_EQUAL(
             FormatResult(runtime.WaitFuture(std::move(upsertFuture1))),
-            "ERROR: UNAVAILABLE");
+            "<empty>");
+
+        // The retryable volatile prepare path should have retried exactly once.
+        UNIT_ASSERT_VALUES_EQUAL(prepareRetries->Val(), retriesBefore + 1);
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                SELECT key, value FROM `/Root/table`
+                ORDER BY key
+            )"),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }, "
+            "{ items { uint32_value: 11 } items { uint32_value: 11 } }, "
+            "{ items { uint32_value: 12 } items { uint32_value: 12 } }");
     }
 
     Y_UNIT_TEST(DistributedUpsertRestartAfterPrepare) {
@@ -4232,6 +4252,424 @@ Y_UNIT_TEST_SUITE(DataShardVolatile) {
         UNIT_ASSERT_VALUES_EQUAL(
             "{ items { uint32_value: 1 } items { uint32_value: 10 } }",
             KqpSimpleExec(runtime, "SELECT key, value FROM `/Root/table-1`;"));
+    }
+
+    Y_UNIT_TEST(VolatilePrepareDuplicateAnswered) {
+        TPortManager pm;
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableDataShardVolatileTransactions(true);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::PIPE_CLIENT, NLog::PRI_TRACE);
+
+        InitRoot(server, sender);
+
+        Cerr << "========= Creating the table =========" << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSchemeExec(runtime, R"(
+                CREATE TABLE `/Root/table` (key uint32, value uint32, PRIMARY KEY (key))
+                WITH (PARTITION_AT_KEYS = (10));
+            )"),
+            "SUCCESS");
+
+        const auto shards = GetTableShards(server, sender, "/Root/table");
+        UNIT_ASSERT_VALUES_EQUAL(shards.size(), 2u);
+
+        Cerr << "========= Upserting initial values =========" << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                UPSERT INTO `/Root/table` (key, value)
+                VALUES (1, 1), (11, 11)
+            )"),
+            "<empty>");
+
+        const auto shard0Actor = ResolveTablet(runtime, shards.at(0));
+        TBlockEvents<NEvents::TDataEvents::TEvWrite> blockedEvWrite(runtime,
+            [shard0Actor](const auto& ev) {
+                return ev->GetRecipientRewrite() == shard0Actor
+                    && ev->Get()->Record.GetTxMode() == NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE;
+            });
+
+        // Block shard 0's PREPARED result so the coordinator never plans.
+        TBlockEvents<NEvents::TDataEvents::TEvWriteResult> blockedPrepared(runtime,
+            [shard0 = shards.at(0)](const auto& ev) {
+                return ev->Get()->Record.GetOrigin() == shard0
+                    && ev->Get()->Record.GetStatus() == NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED;
+            });
+
+        Cerr << "========= Starting upsert =========" << Endl;
+        auto upsertFuture = KqpSimpleSend(runtime, R"(
+            UPSERT INTO `/Root/table` (key, value)
+            VALUES (2, 2), (12, 12);
+        )");
+
+        runtime.WaitFor("shard 0 TEvWrite", [&]{ return blockedEvWrite.size() >= 1; });
+        UNIT_ASSERT_VALUES_EQUAL(blockedEvWrite.size(), 1u);
+
+        auto& capturedEv = blockedEvWrite[0];
+        const ui64 txId = capturedEv->Get()->Record.GetTxId();
+        auto clone = std::make_unique<NEvents::TDataEvents::TEvWrite>();
+        clone->Record.CopyFrom(capturedEv->Get()->Record);
+        for (ui32 i = 0; i < capturedEv->Get()->GetPayloadCount(); ++i) {
+            clone->AddPayload(TRope(capturedEv->Get()->GetPayload(i)));
+        }
+
+        blockedEvWrite.Stop().Unblock();
+
+        // Wait for shard 0's PREPARED to be blocked (before-plan: no step assigned yet).
+        runtime.WaitFor("shard 0 PREPARED blocked", [&]{ return blockedPrepared.size() >= 1; });
+        UNIT_ASSERT_VALUES_EQUAL(blockedPrepared.size(), 1u);
+
+        // Capture original MinStep/MaxStep from the blocked PREPARED.
+        const auto origMinStep = blockedPrepared[0]->Get()->Record.GetMinStep();
+        const auto origMaxStep = blockedPrepared[0]->Get()->Record.GetMaxStep();
+
+        // Stop blocking new PREPARED results so the duplicate's reply can pass through.
+        // The original PREPARED stays held; it is released later via Unblock().
+        blockedPrepared.Stop();
+
+        // Send the duplicate TEvWrite to shard 0 (operation is in TxsInFly with no step).
+        runtime.Send(new IEventHandle(
+            shard0Actor, sender, clone.release(), 0, 0),
+            0, /* viaActorSystem */ true);
+
+        auto dupReply = runtime.GrabEdgeEventRethrow<NEvents::TDataEvents::TEvWriteResult>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(
+            dupReply->Get()->Record.GetStatus(),
+            NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED);
+        UNIT_ASSERT_VALUES_EQUAL(dupReply->Get()->Record.GetTxId(), txId);
+        // Replay must return the original MinStep/MaxStep, not re-run AssignPlanInterval.
+        UNIT_ASSERT_VALUES_EQUAL(dupReply->Get()->Record.GetMinStep(), origMinStep);
+        UNIT_ASSERT_VALUES_EQUAL(dupReply->Get()->Record.GetMaxStep(), origMaxStep);
+
+        // Release the original PREPARED so the transaction can proceed.
+        blockedPrepared.Unblock();
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            FormatResult(AwaitResponse(runtime, std::move(upsertFuture))),
+            "<empty>");
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                SELECT key, value FROM `/Root/table`
+                ORDER BY key
+            )"),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }, "
+            "{ items { uint32_value: 11 } items { uint32_value: 11 } }, "
+            "{ items { uint32_value: 12 } items { uint32_value: 12 } }");
+    }
+
+    // After commit the operation has left TxsInFly, so a duplicate TEvWrite
+    // creates a fresh volatile prepare (the stray-operation gap the data half's
+    // Stage 2c closes). This test pins the current behaviour.
+    Y_UNIT_TEST(VolatilePrepareDuplicateAfterCommit) {
+        TPortManager pm;
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableDataShardVolatileTransactions(true);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::PIPE_CLIENT, NLog::PRI_TRACE);
+
+        InitRoot(server, sender);
+
+        Cerr << "========= Creating the table =========" << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSchemeExec(runtime, R"(
+                CREATE TABLE `/Root/table` (key uint32, value uint32, PRIMARY KEY (key))
+                WITH (PARTITION_AT_KEYS = (10));
+            )"),
+            "SUCCESS");
+
+        const auto shards = GetTableShards(server, sender, "/Root/table");
+        UNIT_ASSERT_VALUES_EQUAL(shards.size(), 2u);
+
+        Cerr << "========= Upserting initial values =========" << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                UPSERT INTO `/Root/table` (key, value)
+                VALUES (1, 1), (11, 11)
+            )"),
+            "<empty>");
+
+        const auto shard0Actor = ResolveTablet(runtime, shards.at(0));
+
+        // Capture the prepare so we can re-send it after the transaction commits.
+        TBlockEvents<NEvents::TDataEvents::TEvWrite> blockedEvWrite(runtime,
+            [shard0Actor](const auto& ev) {
+                return ev->GetRecipientRewrite() == shard0Actor
+                    && ev->Get()->Record.GetTxMode() == NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE;
+            });
+
+        // Capture the original MinStep to distinguish a fresh operation
+        // (larger MinStep) from a replay (same MinStep) on the duplicate.
+        std::optional<ui64> origMinStep;
+        auto prepareObserver = runtime.AddObserver<NEvents::TDataEvents::TEvWriteResult>(
+            [&] (const NEvents::TDataEvents::TEvWriteResult::TPtr& ev) {
+                if (ev->Get()->Record.GetOrigin() == shards.at(0) &&
+                    ev->Get()->Record.GetStatus() == NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED) {
+                    origMinStep = ev->Get()->Record.GetMinStep();
+                }
+            });
+
+        Cerr << "========= Starting upsert =========" << Endl;
+        auto upsertFuture = KqpSimpleSend(runtime, R"(
+            UPSERT INTO `/Root/table` (key, value)
+            VALUES (2, 2), (12, 12);
+        )");
+
+        runtime.WaitFor("shard 0 TEvWrite", [&]{ return blockedEvWrite.size() >= 1; });
+        UNIT_ASSERT_VALUES_EQUAL(blockedEvWrite.size(), 1u);
+
+        auto& capturedEv = blockedEvWrite[0];
+        const ui64 txId = capturedEv->Get()->Record.GetTxId();
+        auto clone = std::make_unique<NEvents::TDataEvents::TEvWrite>();
+        clone->Record.CopyFrom(capturedEv->Get()->Record);
+        for (ui32 i = 0; i < capturedEv->Get()->GetPayloadCount(); ++i) {
+            clone->AddPayload(TRope(capturedEv->Get()->GetPayload(i)));
+        }
+
+        blockedEvWrite.Stop().Unblock();
+
+        // Wait for shard 0's PREPARED to reach KQP so we capture its MinStep.
+        runtime.WaitFor("shard 0 PREPARED observed", [&]{ return origMinStep.has_value(); });
+        UNIT_ASSERT_C(origMinStep.has_value(), "Original PREPARED was not observed");
+
+        // Let the transaction commit fully — the operation leaves TxsInFly.
+        UNIT_ASSERT_VALUES_EQUAL(
+            FormatResult(AwaitResponse(runtime, std::move(upsertFuture))),
+            "<empty>");
+
+        // The operation is gone from TxsInFly: a duplicate creates a fresh
+        // prepare. Pin that the shard answers PREPARED and stays alive.
+        runtime.Send(new IEventHandle(
+            shard0Actor, sender, clone.release(), 0, 0),
+            0, /* viaActorSystem */ true);
+
+        auto dupReply = runtime.GrabEdgeEventRethrow<NEvents::TDataEvents::TEvWriteResult>(sender);
+        UNIT_ASSERT_VALUES_EQUAL(
+            dupReply->Get()->Record.GetStatus(),
+            NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED);
+        UNIT_ASSERT_VALUES_EQUAL(dupReply->Get()->Record.GetTxId(), txId);
+        // A fresh operation re-runs AssignPlanInterval, so MinStep is at
+        // least the original (LastPlannedTx.Step only moves forward). A
+        // replay would return the exact same MinStep; in the test runtime
+        // mediator time may not advance, so >= is the reliable assertion.
+        UNIT_ASSERT_C(dupReply->Get()->Record.GetMinStep() >= *origMinStep,
+            "Fresh prepare should have MinStep >= original: "
+            << dupReply->Get()->Record.GetMinStep() << " vs " << *origMinStep);
+
+        // The tablet must still be alive.
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                SELECT key, value FROM `/Root/table`
+                ORDER BY key
+            )"),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }, "
+            "{ items { uint32_value: 11 } items { uint32_value: 11 } }, "
+            "{ items { uint32_value: 12 } items { uint32_value: 12 } }");
+    }
+
+    Y_UNIT_TEST(VolatilePrepareRetriedAfterGracefulRestart) {
+        TPortManager pm;
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableDataShardVolatileTransactions(true);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::PIPE_CLIENT, NLog::PRI_TRACE);
+
+        InitRoot(server, sender);
+
+        Cerr << "========= Creating the table =========" << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSchemeExec(runtime, R"(
+                CREATE TABLE `/Root/table` (key uint32, value uint32, PRIMARY KEY (key))
+                WITH (PARTITION_AT_KEYS = (10));
+            )"),
+            "SUCCESS");
+
+        const auto shards = GetTableShards(server, sender, "/Root/table");
+        UNIT_ASSERT_VALUES_EQUAL(shards.size(), 2u);
+
+        Cerr << "========= Upserting initial values =========" << Endl;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                UPSERT INTO `/Root/table` (key, value)
+                VALUES (1, 1), (11, 11)
+            )"),
+            "<empty>");
+
+        TBlockEvents<NEvents::TDataEvents::TEvWriteResult> blockedPrepare(runtime,
+            [shard0 = shards.at(0)](const auto& ev) {
+                return ev->Get()->Record.GetOrigin() == shard0;
+            });
+
+        auto kqpCounters = GetServiceCounters(runtime.GetAppData().Counters, "kqp");
+        auto prepareRetries = kqpCounters->GetCounter("SinkWrites/WriteActorPrepareWritesRetries", true);
+        const auto retriesBefore = prepareRetries->Val();
+
+        Cerr << "========= Starting upsert =========" << Endl;
+        auto upsertFuture = KqpSimpleSend(runtime, R"(
+            UPSERT INTO `/Root/table` (key, value)
+            VALUES (2, 2), (12, 12);
+        )");
+
+        runtime.WaitFor("shard 0 prepare result", [&]{ return blockedPrepare.size() >= 1; });
+        UNIT_ASSERT_VALUES_EQUAL(blockedPrepare.size(), 1u);
+
+        blockedPrepare.Stop().clear();
+
+        Cerr << "========= Graceful restart shard 0 =========" << Endl;
+        GracefulRestartTablet(runtime, shards.at(0), sender);
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            FormatResult(AwaitResponse(runtime, std::move(upsertFuture))),
+            "<empty>");
+
+        UNIT_ASSERT_VALUES_EQUAL(prepareRetries->Val(), retriesBefore + 1);
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                SELECT key, value FROM `/Root/table`
+                ORDER BY key
+            )"),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }, "
+            "{ items { uint32_value: 2 } items { uint32_value: 2 } }, "
+            "{ items { uint32_value: 11 } items { uint32_value: 11 } }, "
+            "{ items { uint32_value: 12 } items { uint32_value: 12 } }");
+    }
+
+    // External (buffer-actor) shard retry path: read from table-1 (locks-only
+    // external shard), write to table-2 (write-actor shard). A graceful restart
+    // of table-1's shard triggers TEvRetryExternalPrepare. Both shards' PREPARED
+    // are blocked so the buffer actor stays in StatePrepare; the retry produces
+    // a second PREPARED for table-1, then the held original is released to
+    // exercise the OnPrepared stale-drop guard while the actor is still alive.
+    Y_UNIT_TEST(VolatilePrepareExternalShardRetriedAfterGracefulRestart) {
+        TPortManager pm;
+        TServerSettings serverSettings(pm.GetPort(2134));
+        serverSettings.SetDomainName("Root")
+            .SetUseRealThreads(false)
+            .SetEnableDataShardVolatileTransactions(true);
+
+        Tests::TServer::TPtr server = new TServer(serverSettings);
+        auto &runtime = *server->GetRuntime();
+        auto sender = runtime.AllocateEdgeActor();
+
+        runtime.SetLogPriority(NKikimrServices::TX_DATASHARD, NLog::PRI_TRACE);
+        runtime.SetLogPriority(NKikimrServices::PIPE_CLIENT, NLog::PRI_TRACE);
+
+        InitRoot(server, sender);
+
+        Cerr << "========= Creating the tables =========" << Endl;
+        CreateShardedTable(server, sender, "/Root", "table-1", 1);
+        CreateShardedTable(server, sender, "/Root", "table-2", 1);
+
+        const auto shards1 = GetTableShards(server, sender, "/Root/table-1");
+        const auto shards2 = GetTableShards(server, sender, "/Root/table-2");
+        UNIT_ASSERT_VALUES_EQUAL(shards1.size(), 1u);
+        UNIT_ASSERT_VALUES_EQUAL(shards2.size(), 1u);
+
+        Cerr << "========= Upserting initial values =========" << Endl;
+        ExecSQL(server, sender, "UPSERT INTO `/Root/table-1` (key, value) VALUES (1, 1);");
+        ExecSQL(server, sender, "UPSERT INTO `/Root/table-2` (key, value) VALUES (10, 10);");
+
+        // Block PREPARED from both shards so the buffer actor stays in
+        // StatePrepare. Filter on STATUS_PREPARED so later results pass.
+        TBlockEvents<NEvents::TDataEvents::TEvWriteResult> blockedPrepare1(runtime,
+            [shard1 = shards1.at(0)](const auto& ev) {
+                return ev->Get()->Record.GetOrigin() == shard1
+                    && ev->Get()->Record.GetStatus() == NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED;
+            });
+        TBlockEvents<NEvents::TDataEvents::TEvWriteResult> blockedPrepare2(runtime,
+            [shard2 = shards2.at(0)](const auto& ev) {
+                return ev->Get()->Record.GetOrigin() == shard2
+                    && ev->Get()->Record.GetStatus() == NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED;
+            });
+
+        auto kqpCounters = GetServiceCounters(runtime.GetAppData().Counters, "kqp");
+        auto prepareRetries = kqpCounters->GetCounter("SinkWrites/WriteActorPrepareWritesRetries", true);
+        const auto retriesBefore = prepareRetries->Val();
+
+        // Begin a transaction that reads from table-1 (locks table-1's shard).
+        TString sessionId, txId;
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleBegin(runtime, sessionId, txId, R"(
+                SELECT key, value FROM `/Root/table-1`
+                ORDER BY key
+            )"),
+            "{ items { uint32_value: 1 } items { uint32_value: 1 } }");
+
+        // Commit with a write to table-2: buffer actor prepares table-1
+        // (external/locks-only), write actor prepares table-2.
+        Cerr << "========= Starting commit =========" << Endl;
+        auto commitFuture = KqpSimpleSendCommit(runtime, sessionId, txId, R"(
+            UPSERT INTO `/Root/table-2` (key, value) VALUES (20, 20);
+        )");
+
+        // Wait for both shards' PREPARED to be captured.
+        runtime.WaitFor("table-1 prepare result", [&]{ return blockedPrepare1.size() >= 1; });
+        UNIT_ASSERT_VALUES_EQUAL(blockedPrepare1.size(), 1u);
+        runtime.WaitFor("table-2 prepare result", [&]{ return blockedPrepare2.size() >= 1; });
+        UNIT_ASSERT_VALUES_EQUAL(blockedPrepare2.size(), 1u);
+
+        // Stop blocking new PREPARED for table-1 but hold the original.
+        // The retry produces a second PREPARED that the buffer actor consumes,
+        // moving table-1 to PREPARED. Table-2 stays blocked so the actor
+        // cannot leave StatePrepare.
+        blockedPrepare1.Stop();
+
+        Cerr << "========= Graceful restart table-1 shard =========" << Endl;
+        GracefulRestartTablet(runtime, shards1.at(0), sender);
+
+        // Wait for the retry to produce table-1's second PREPARED and the
+        // buffer actor to consume it (table-1 moves to PREPARED). The retry
+        // delay is ~2s with jitter, so wait long enough.
+        runtime.SimulateSleep(TDuration::Seconds(4));
+
+        // The external-shard retry path should have retried exactly once.
+        UNIT_ASSERT_VALUES_EQUAL(prepareRetries->Val(), retriesBefore + 1);
+
+        // Release the held original table-1 PREPARED. The actor is still in
+        // StatePrepare (table-2 is blocked), so it routes to HandlePrepare →
+        // ProcessWritePreparedShard → OnPrepared, where the stale-drop guard
+        // must drop it because table-1 is no longer PREPARING.
+        blockedPrepare1.Unblock();
+        runtime.SimulateSleep(TDuration::MilliSeconds(100));
+
+        // Release table-2's PREPARED so the transaction can commit.
+        blockedPrepare2.Stop().Unblock();
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            FormatResult(AwaitResponse(runtime, std::move(commitFuture))),
+            "<empty>");
+
+        UNIT_ASSERT_VALUES_EQUAL(
+            KqpSimpleExec(runtime, R"(
+                SELECT key, value FROM `/Root/table-2`
+                ORDER BY key
+            )"),
+            "{ items { uint32_value: 10 } items { uint32_value: 10 } }, "
+            "{ items { uint32_value: 20 } items { uint32_value: 20 } }");
     }
 
 } // Y_UNIT_TEST_SUITE(DataShardVolatile)

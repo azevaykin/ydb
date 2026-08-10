@@ -232,7 +232,7 @@ namespace {
         return record.GetStatus() == NKikimrProto::OK;
     }
 
-    bool HandleTransactionRestart(NKikimr::NKqp::IKqpTransactionManagerPtr& txManager, NKikimr::TEvDataShard::TEvProposeTransactionRestart::TPtr& ev) {
+    bool HandleTransactionRestart(NKikimr::NKqp::IKqpTransactionManagerPtr& txManager, NKikimr::TEvDataShard::TEvProposeTransactionRestart::TPtr& ev, bool canRetry) {
         const auto& record = ev->Get()->Record;
         const ui64 shardId = record.GetTabletId();
 
@@ -243,6 +243,9 @@ namespace {
                 return true;
             }
             case NKikimr::NKqp::IKqpTransactionManager::PREPARING: {
+                if (canRetry && txManager->IsVolatile()) {
+                    return true;
+                }
                 return false;
             }
             case NKikimr::NKqp::IKqpTransactionManager::FINISHED:
@@ -1134,11 +1137,14 @@ public:
     }
 
     void ProcessWritePreparedShard(NKikimr::NEvents::TDataEvents::TEvWriteResult::TPtr& ev) {
-        YQL_ENSURE(Mode == EMode::PREPARE);
+        if (Mode != EMode::PREPARE) {
+            YDB_LOG_WARN("Dropping stale PREPARED result for shard that is no longer in PREPARE mode",
+                {"logPrefix", this->LogPrefix},
+                {"shardId", ev->Get()->Record.GetOrigin()},
+                {"mode", static_cast<int>(Mode)});
+            return;
+        }
         const auto& record = ev->Get()->Record;
-        AFL_ENSURE(record.GetTxLocks().empty());
-
-        UpdateStats(record.GetTxStats());
 
         IKqpTransactionManager::TPrepareResult preparedInfo;
         preparedInfo.ShardId = record.GetOrigin();
@@ -1152,13 +1158,16 @@ public:
             preparedInfo.Coordinator = domainCoordinators.Select(*TxId);
         }
 
-        OnMessageReceived(ev->Get()->Record.GetOrigin());
         const auto result = ShardedWriteController->OnMessageAcknowledged(
                 ev->Get()->Record.GetOrigin(), ev->Cookie);
-        if (result) {
-            YQL_ENSURE(result->IsShardEmpty);
-            Callbacks->OnPrepared(std::move(preparedInfo), result->DataSize);
+        if (!result) {
+            return;
         }
+        UpdateStats(record.GetTxStats());
+        OnMessageReceived(ev->Get()->Record.GetOrigin());
+        AFL_ENSURE(record.GetTxLocks().empty());
+        YQL_ENSURE(result->IsShardEmpty);
+        Callbacks->OnPrepared(std::move(preparedInfo), result->DataSize);
     }
 
     void ProcessWriteCompletedShard(NKikimr::NEvents::TDataEvents::TEvWriteResult::TPtr& ev) {
@@ -1297,7 +1306,9 @@ public:
 
         const auto metadata = ShardedWriteController->GetMessageMetadata(shardId);
         YQL_ENSURE(metadata);
-        YQL_ENSURE(metadata->SendAttempts == 0 || InconsistentTx);
+        // Allow prepare resends for retryable volatile prepare.
+        YQL_ENSURE(metadata->SendAttempts == 0 || InconsistentTx
+            || (PipelinedWrites && metadata->IsFinal && Mode == EMode::PREPARE));
         if (metadata->SendAttempts >= MessageSettings.MaxWriteAttempts) {
             YDB_LOG_WARN("Write retry limit exceeded for table.",
                 {"logPrefix", this->LogPrefix},
@@ -1377,8 +1388,12 @@ public:
 
             SendTime[shardId] = TInstant::Now();
         } else {
-            YQL_ENSURE(!isPrepare);
-            Counters->WriteActorImmediateWritesRetries->Inc();
+            if (isPrepare) {
+                YQL_ENSURE(PipelinedWrites);
+                Counters->WriteActorPrepareWritesRetries->Inc();
+            } else {
+                Counters->WriteActorImmediateWritesRetries->Inc();
+            }
         }
 
         if (MvccSnapshot && (isPrepare || isImmediateCommit)) {
@@ -1475,7 +1490,11 @@ public:
         YDB_LOG_INFO("Timeout",
             {"logPrefix", this->LogPrefix},
             {"shardID", ev->Get()->ShardId});
-        YQL_ENSURE(InconsistentTx);
+        if (!InconsistentTx
+            && !(PipelinedWrites && TxManager->IsVolatile()
+                && TxManager->GetState(ev->Get()->ShardId) == IKqpTransactionManager::PREPARING)) {
+            return;
+        }
         RetryShard(ev->Get()->ShardId, ev->Cookie);
     }
 
@@ -1496,9 +1515,33 @@ public:
             return;
         }
 
+        const auto state = TxManager->GetState(ev->Get()->TabletId);
+
+        // Retryable volatile prepare: schedule a prepare resend.
+        if (PipelinedWrites && TxManager->IsVolatile()
+                && state == IKqpTransactionManager::PREPARING
+                && !ev->Get()->IsDeleted) {
+            const auto metadata = ShardedWriteController->GetMessageMetadata(ev->Get()->TabletId);
+            if (metadata && metadata->SendAttempts < MessageSettings.MaxWriteAttempts) {
+                YDB_LOG_NOTICE("Shard delivery problem during volatile prepare; scheduling prepare retry.",
+                    {"logPrefix", this->LogPrefix},
+                    {"tabletId", ev->Get()->TabletId},
+                    {"attempt", metadata->SendAttempts},
+                    {"delay", CalculateNextAttemptDelay(MessageSettings, metadata->SendAttempts)});
+                TlsActivationContext->Schedule(
+                    CalculateNextAttemptDelay(MessageSettings, metadata->SendAttempts),
+                    new IEventHandle(
+                        SelfId(),
+                        SelfId(),
+                        new TEvPrivate::TEvShardRequestTimeout(ev->Get()->TabletId),
+                        0,
+                        metadata->Cookie));
+                return;
+            }
+        }
+
         const auto& reattachState = TxManager->GetReattachState(ev->Get()->TabletId);
 
-        const auto state = TxManager->GetState(ev->Get()->TabletId);
         if ((state == IKqpTransactionManager::PREPARED
                     || state == IKqpTransactionManager::EXECUTING)
                 && TxManager->ShouldReattach(ev->Get()->TabletId, TlsActivationContext->Now())) {
@@ -1572,7 +1615,7 @@ public:
         YDB_LOG_DEBUG("Got transaction restart event",
             {"logPrefix", this->LogPrefix},
             {"tabletId", ev->Get()->Record.GetTabletId()});
-        if (!HandleTransactionRestart(TxManager, ev)) {
+        if (!HandleTransactionRestart(TxManager, ev, PipelinedWrites)) {
             RuntimeError(
                 NYql::NDqProto::StatusIds::UNAVAILABLE,
                 NYql::TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE,
@@ -3340,6 +3383,7 @@ class TKqpBufferWriteActor : public TActorBootstrapped<TKqpBufferWriteActor>, pu
     struct TEvPrivate {
         enum EEv {
             EvReattachToShard = EventSpaceBegin(TKikimrEvents::ES_PRIVATE),
+            EvRetryExternalPrepare,
         };
 
         struct TEvReattachToShard : public TEventLocal<TEvReattachToShard, EvReattachToShard> {
@@ -3347,6 +3391,15 @@ class TKqpBufferWriteActor : public TActorBootstrapped<TKqpBufferWriteActor>, pu
 
             explicit TEvReattachToShard(ui64 tabletId)
                 : TabletId(tabletId) {}
+        };
+
+        struct TEvRetryExternalPrepare : public TEventLocal<TEvRetryExternalPrepare, EvRetryExternalPrepare> {
+            const ui64 ShardId;
+            const ui64 SeqNo;
+
+            explicit TEvRetryExternalPrepare(ui64 shardId, ui64 seqNo)
+                : ShardId(shardId)
+                , SeqNo(seqNo) {}
         };
     };
 
@@ -3442,6 +3495,7 @@ public:
 
                 hFunc(TEvDataShard::TEvProposeTransactionAttachResult, HandlePrepare);
                 hFunc(TEvPrivate::TEvReattachToShard, Handle);
+                hFunc(TEvPrivate::TEvRetryExternalPrepare, Handle);
                 hFunc(TEvDataShard::TEvProposeTransactionRestart, Handle);
             default:
                 AFL_ENSURE(false)("StatePrepare: unknown message", ev->GetTypeRewrite());
@@ -3466,6 +3520,7 @@ public:
 
                 hFunc(TEvDataShard::TEvProposeTransactionAttachResult, HandleCommit);
                 hFunc(TEvPrivate::TEvReattachToShard, Handle);
+                hFunc(TEvPrivate::TEvRetryExternalPrepare, Handle);
                 hFunc(TEvDataShard::TEvProposeTransactionRestart, Handle);
             default:
                 AFL_ENSURE(false)("StateCommit: unknown message", ev->GetTypeRewrite());
@@ -5128,7 +5183,7 @@ public:
         YDB_LOG_DEBUG("Got transaction restart event",
             {"logPrefix", this->LogPrefix},
             {"tabletId", ev->Get()->Record.GetTabletId()});
-        if (!HandleTransactionRestart(TxManager, ev)) {
+        if (!HandleTransactionRestart(TxManager, ev, AppData()->FeatureFlags.GetEnableDataShardPipelinedUncommittedWrites())) {
             ReplyError(
                 NYql::NDqProto::StatusIds::UNAVAILABLE,
                 NYql::TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE,
@@ -5171,6 +5226,31 @@ public:
             {"tablet", ev->Get()->TabletId});
 
         const auto state = TxManager->GetState(ev->Get()->TabletId);
+
+        // Retryable volatile prepare: schedule a prepare resend.
+        if (AppData()->FeatureFlags.GetEnableDataShardPipelinedUncommittedWrites()
+                && TxManager->IsVolatile()
+                && state == IKqpTransactionManager::PREPARING
+                && !ev->Get()->IsDeleted) {
+            const ui64 shardId = ev->Get()->TabletId;
+            const auto seqNoIt = ExternalShardIdToOverloadSeqNo.FindPtr(shardId);
+            const ui64 seqNo = seqNoIt ? *seqNoIt : 0;
+            const auto attemptIt = PrepareRetryAttempts.FindPtr(shardId);
+            const ui64 attempt = attemptIt ? *attemptIt : 0;
+            if (attempt + 1 < MessageSettings.MaxWriteAttempts) {
+                const ui64 delayBase = attempt + 1;
+                YDB_LOG_NOTICE("Shard delivery problem during volatile prepare; scheduling prepare retry.",
+                    {"logPrefix", this->LogPrefix},
+                    {"tabletId", shardId},
+                    {"attempt", attempt},
+                    {"delay", CalculateNextAttemptDelay(MessageSettings, delayBase)});
+                Schedule(
+                    CalculateNextAttemptDelay(MessageSettings, delayBase),
+                    new TEvPrivate::TEvRetryExternalPrepare(shardId, seqNo));
+                return;
+            }
+        }
+
         if (state == IKqpTransactionManager::PREPARED && TxManager->ShouldReattach(ev->Get()->TabletId, TlsActivationContext->Now())) {
             const auto& reattachState = TxManager->GetReattachState(ev->Get()->TabletId);
             YDB_LOG_NOTICE("Shard delivery problem detected; scheduling reattach to shard.",
@@ -5190,6 +5270,34 @@ public:
                 << " during prepare phase. "
                 << GetPathes(ev->Get()->TabletId) << ".",
             {});
+    }
+
+    void Handle(TEvPrivate::TEvRetryExternalPrepare::TPtr& ev) {
+        const ui64 shardId = ev->Get()->ShardId;
+        const ui64 seqNo = ev->Get()->SeqNo;
+
+        const auto currentSeqNoIt = ExternalShardIdToOverloadSeqNo.FindPtr(shardId);
+        const ui64 currentSeqNo = currentSeqNoIt ? *currentSeqNoIt : 0;
+        if (seqNo != currentSeqNo) {
+            YDB_LOG_DEBUG("Stale prepare retry dropped",
+                {"logPrefix", this->LogPrefix},
+                {"shardId", shardId},
+                {"seqNo", seqNo});
+            return;
+        }
+        if (TxManager->GetState(shardId) != IKqpTransactionManager::PREPARING) {
+            YDB_LOG_DEBUG("Prepare retry dropped: shard no longer PREPARING",
+                {"logPrefix", this->LogPrefix},
+                {"shardId", shardId});
+            return;
+        }
+
+        YDB_LOG_DEBUG("Retrying external prepare",
+            {"logPrefix", this->LogPrefix},
+            {"shardId", shardId});
+        ++PrepareRetryAttempts[shardId];
+        Counters->WriteActorPrepareWritesRetries->Inc();
+        SendToExternalShard(shardId, false, false);
     }
 
     void HandleCommit(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
@@ -5378,6 +5486,13 @@ public:
         switch (ev->Get()->GetStatus()) {
         case NKikimrDataEvents::TEvWriteResult::STATUS_COMPLETED: {
             ProcessWriteCompletedShard(ev);
+            return;
+        }
+        case NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED: {
+            // Drop a stale PREPARED for a shard that has already prepared.
+            YDB_LOG_WARN("Dropping stale PREPARED result in StateCommit",
+                {"logPrefix", this->LogPrefix},
+                {"shardId", ev->Get()->Record.GetOrigin()});
             return;
         }
         case NKikimrDataEvents::TEvWriteResult::STATUS_DISK_GROUP_OUT_OF_SPACE:
@@ -5732,6 +5847,13 @@ public:
     }
 
     void OnPrepared(IKqpTransactionManager::TPrepareResult&& preparedInfo, ui64) override {
+        // Drop a duplicate PREPARED for a shard no longer PREPARING.
+        if (TxManager->GetState(preparedInfo.ShardId) != IKqpTransactionManager::PREPARING) {
+            YDB_LOG_WARN("Dropping stale PREPARED result for shard that is no longer PREPARING",
+                {"logPrefix", this->LogPrefix},
+                {"shardId", preparedInfo.ShardId});
+            return;
+        }
         if (HandleDeferredLocksBrokenOnPrepare()) return;
         if (!preparedInfo.Coordinator || (TxManager->GetCoordinator() && preparedInfo.Coordinator != TxManager->GetCoordinator())) {
             YDB_LOG_ERROR("Handle TEvWriteResult: unable to select coordinator. Tx canceled, previously selected coordinator selected at propose",
@@ -6260,6 +6382,9 @@ private:
     TInstant OperationStartTime;
 
     THashMap<ui64, ui64> ExternalShardIdToOverloadSeqNo;
+
+    // Per-shard prepare retry attempt count for retryable volatile prepare.
+    THashMap<ui64, ui64> PrepareRetryAttempts;
 
     struct TAfterWaitTasksState {
         bool IsCommit = false;
