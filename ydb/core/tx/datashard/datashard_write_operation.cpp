@@ -37,10 +37,13 @@ namespace NKikimr {
 namespace NDataShard {
 
 TValidatedWriteTx::TValidatedWriteTx(TDataShard* self, ui64 globalTxId, TInstant receivedAt, const NEvents::TDataEvents::TEvWrite& ev,
-        const NWilson::TTraceId& traceId, bool mvccSnapshotRead)
+        const NWilson::TTraceId& traceId, bool mvccSnapshotRead,
+        EConstructionMode mode)
     : KeyValidator(*self)
     , TabletId(self->TabletID())
-    , IsImmediate(ev.Record.GetTxMode() == NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE)
+    , IsImmediate(mode == EConstructionMode::SplitWriteHalf
+                  ? true
+                  : ev.Record.GetTxMode() == NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE)
     , GlobalTxId(globalTxId)
     , ReceivedAt(receivedAt)
     , MvccSnapshotRead(mvccSnapshotRead)
@@ -53,14 +56,14 @@ TValidatedWriteTx::TValidatedWriteTx(TDataShard* self, ui64 globalTxId, TInstant
 
     const NKikimrDataEvents::TEvWrite& record = ev.Record;
 
-    if (record.GetLockTxId()) {
+    if (mode != EConstructionMode::SplitCommitHalf && record.GetLockTxId()) {
         LockTxId = record.GetLockTxId();
         LockNodeId = record.GetLockNodeId();
         WriterIndex = record.GetWriteSeqNum().GetWriterIndex();
         WriteSeqNum = record.GetWriteSeqNum().GetWriteSeqNum();
     }
 
-    if (record.HasMvccSnapshot()) {
+    if (mode != EConstructionMode::SplitCommitHalf && record.HasMvccSnapshot()) {
         MvccSnapshot.emplace(record.GetMvccSnapshot().GetStep(), record.GetMvccSnapshot().GetTxId());
     }
 
@@ -74,21 +77,23 @@ TValidatedWriteTx::TValidatedWriteTx(TDataShard* self, ui64 globalTxId, TInstant
 
     LOG_T("Parsing write transaction for " << globalTxId << " at " << TabletId << ", record: " << record.ShortDebugString());
 
-    Operations.reserve(record.operations().size());
-    for (const auto& recordOperation : record.operations()) {
-        TValidatedWriteTxOperation validatedOperation;
+    if (mode != EConstructionMode::SplitCommitHalf) {
+        Operations.reserve(record.operations().size());
+        for (const auto& recordOperation : record.operations()) {
+            TValidatedWriteTxOperation validatedOperation;
 
-        auto [errCode, errStr] = validatedOperation.ParseOperation(ev, recordOperation, self->TableInfos, TabletId, KeyValidator, traceId);
-        if (errCode != NKikimrTxDataShard::TError::OK) {
-            ErrCode = errCode;
-            ErrStr = std::move(errStr);
-            return;
+            auto [errCode, errStr] = validatedOperation.ParseOperation(ev, recordOperation, self->TableInfos, TabletId, KeyValidator, traceId);
+            if (errCode != NKikimrTxDataShard::TError::OK) {
+                ErrCode = errCode;
+                ErrStr = std::move(errStr);
+                return;
+            }
+
+            Operations.push_back(std::move(validatedOperation));
         }
-
-        Operations.push_back(std::move(validatedOperation));
     }
 
-    if (record.HasLocks()) {
+    if (mode != EConstructionMode::SplitWriteHalf && record.HasLocks()) {
         KqpLocks = record.GetLocks();
         KqpSetTxLocksKeys(record.GetLocks(), self->SysLocksTable(), KeyValidator);
     }
@@ -395,6 +400,22 @@ TWriteOperation::TWriteOperation(const TBasicOpInfo& op, NEvents::TDataEvents::T
     TrackMemory();
 }
 
+TWriteOperation::TWriteOperation(const TBasicOpInfo& op, std::unique_ptr<NEvents::TDataEvents::TEvWrite> ev,
+    const TActorId& target, ui64 cookie, TDataShard* self, const NWilson::TTraceId& traceId)
+    : TWriteOperation(op, self->TabletID())
+{
+    SetTarget(target);
+    SetCookie(cookie);
+
+    Orbit = std::move(ev->MoveOrbit());
+    WriteRequest = std::move(ev);
+    WriteRequestTraceId = traceId.Clone();
+
+    BuildWriteTx(self);
+
+    TrackMemory();
+}
+
 TWriteOperation::~TWriteOperation()
 {
     UntrackMemory();
@@ -502,7 +523,7 @@ bool TWriteOperation::BuildWriteTx(TDataShard* self)
 {
     if (!WriteTx) {
         Y_ENSURE(WriteRequest);
-        WriteTx = std::make_shared<TValidatedWriteTx>(self, GetGlobalTxId(), GetReceivedAt(), *WriteRequest, WriteRequestTraceId, IsMvccSnapshotRead());
+        WriteTx = std::make_shared<TValidatedWriteTx>(self, GetGlobalTxId(), GetReceivedAt(), *WriteRequest, WriteRequestTraceId, IsMvccSnapshotRead(), ConstructionMode);
     }
     return bool(WriteTx);
 }
@@ -609,7 +630,7 @@ ERestoreDataStatus TWriteOperation::RestoreTxData(TDataShard* self, NTable::TDat
 
     bool extractKeys = WriteTx->IsTxInfoLoaded();
 
-    WriteTx = std::make_shared<TValidatedWriteTx>(self, GetGlobalTxId(), GetReceivedAt(), *WriteRequest, WriteRequestTraceId, IsMvccSnapshotRead());
+    WriteTx = std::make_shared<TValidatedWriteTx>(self, GetGlobalTxId(), GetReceivedAt(), *WriteRequest, WriteRequestTraceId, IsMvccSnapshotRead(), ConstructionMode);
     if (WriteTx->Ready() && extractKeys) {
         WriteTx->ExtractKeys(db.GetScheme(), true);
     }

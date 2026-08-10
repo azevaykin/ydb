@@ -100,7 +100,13 @@ EExecutionStatus TFinishProposeWriteUnit::Execute(TOperation::TPtr op,
         op->SetFinishProposeTs(DataShard.ConfirmReadOnlyLease());
     }
 
-    if (!op->HasResultSentFlag() &&
+    if (writeOp->IsSplitWriteHalf() && !op->IsAborted() && writeOp->GetWriteResult()
+        && !writeOp->GetWriteResult()->IsError())
+    {
+        // Success: suppress the reply. The commit half will be proposed from
+        // TTxWrite::Complete and its PREPARED is the single reply.
+        op->SetProposeResultSentEarly();
+    } else if (!op->HasResultSentFlag() &&
         (op->IsDirty() || op->HasVolatilePrepareFlag() || writeOp->IsPipelinedWrite() || !Pipeline.WaitCompletion(op)))
     {
         DataShard.IncCounter(COUNTER_PREPARE_COMPLETE);

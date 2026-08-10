@@ -111,6 +111,13 @@ public:
              ui64 tieBreakerIndex,
              bool delayed,
              NWilson::TSpan &&datashardTransactionSpan);
+    // Constructor for the commit half of a split volatile prepare.
+    // Takes a pre-built operation instead of an event.
+    TTxWrite(TDataShard* ds,
+             TOperation::TPtr op,
+             TInstant receivedAt,
+             ui64 tieBreakerIndex,
+             NWilson::TSpan &&datashardTransactionSpan);
     bool Execute(TTransactionContext& txc, const TActorContext& ctx) override;
     void Complete(const TActorContext& ctx) override;
     TTxType GetTxType() const override { return TXTYPE_WRITE; }

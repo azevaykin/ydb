@@ -4367,8 +4367,7 @@ Y_UNIT_TEST_SUITE(DataShardVolatile) {
     }
 
     // After commit the operation has left TxsInFly, so a duplicate TEvWrite
-    // creates a fresh volatile prepare (the stray-operation gap the data half's
-    // Stage 2c closes). This test pins the current behaviour.
+    // creates a fresh volatile prepare. This test pins the current behaviour.
     Y_UNIT_TEST(VolatilePrepareDuplicateAfterCommit) {
         TPortManager pm;
         TServerSettings serverSettings(pm.GetPort(2134));

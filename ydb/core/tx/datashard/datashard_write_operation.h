@@ -37,8 +37,23 @@ class TValidatedWriteTx: TNonCopyable, public TValidatedTx {
 public:
     using TPtr = std::shared_ptr<TValidatedWriteTx>;
 
+    // How a TValidatedWriteTx is constructed from a TEvWrite event. The split of
+    // a volatile prepare carrying WriteSeqNum produces two operations from one
+    // event with disjoint content:
+    //   Normal         — parse everything (today's behaviour)
+    //   SplitWriteHalf — immediate uncommitted write: parse operations/LockTxId/
+    //                    WriteSeqNum/MvccSnapshot, ignore Locks, force IsImmediate
+    //   SplitCommitHalf — volatile prepare commit: parse Locks/participants,
+    //                     ignore operations/LockTxId/WriteSeqNum
+    enum EConstructionMode {
+        Normal,
+        SplitWriteHalf,
+        SplitCommitHalf,
+    };
+
     TValidatedWriteTx(TDataShard* self, ui64 globalTxId, TInstant receivedAt, const NEvents::TDataEvents::TEvWrite& ev,
-            const NWilson::TTraceId& traceId, bool mvccSnapshotRead);
+            const NWilson::TTraceId& traceId, bool mvccSnapshotRead,
+            EConstructionMode mode = EConstructionMode::Normal);
     ~TValidatedWriteTx();
 
     EType GetType() const override {
@@ -157,6 +172,7 @@ public:
 
     explicit TWriteOperation(const TBasicOpInfo& op, ui64 tabletId);
     explicit TWriteOperation(const TBasicOpInfo& op, NEvents::TDataEvents::TEvWrite::TPtr&& ev, TDataShard* self, const NWilson::TTraceId& traceId);
+    explicit TWriteOperation(const TBasicOpInfo& op, std::unique_ptr<NEvents::TDataEvents::TEvWrite> ev, const TActorId& target, ui64 cookie, TDataShard* self, const NWilson::TTraceId& traceId);
     ~TWriteOperation();
 
     void FillTxData(TValidatedWriteTx::TPtr dataTx);
@@ -274,6 +290,14 @@ public:
         PipelinedWrite = val;
     }
 
+    bool IsSplitWriteHalf() const {
+        return ConstructionMode == TValidatedWriteTx::EConstructionMode::SplitWriteHalf;
+    }
+
+    bool IsSplitCommitHalf() const {
+        return ConstructionMode == TValidatedWriteTx::EConstructionMode::SplitCommitHalf;
+    }
+
     const TValidatedWriteTx::TPtr& GetWriteTx() const {
         return WriteTx;
     }
@@ -282,8 +306,26 @@ public:
     }
     bool BuildWriteTx(TDataShard* self);
 
+    TValidatedWriteTx::EConstructionMode GetConstructionMode() const {
+        return ConstructionMode;
+    }
+    void SetConstructionMode(TValidatedWriteTx::EConstructionMode mode) {
+        ConstructionMode = mode;
+    }
+
     void ClearWriteTx() {
         WriteTx = nullptr;
+    }
+
+    std::unique_ptr<NEvents::TDataEvents::TEvWrite> ReleaseWriteRequest() {
+        return std::move(WriteRequest);
+    }
+    const NWilson::TTraceId& GetWriteRequestTraceId() const {
+        return WriteRequestTraceId;
+    }
+
+    const std::unique_ptr<NEvents::TDataEvents::TEvWrite>& GetWriteRequest() const {
+        return WriteRequest;
     }
 
     const std::unique_ptr<NEvents::TDataEvents::TEvWriteResult>& GetWriteResult() const {
@@ -325,6 +367,7 @@ private:
 
     ui64 PageFaultCount = 0;
     bool PipelinedWrite = false;
+    TValidatedWriteTx::EConstructionMode ConstructionMode = TValidatedWriteTx::EConstructionMode::Normal;
 };
 
 } // NDataShard

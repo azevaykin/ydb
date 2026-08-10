@@ -10,17 +10,31 @@ LWTRACE_USING(DATASHARD_PROVIDER)
 namespace NKikimr::NDataShard {
 
 TDataShard::TTxWrite::TTxWrite(TDataShard* self,
-                                    NEvents::TDataEvents::TEvWrite::TPtr ev,
-                                    TInstant receivedAt,
-                                    ui64 tieBreakerIndex,
-                                    bool delayed,
-                                    NWilson::TSpan &&datashardTransactionSpan)
+                                     NEvents::TDataEvents::TEvWrite::TPtr ev,
+                                     TInstant receivedAt,
+                                     ui64 tieBreakerIndex,
+                                     bool delayed,
+                                     NWilson::TSpan &&datashardTransactionSpan)
     : TBase(self, datashardTransactionSpan.GetTraceId())
     , Ev(std::move(ev))
     , ReceivedAt(receivedAt)
     , TieBreakerIndex(tieBreakerIndex)
     , TxId(Ev->Get()->GetTxId())
     , Acked(!delayed)
+    , DatashardTransactionSpan(std::move(datashardTransactionSpan))
+{ }
+
+TDataShard::TTxWrite::TTxWrite(TDataShard* self,
+                                     TOperation::TPtr op,
+                                     TInstant receivedAt,
+                                     ui64 tieBreakerIndex,
+                                     NWilson::TSpan &&datashardTransactionSpan)
+    : TBase(self, datashardTransactionSpan.GetTraceId())
+    , Op(std::move(op))
+    , ReceivedAt(receivedAt)
+    , TieBreakerIndex(tieBreakerIndex)
+    , TxId(Op->GetTxId())
+    , Acked(true)
     , DatashardTransactionSpan(std::move(datashardTransactionSpan))
 { }
 
@@ -93,6 +107,20 @@ bool TDataShard::TTxWrite::Execute(TTransactionContext& txc, const TActorContext
 
             Op = op;
             Op->IncrementInProgress();
+        } else if (Op && !Op->IsInProgress()) {
+            TWriteOperation* writeOp = TWriteOperation::CastWriteOperation(Op);
+
+            if (Op->IsAborted()) {
+                Y_ENSURE(writeOp->GetWriteResult());
+                ctx.Send(Op->GetTarget(), writeOp->ReleaseWriteResult().release(), 0, Op->GetCookie());
+                return true;
+            }
+
+            Op->BuildExecutionPlan(false);
+            if (!Op->IsExecutionPlanFinished())
+                Self->Pipeline.GetExecutionUnit(Op->GetCurrentUnit()).AddOperation(Op);
+
+            Op->IncrementInProgress();
         }
 
         Y_ENSURE(Op && Op->IsInProgress() && !Op->GetExecutionPlan().empty());
@@ -148,6 +176,39 @@ bool TDataShard::TTxWrite::Execute(TTransactionContext& txc, const TActorContext
 
 void TDataShard::TTxWrite::Complete(const TActorContext& ctx) {
     LOG_TRACE_S(ctx, NKikimrServices::TX_DATASHARD, "TTxWrite complete: at tablet# " << Self->TabletID());
+
+    if (Op) {
+        auto* writeOp = TWriteOperation::CastWriteOperation(Op);
+        if (writeOp && writeOp->IsSplitWriteHalf() && !Op->IsAborted()
+            && writeOp->GetWriteResult() && !writeOp->GetWriteResult()->IsError())
+        {
+            auto ev = writeOp->ReleaseWriteRequest();
+            const auto& traceId = writeOp->GetWriteRequestTraceId();
+            auto target = Op->GetTarget();
+            auto cookie = Op->GetCookie();
+            auto receivedAt = Op->GetReceivedAt();
+
+            auto commitOp = Self->Pipeline.BuildCommitHalf(
+                std::move(ev), receivedAt, TieBreakerIndex, target, cookie, traceId);
+
+            NWilson::TSpan datashardTransactionSpan(
+                TWilsonTablet::TabletTopLevel, NWilson::TTraceId(traceId),
+                "Datashard.WriteTransaction.CommitHalf", NWilson::EFlags::AUTO_END);
+            if (datashardTransactionSpan) {
+                datashardTransactionSpan.Attribute("Shard", std::to_string(Self->TabletID()));
+            }
+
+            auto* commitWriteOp = TWriteOperation::CastWriteOperation(commitOp);
+            if (commitWriteOp->IsAborted()) {
+                Y_ENSURE(commitWriteOp->GetWriteResult());
+                ctx.Send(target, commitWriteOp->ReleaseWriteResult().release(), 0, cookie);
+            } else {
+                commitOp->BuildExecutionPlan(false);
+                Self->Execute(new TTxWrite(Self, std::move(commitOp), receivedAt,
+                    Self->NextTieBreakerIndex++, std::move(datashardTransactionSpan)), ctx);
+            }
+        }
+    }
 
     if (Op) {
         Y_ENSURE(!Op->GetExecutionPlan().empty());

@@ -154,6 +154,13 @@ public:
         if (requested == current) {
             // A duplicate of the last write: report its result again, touch nothing else.
             Y_ENSURE(lock, "A non-zero write seq num implies the lock that carries it");
+
+            if (writeOp->IsSplitWriteHalf()) {
+                writeOp->SetWriteResult(NEvents::TDataEvents::TEvWriteResult::BuildCompleted(tabletId, writeOp->GetTxId()));
+                writeOp->ReleaseTxData(txc);
+                return EExecutionStatus::Executed;
+            }
+
             auto res = NEvents::TDataEvents::TEvWriteResult::BuildAlreadyApplied(tabletId, writeOp->GetTxId());
             if (const auto* stats = lock->GetWriteSeqNumStats()) {
                 *res->Record.MutableTxStats() = *stats;
@@ -884,6 +891,23 @@ public:
             }
 
             return EExecutionStatus::Executed;
+        }
+
+        if (writeOp->IsSplitCommitHalf() && writeOp->GetWriteResult()
+            && writeOp->GetWriteResult()->GetStatus() == NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED)
+        {
+            auto lock = DataShard.SysLocksTable().GetRawLock(op->GetTxId());
+            if (lock) {
+                THashSet<TPathId> tables = lock->GetReadTables();
+                tables.insert(lock->GetWriteTables().begin(), lock->GetWriteTables().end());
+                for (const TPathId& pathId : tables) {
+                    writeOp->GetWriteResult()->AddTxLock(
+                        lock->GetLockId(), tabletId, lock->GetGeneration(),
+                        lock->GetCounter(), pathId.OwnerId, pathId.LocalPathId,
+                        lock->IsWriteLock(), lock->GetWriterIndex(),
+                        lock->GetWriteSeqNum());
+                }
+            }
         }
 
         Pipeline.AddCommittingOp(op);

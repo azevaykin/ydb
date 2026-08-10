@@ -1671,14 +1671,45 @@ TOperation::TPtr TPipeline::BuildOperation(NEvents::TDataEvents::TEvWrite::TPtr&
                                            NWilson::TSpan &&operationSpan)
 {
     const auto& rec = ev->Get()->Record;
-    TBasicOpInfo info(rec.GetTxId(), EOperationKind::WriteTx, NEvWrite::TConvertor::GetProposeFlags(rec.GetTxMode()), 0, receivedAt, tieBreakerIndex);
-    // Uncommitted writes are performed over a consistent mvcc snapshot
-    if (rec.HasMvccSnapshot() && rec.GetLockTxId()) {
-        info.SetMvccSnapshot(TRowVersion(rec.GetMvccSnapshot().GetStep(), rec.GetMvccSnapshot().GetTxId()),
-            rec.GetMvccSnapshot().GetRepeatableRead());
+
+    const bool isVolatilePrepareDataHalf =
+        rec.HasWriteSeqNum() && rec.GetLockTxId()
+        && rec.txmode() == NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE
+        && rec.HasLocks() && rec.GetLocks().GetOp() == NKikimrDataEvents::TKqpLocks::Commit
+        && rec.GetLocks().LocksSize() > 0
+        && AppData()->FeatureFlags.GetEnableDataShardPipelinedUncommittedWrites();
+
+    TBasicOpInfo info(rec.GetTxId(), EOperationKind::WriteTx,
+        isVolatilePrepareDataHalf
+            ? NEvWrite::TConvertor::GetProposeFlags(NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE)
+            : NEvWrite::TConvertor::GetProposeFlags(rec.GetTxMode()),
+        0, receivedAt, tieBreakerIndex);
+    if (isVolatilePrepareDataHalf) {
+        // The write half is immediate — set the snapshot as a flush does.
+        if (rec.HasMvccSnapshot()) {
+            info.SetMvccSnapshot(TRowVersion(rec.GetMvccSnapshot().GetStep(), rec.GetMvccSnapshot().GetTxId()),
+                rec.GetMvccSnapshot().GetRepeatableRead());
+        }
+    } else {
+        // Uncommitted writes are performed over a consistent mvcc snapshot
+        if (rec.HasMvccSnapshot() && rec.GetLockTxId()) {
+            info.SetMvccSnapshot(TRowVersion(rec.GetMvccSnapshot().GetStep(), rec.GetMvccSnapshot().GetTxId()),
+                rec.GetMvccSnapshot().GetRepeatableRead());
+        }
     }
     auto writeOp = MakeIntrusive<TWriteOperation>(info, std::move(ev), Self, operationSpan.GetTraceId());
     writeOp->OperationSpan = std::move(operationSpan);
+
+    if (isVolatilePrepareDataHalf) {
+        // Rebuild the WriteTx with SplitWriteHalf mode: parse operations/LockTxId/
+        // WriteSeqNum/MvccSnapshot, ignore Locks, force IsImmediate.
+        writeOp->SetConstructionMode(TValidatedWriteTx::EConstructionMode::SplitWriteHalf);
+        writeOp->ClearWriteTx();
+        Y_ENSURE(writeOp->BuildWriteTx(Self));
+        // The write half is an immediate operation.
+        writeOp->SetImmediateFlag();
+    }
+
     auto writeTx = writeOp->GetWriteTx();
     Y_ENSURE(writeTx);
 
@@ -1711,34 +1742,55 @@ TOperation::TPtr TPipeline::BuildOperation(NEvents::TDataEvents::TEvWrite::TPtr&
         return writeOp;
     }
 
-    switch (rec.txmode()) {
-        case NKikimrDataEvents::TEvWrite::MODE_PREPARE:
-            break;
-        case NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE:
-            writeOp->SetVolatilePrepareFlag();
-            break;
-        case NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE:
-            writeOp->SetImmediateFlag();
-            break;
-        default:
-            badRequest(NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST, TStringBuilder() << "Unknown txmode: " << rec.txmode());
-            return writeOp;
+    if (!isVolatilePrepareDataHalf) {
+        switch (rec.txmode()) {
+            case NKikimrDataEvents::TEvWrite::MODE_PREPARE:
+                break;
+            case NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE:
+                writeOp->SetVolatilePrepareFlag();
+                break;
+            case NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE:
+                writeOp->SetImmediateFlag();
+                break;
+            default:
+                badRequest(NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST, TStringBuilder() << "Unknown txmode: " << rec.txmode());
+                return writeOp;
+        }
     }
 
     if (rec.HasWriteSeqNum()) {
         const ui64 writerIndex = rec.GetWriteSeqNum().GetWriterIndex();
         const ui64 writeSeqNum = rec.GetWriteSeqNum().GetWriteSeqNum();
-        // A write with LockTxId has to be immediate, see TKeyValidator::IsValidKey
-        if (writeSeqNum == 0
-            || !rec.GetLockTxId()
-            || rec.txmode() != NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE
-            || rec.HasLocks()
-            || rec.OperationsSize() == 0)
-        {
+        // Two admissible shapes for a WriteSeqNum:
+        //   1) an ordinary uncommitted write: LockTxId + MODE_IMMEDIATE + no Locks
+        //   2) a volatile prepare carrying its data half: LockTxId + MODE_VOLATILE_PREPARE
+        //      + Locks{Op=Commit} with at least one lock entry (split at propose)
+        const bool uncommittedWrite =
+            rec.GetLockTxId() && rec.txmode() == NKikimrDataEvents::TEvWrite::MODE_IMMEDIATE && !rec.HasLocks();
+        const bool volatilePrepare =
+            rec.GetLockTxId() && rec.txmode() == NKikimrDataEvents::TEvWrite::MODE_VOLATILE_PREPARE
+            && rec.HasLocks() && rec.GetLocks().GetOp() == NKikimrDataEvents::TKqpLocks::Commit
+            && rec.GetLocks().LocksSize() > 0;
+        if (writeSeqNum == 0 || rec.OperationsSize() == 0 || !(uncommittedWrite || volatilePrepare)) {
             badRequest(NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST, TStringBuilder()
                 << "WriteSeqNum " << writerIndex << ":" << writeSeqNum << " requires a non-zero"
-                   " WriteSeqNum, LockTxId, MODE_IMMEDIATE, at least one operation and no Locks");
+                   " WriteSeqNum, LockTxId, at least one operation, and either MODE_IMMEDIATE with"
+                   " no Locks or MODE_VOLATILE_PREPARE with Locks{Op=Commit}");
             return writeOp;
+        }
+        if (volatilePrepare) {
+            // LockTxId must equal the LockId carried in Locks.Locks[] — MakeLock emits one
+            // lock per TPathId for a shard, so all entries share the same LockId. Reject if
+            // they disagree, which would otherwise misroute the data half at propose.
+            for (const auto& lock : rec.GetLocks().GetLocks()) {
+                if (lock.GetLockId() != rec.GetLockTxId()) {
+                    badRequest(NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST, TStringBuilder()
+                        << "WriteSeqNum " << writerIndex << ":" << writeSeqNum
+                        << " LockTxId " << rec.GetLockTxId()
+                        << " does not match Locks[] LockId " << lock.GetLockId());
+                    return writeOp;
+                }
+            }
         }
         if (AppData()->FeatureFlags.GetEnableDataShardPipelinedUncommittedWrites()) {
             writeOp->SetPipelinedWriteFlag();
@@ -1754,6 +1806,48 @@ TOperation::TPtr TPipeline::BuildOperation(NEvents::TDataEvents::TEvWrite::TPtr&
             if (Config.DirtyImmediate())
                 writeOp->SetForceDirtyFlag();
         }
+    }
+
+    return writeOp;
+}
+
+TOperation::TPtr TPipeline::BuildCommitHalf(std::unique_ptr<NEvents::TDataEvents::TEvWrite> ev,
+                                            TInstant receivedAt, ui64 tieBreakerIndex,
+                                            const TActorId& target, ui64 cookie,
+                                            const NWilson::TTraceId& traceId)
+{
+    const auto& rec = ev->Record;
+
+    // Commit half: volatile prepare with Locks{Op=Commit}, no operations/LockTxId/WriteSeqNum.
+    TBasicOpInfo info(rec.GetTxId(), EOperationKind::WriteTx,
+        NEvWrite::TConvertor::GetProposeFlags(rec.GetTxMode()),
+        0, receivedAt, tieBreakerIndex);
+
+    auto writeOp = MakeIntrusive<TWriteOperation>(info, std::move(ev), target, cookie, Self, traceId);
+
+    writeOp->SetConstructionMode(TValidatedWriteTx::EConstructionMode::SplitCommitHalf);
+    writeOp->ClearWriteTx();
+    Y_ENSURE(writeOp->BuildWriteTx(Self));
+
+    writeOp->SetVolatilePrepareFlag();
+
+    auto writeTx = writeOp->GetWriteTx();
+    Y_ENSURE(writeTx);
+
+    if (!writeTx->Ready()) {
+        writeOp->SetError(NEvWrite::TConvertor::ConvertErrCode(writeTx->GetErrCode()),
+            TStringBuilder() << "Cannot parse commit half " << writeOp->GetTxId() << ". "
+            << writeTx->GetErrCode() << ": " << writeTx->GetErrStr());
+        return writeOp;
+    }
+
+    writeTx->ExtractKeys(Self->Scheme(), true);
+
+    if (!writeTx->Ready()) {
+        writeOp->SetError(NEvWrite::TConvertor::ConvertErrCode(writeTx->GetErrCode()),
+            TStringBuilder() << "Cannot parse commit half keys " << writeOp->GetTxId() << ". "
+            << writeTx->GetErrCode() << ": " << writeTx->GetErrStr());
+        return writeOp;
     }
 
     return writeOp;

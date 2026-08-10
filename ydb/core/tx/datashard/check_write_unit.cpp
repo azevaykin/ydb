@@ -48,6 +48,19 @@ EExecutionStatus TCheckWriteUnit::Execute(TOperation::TPtr op,
 
     TWriteOperation* writeOp = TWriteOperation::CastWriteOperation(op);
 
+    auto addLocksToPrepared = [&](NEvents::TDataEvents::TEvWriteResult& res, ui64 lockId) {
+        auto lock = DataShard.SysLocksTable().GetRawLock(lockId);
+        if (lock) {
+            THashSet<TPathId> tables = lock->GetReadTables();
+            tables.insert(lock->GetWriteTables().begin(), lock->GetWriteTables().end());
+            for (const TPathId& pathId : tables) {
+                res.AddTxLock(lock->GetLockId(), DataShard.TabletID(), lock->GetGeneration(),
+                              lock->GetCounter(), pathId.OwnerId, pathId.LocalPathId,
+                              lock->IsWriteLock(), lock->GetWriterIndex(), lock->GetWriteSeqNum());
+            }
+        }
+    };
+
     // Replay a duplicate volatile prepare: answer PREPARED from the stored
     // operation instead of crashing in AddTxInFly. The !op->IsImmediate()
     // guard is load-bearing — immediate TEvWrite carries TxId = 0.
@@ -56,14 +69,19 @@ EExecutionStatus TCheckWriteUnit::Execute(TOperation::TPtr op,
             if (existing->IsWriteTx() && existing->HasVolatilePrepareFlag() && !existing->IsAborted()) {
                 op->SetMinStep(existing->GetMinStep());
                 op->SetMaxStep(existing->GetMaxStep());
-                writeOp->SetWriteResult(NEvents::TDataEvents::TEvWriteResult::BuildPrepared(
+                auto res = NEvents::TDataEvents::TEvWriteResult::BuildPrepared(
                     DataShard.TabletID(),
                     op->GetTxId(),
                     {
                         op->GetMinStep(),
                         op->GetMaxStep(),
                         DataShard.GetProcessingParams() ? DataShard.GetProcessingParams()->GetCoordinators() : google::protobuf::RepeatedField<ui64>{}
-                    }));
+                    });
+                if (writeOp->GetWriteRequest() && writeOp->GetWriteRequest()->Record.HasWriteSeqNum()) {
+                    const ui64 lockId = writeOp->GetWriteRequest()->Record.GetLockTxId();
+                    addLocksToPrepared(*res, lockId);
+                }
+                writeOp->SetWriteResult(std::move(res));
             } else {
                 TString err = TStringBuilder()
                     << "Duplicate txId " << op->GetTxId()
@@ -71,6 +89,17 @@ EExecutionStatus TCheckWriteUnit::Execute(TOperation::TPtr op,
                     << " is not a volatile prepare write tx";
                 writeOp->SetError(NKikimrDataEvents::TEvWriteResult::STATUS_BAD_REQUEST, err);
             }
+            op->Abort(EExecutionUnitKind::FinishProposeWrite);
+            return EExecutionStatus::Executed;
+        }
+    }
+
+    if (writeOp->IsSplitWriteHalf()) {
+        const ui64 lockTxId = writeOp->LockTxId();
+        if (!DataShard.SysLocksTable().GetRawLock(lockTxId)) {
+            writeOp->SetError(NKikimrDataEvents::TEvWriteResult::STATUS_LOCKS_BROKEN, TStringBuilder()
+                << "Lock " << lockTxId << " is gone at tablet " << DataShard.TabletID()
+                << " for txId " << op->GetTxId());
             op->Abort(EExecutionUnitKind::FinishProposeWrite);
             return EExecutionStatus::Executed;
         }

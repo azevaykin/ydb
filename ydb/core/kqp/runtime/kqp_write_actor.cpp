@@ -1165,7 +1165,9 @@ public:
         }
         UpdateStats(record.GetTxStats());
         OnMessageReceived(ev->Get()->Record.GetOrigin());
-        AFL_ENSURE(record.GetTxLocks().empty());
+        for (const auto& lock : record.GetTxLocks()) {
+            TxManager->AddLock(record.GetOrigin(), lock);
+        }
         YQL_ENSURE(result->IsShardEmpty);
         Callbacks->OnPrepared(std::move(preparedInfo), result->DataSize);
     }
@@ -1341,6 +1343,30 @@ public:
         } else if (isPrepare) {
             YQL_ENSURE(TxId);
             FillEvWritePrepare(evWrite.get(), shardId, *TxId, TxManager);
+
+            if (PipelinedWrites && TxManager->IsVolatile() && LockTxId != 0) {
+                evWrite->SetLockId(LockTxId, LockNodeId);
+
+                auto [it, allocated] = InFlightWriteSeqNum.try_emplace(shardId, 0);
+                if (allocated) {
+                    it->second = TxManager->NextWriteSeqNum(WriterIndex, shardId);
+                }
+                auto* writeSeqNum = evWrite->Record.MutableWriteSeqNum();
+                writeSeqNum->SetWriterIndex(WriterIndex);
+                writeSeqNum->SetWriteSeqNum(it->second);
+
+                if (evWrite->Record.HasLocks()) {
+                    for (auto& lock : *evWrite->Record.MutableLocks()->MutableLocks()) {
+                        auto* lockWriteSeqNum = lock.AddWriteSeqNums();
+                        lockWriteSeqNum->SetWriterIndex(WriterIndex);
+                        lockWriteSeqNum->SetWriteSeqNum(it->second);
+                    }
+                }
+
+                if (MvccSnapshot && LockMode != NKikimrDataEvents::PESSIMISTIC_NONE) {
+                    *evWrite->Record.MutableMvccSnapshot() = *MvccSnapshot;
+                }
+            }
         } else if (!InconsistentTx) {
             evWrite->SetLockId(LockTxId, LockNodeId);
             if (PipelinedWrites) {

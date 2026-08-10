@@ -280,6 +280,13 @@ public:
                                     TInstant receivedAt, ui64 tieBreakerIndex,
                                     NTabletFlatExecutor::TTransactionContext &txc,
                                     NWilson::TSpan &&operationSpan);
+    // Build the commit half of a split volatile prepare.
+    // Takes the event released from the write half and constructs a volatile
+    // prepare with SplitCommitHalf mode: Locks{Op=Commit}, no operations.
+    TOperation::TPtr BuildCommitHalf(std::unique_ptr<NEvents::TDataEvents::TEvWrite> ev,
+                                     TInstant receivedAt, ui64 tieBreakerIndex,
+                                     const TActorId& target, ui64 cookie,
+                                     const NWilson::TTraceId& traceId);
     void BuildDataTx(TActiveTransaction *tx,
                      TTransactionContext &txc,
                      const TActorContext &ctx,
