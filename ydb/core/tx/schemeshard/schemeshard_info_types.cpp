@@ -918,6 +918,7 @@ TTableInfo::TAlterDataPtr TTableInfo::CreateAlterData(
                         errStr = TStringBuilder() << "MultiColumnStatistics " << add.GetName() << " type must be specified";
                         return nullptr;
                     case NKikimrSchemeOp::EMultiColumnStatisticsType::COUNT_MIN_SKETCH:
+                    case NKikimrSchemeOp::EMultiColumnStatisticsType::EQ_HEIGHT_HISTOGRAM:
                         break;
                     default:
                         errStr = TStringBuilder() << "Unknown statistic type: " << rawType;

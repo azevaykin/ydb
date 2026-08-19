@@ -5,6 +5,9 @@
 #include <ydb/core/statistics/events.h>
 #include <ydb/core/protos/analyze_operation.pb.h>
 
+#include <yql/essentials/minikql/computation/presort.h>
+#include <yql/essentials/public/udf/udf_value.h>
+
 #include <ydb/core/tx/columnshard/hooks/testing/controller.h>
 
 #include <ydb/core/testlib/test_client.h>
@@ -135,6 +138,19 @@ TTableInfo PrepareMultiColumnColumnTable(
 // multi-column statistic (see MultiColumnValueColumns), and insert ColumnTableRowsNumber rows.
 TTableInfo PrepareMultiColumnUniformTable(TTestEnv& env, const TString& databaseName, const TString& tableName);
 
+// Create a column table with a two-column EQ_HEIGHT_HISTOGRAM multi-column statistic
+// (see MultiColumnValueColumns) and insert ColumnTableRowsNumber rows.
+TTableInfo PrepareMultiColumnEqHeightColumnTable(
+    TTestEnv& env, const TString& databaseName, const TString& tableName, int shardCount = 4);
+
+// Create a datashard table with 4 uniform shards and a two-column EQ_HEIGHT_HISTOGRAM
+// multi-column statistic (see MultiColumnValueColumns) and insert ColumnTableRowsNumber rows.
+TTableInfo PrepareMultiColumnEqHeightUniformTable(TTestEnv& env, const TString& databaseName, const TString& tableName);
+
+// Create a table of the requested type with a two-column EQ_HEIGHT_HISTOGRAM
+// multi-column statistic and insert ColumnTableRowsNumber rows.
+TTableInfo PrepareMultiColumnEqHeightTable(TTestEnv& env, const TString& databaseName, const TString& tableName, bool columnShard);
+
 // Create a datashard table with 4 uniform shards and insert ColumnTableRowsNumber rows
 // (Value = key % 10, matching PrepareColumnTable's data pattern).
 TTableInfo PrepareUniformTableWithData(TTestEnv& env, const TString& databaseName, const TString& tableName);
@@ -184,6 +200,15 @@ std::vector<TResponse> GetStatistics(
     TTestActorRuntime&, const TPathId&, EStatType,
     const std::vector<std::optional<ui32>>& columnTags, ui32 nodeIdx = 1);
 
+// Multi-column variant: requests a single statistic under a multi-column
+// TColumnTags(vector<ui32>), which serializes to a comma-joined key. Use this
+// for multi-column statistics (e.g. EQ_HEIGHT_HISTOGRAM) where the single-column
+// GetStatistics above would construct a TColumnTags(ui32) that only collides
+// with the multi-column key by coincidence of SerializeColumnTags.
+std::vector<TResponse> GetStatisticsMultiColumn(
+    TTestActorRuntime&, const TPathId&, EStatType,
+    const std::vector<ui32>& columnTags, ui32 nodeIdx = 1);
+
 struct TCountMinSketchProbes {
     struct TProbe {
         TString Value;
@@ -198,6 +223,85 @@ struct TCountMinSketchProbes {
 void CheckCountMinSketch(
     TTestActorRuntime& runtime, const TPathId& pathId,
     const std::vector<TCountMinSketchProbes>& expected);
+
+// A probe for EQ_HEIGHT_HISTOGRAM: `Key` is a pre-built presort key (use
+// MakeUint64PresortKey for a single Uint64 column), and `Expected` is the exact
+// value EstimateLessOrEqual must return.
+struct TEqHeightHistogramProbe {
+    TString Key;
+    ui64 Expected;
+};
+
+// Build a presort key for a single Uint64 column value using TPresortEncoder.
+// The encoding is memcomparable: memcmp on the result equals value order.
+// isOptional=true matches the UDF: YQL wraps column references in Optional even
+// for NOT NULL columns, so the UDF's type inspection sees Optional<Uint64> and
+// registers the presort type as optional.  The probe must use the same flag or
+// the has-value prefix byte (0x01 for present) would be missing and the keys
+// would not compare correctly.
+inline TString MakeUint64PresortKey(ui64 value) {
+    NMiniKQL::TPresortEncoder enc;
+    enc.AddType(NYql::NUdf::EDataSlot::Uint64, /*isOptional=*/true, /*isDesc=*/false);
+    enc.Start();
+    enc.Encode(NYql::NUdf::TUnboxedValuePod(value).MakeOptional());
+    TStringBuf buf = enc.Finish();
+    return TString(buf.data(), buf.size());
+}
+
+// Build a presort key that sorts below every present value: a single optional
+// column encoded as NULL.  Presort writes the inline has-value byte as 0x00,
+// which precedes the 0x01 byte written for any present value, so this key is
+// less than every key produced by MakeUint64PresortKey / MakeStringTuplePresortKey.
+inline TString MakeNullPresortKey() {
+    NMiniKQL::TPresortEncoder enc;
+    enc.AddType(NYql::NUdf::EDataSlot::Uint64, /*isOptional=*/true, /*isDesc=*/false);
+    enc.Start();
+    enc.Encode(NYql::NUdf::TUnboxedValuePod()); // empty == NULL
+    TStringBuf buf = enc.Finish();
+    return TString(buf.data(), buf.size());
+}
+
+// Build a presort key for a tuple of String column values using TPresortEncoder.
+// Each column is encoded as a separate presort type, so one column's key never
+// bleeds into the next.  isOptional=true matches the UDF: YQL wraps column
+// references in Optional even for NOT NULL columns (see MakeUint64PresortKey).
+// Uses TUnboxedValuePod::Embedded for the string payload, which stores short
+// strings (<= 14 bytes) in the pod's internal buffer without any heap
+// allocation -- and therefore without needing a TScopedAlloc.  Test probe
+// strings are always short enough to fit.
+inline TString MakeStringTuplePresortKey(const std::vector<TStringBuf>& values) {
+    NMiniKQL::TPresortEncoder enc;
+    for (size_t i = 0; i < values.size(); ++i) {
+        enc.AddType(NYql::NUdf::EDataSlot::String, /*isOptional=*/true, /*isDesc=*/false);
+    }
+    enc.Start();
+    for (auto value : values) {
+        // TUnboxedValuePod::Embedded stores strings up to 14 bytes inline.
+        // Longer strings require a heap-backed TStringValue, which needs a
+        // TScopedAlloc; guard against silent corruption if a future test
+        // uses a longer probe string.
+        UNIT_ASSERT_C(value.size() <= 14,
+            "MakeStringTuplePresortKey: string of " << value.size()
+            << " bytes exceeds the 14-byte Embedded limit");
+        enc.Encode(NYql::NUdf::TUnboxedValuePod::Embedded(
+            NYql::NUdf::TStringRef(value.data(), value.size())).MakeOptional());
+    }
+    TStringBuf buf = enc.Finish();
+    return TString(buf.data(), buf.size());
+}
+
+// Fetches an EQ_HEIGHT_HISTOGRAM statistic via the stat service and checks
+// that it was collected.  `columnTags` identifies the multi-column tuple
+// (e.g. the primary key).  If `expectedTotalCount` is set, the histogram's
+// total count must match it.  If `expectedBuckets` is set, the histogram must
+// have at least that many buckets.  If `probes` is set, each probe key is
+// passed to EstimateLessOrEqual and the result must equal `Expected`.
+void CheckEqHeightHistogram(
+    TTestActorRuntime& runtime, const TPathId& pathId,
+    const std::vector<ui32>& columnTags,
+    std::optional<ui64> expectedTotalCount = std::nullopt,
+    std::optional<size_t> expectedMinBuckets = std::nullopt,
+    std::optional<std::vector<TEqHeightHistogramProbe>> probes = std::nullopt);
 
 // Checks the multi-column count-min sketch produced from data inserted via
 // MultiColumnValueColumns: the present pair ("0","0") should have count

@@ -17,6 +17,7 @@
 #include <ydb/core/grpc_services/local_rpc/local_rpc.h>
 
 #include <yql/essentials/public/udf/udf_data_type.h>
+#include <yql/essentials/core/histogram/eq_height_histogram.h>
 
 using namespace NYdb;
 using namespace NYdb::NTable;
@@ -498,6 +499,55 @@ TTableInfo PrepareMultiColumnUniformTable(TTestEnv& env, const TString& database
     return MakeTableInfo(runtime, databaseName, tableName, false);
 }
 
+TTableInfo PrepareMultiColumnEqHeightColumnTable(
+        TTestEnv& env, const TString& databaseName, const TString& tableName, int shardCount) {
+    auto fullTableName = Sprintf("Root/%s/%s", databaseName.c_str(), tableName.c_str());
+    auto& runtime = *env.GetServer().GetRuntime();
+
+    ExecuteYqlScript(env, Sprintf(R"(
+        CREATE TABLE `%s` (
+            Key Uint64 NOT NULL,
+            Value1 String,
+            Value2 String,
+            PRIMARY KEY (Key),
+            STATISTICS multi_stat ON (Value1, Value2) WITH (EQ_HEIGHT_HISTOGRAM)
+        )
+        PARTITION BY HASH(Key)
+        WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = %d);
+    )", fullTableName.c_str(), shardCount));
+    runtime.SimulateSleep(TDuration::Seconds(1));
+
+    InsertDataIntoTable(env, databaseName, tableName, ColumnTableRowsNumber, MultiColumnValueColumns());
+
+    return MakeTableInfo(runtime, databaseName, tableName, true);
+}
+
+TTableInfo PrepareMultiColumnEqHeightUniformTable(TTestEnv& env, const TString& databaseName, const TString& tableName) {
+    auto& runtime = *env.GetServer().GetRuntime();
+
+    ExecuteYqlScript(env, Sprintf(R"(
+        CREATE TABLE `Root/%s/%s` (
+            Key Uint64,
+            Value1 String,
+            Value2 String,
+            PRIMARY KEY (Key),
+            STATISTICS multi_stat ON (Value1, Value2) WITH (EQ_HEIGHT_HISTOGRAM)
+        )
+        WITH ( UNIFORM_PARTITIONS = 4 );
+    )", databaseName.c_str(), tableName.c_str()));
+
+    InsertDataIntoTable(env, databaseName, tableName, ColumnTableRowsNumber, MultiColumnValueColumns());
+
+    return MakeTableInfo(runtime, databaseName, tableName, false);
+}
+
+TTableInfo PrepareMultiColumnEqHeightTable(TTestEnv& env, const TString& databaseName, const TString& tableName, bool columnShard) {
+    if (columnShard) {
+        return PrepareMultiColumnEqHeightColumnTable(env, databaseName, tableName);
+    }
+    return PrepareMultiColumnEqHeightUniformTable(env, databaseName, tableName);
+}
+
 TTableInfo PrepareUniformTableWithData(TTestEnv& env, const TString& databaseName, const TString& tableName) {
     CreateUniformTable(env, databaseName, tableName);
     InsertDataIntoTable(env, databaseName, tableName, ColumnTableRowsNumber);
@@ -579,6 +629,25 @@ std::vector<TResponse> GetStatistics(
     return std::move(evResult->Get()->StatResponses);
 }
 
+std::vector<TResponse> GetStatisticsMultiColumn(
+        TTestActorRuntime& runtime, const TPathId& pathId, EStatType statType,
+        const std::vector<ui32>& columnTags, ui32 nodeIdx) {
+    auto statServiceId = NStat::MakeStatServiceID(runtime.GetNodeId(nodeIdx));
+
+    auto evGet = std::make_unique<TEvStatistics::TEvGetStatistics>();
+    evGet->StatType = statType;
+    TRequest req{ .PathId = pathId, .ColumnTags = TColumnTags(columnTags) };
+    evGet->StatRequests.push_back(std::move(req));
+
+    auto sender = runtime.AllocateEdgeActor(nodeIdx);
+    runtime.Send(statServiceId, sender, evGet.release(), nodeIdx, true);
+    auto evResult = runtime.GrabEdgeEventRethrow<TEvStatistics::TEvGetStatisticsResult>(sender);
+
+    UNIT_ASSERT(evResult);
+    UNIT_ASSERT(evResult->Get());
+    return std::move(evResult->Get()->StatResponses);
+}
+
 
 void CheckCountMinSketch(
         TTestActorRuntime& runtime, const TPathId& pathId,
@@ -605,6 +674,47 @@ void CheckCountMinSketch(
             }
         } else {
             UNIT_ASSERT(!stat.Success);
+        }
+    }
+}
+
+void CheckEqHeightHistogram(
+        TTestActorRuntime& runtime, const TPathId& pathId,
+        const std::vector<ui32>& columnTags,
+        std::optional<ui64> expectedTotalCount,
+        std::optional<size_t> expectedMinBuckets,
+        std::optional<std::vector<TEqHeightHistogramProbe>> probes) {
+    auto statServiceId = NStat::MakeStatServiceID(runtime.GetNodeId(1));
+
+    auto evGet = std::make_unique<TEvStatistics::TEvGetStatistics>();
+    evGet->StatType = EStatType::EQ_HEIGHT_HISTOGRAM;
+    evGet->StatRequests.push_back(TRequest{ .PathId = pathId, .ColumnTags = TColumnTags(columnTags) });
+
+    auto sender = runtime.AllocateEdgeActor(1);
+    runtime.Send(statServiceId, sender, evGet.release(), 1, true);
+    auto evResult = runtime.GrabEdgeEventRethrow<TEvStatistics::TEvGetStatisticsResult>(sender);
+
+    UNIT_ASSERT(evResult);
+    UNIT_ASSERT(evResult->Get());
+    auto& responses = evResult->Get()->StatResponses;
+    UNIT_ASSERT_VALUES_EQUAL(responses.size(), 1);
+    const auto& stat = responses[0];
+
+    UNIT_ASSERT(stat.Success);
+    const auto& histogram = stat.EqHeightHistogram.Data;
+    UNIT_ASSERT(histogram);
+
+    if (expectedTotalCount) {
+        UNIT_ASSERT_VALUES_EQUAL(histogram->GetTotalCount(), *expectedTotalCount);
+    }
+    if (expectedMinBuckets) {
+        UNIT_ASSERT(histogram->GetNumBuckets() >= *expectedMinBuckets);
+    }
+    if (probes) {
+        for (const auto& probe : *probes) {
+            auto estimate = histogram->EstimateLessOrEqual(probe.Key);
+            UNIT_ASSERT_VALUES_EQUAL_C(estimate, probe.Expected,
+                "EstimateLessOrEqual returned " << estimate << ", expected " << probe.Expected);
         }
     }
 }

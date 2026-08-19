@@ -39,6 +39,123 @@ Y_UNIT_TEST_SUITE(AnalyzeStatistics) {
         CheckMultiColumnStatisticsProbes(env, runtime, tableInfo.PathId, {2, 3});
     }
 
+    Y_UNIT_TEST_TWIN(AnalyzeEqHeightHistogram, ColumnShard) {
+        TTestEnv env(1, 1, false, [](Tests::TServerSettings& settings) {
+            settings.AppConfig->MutableStatisticsConfig()->SetAnalyzeCollectPrimaryKeyHistogram(true);
+        });
+        auto& runtime = *env.GetServer().GetRuntime();
+        CreateDatabase(env, "Database");
+        const auto tableInfo = PrepareMultiColumnTable(env, "Database", "Table", ColumnShard);
+
+        Analyze(runtime, tableInfo.SaTabletId, {tableInfo.PathId});
+
+        // The auto-PK histogram is over the primary key column (tag 1, "Key").
+        // PrepareMultiColumnTable inserts ColumnTableRowsNumber rows with Key in [0, N).
+        // The data is uniform: each key 0..N-1 appears exactly once.
+        //
+        // Note: the integration histogram is NOT exact — it goes through per-shard
+        // collection, UDAF merge, and byte-budget compaction, producing fewer
+        // buckets with boundaries that depend on the compaction path.  Therefore
+        // only boundary probes (null, max-data-key, above-max) are asserted here;
+        // intermediate-key exactness is covered by the unit tests in
+        // eq_height_histogram_ut.cpp.
+        //
+        // Probes (following the CheckCountMinSketch pattern of probing with known
+        // values and asserting exact results):
+        //   - A null order key (0x00) sorts before every present key (0x01 + bytes),
+        //     so EstimateLessOrEqual must return 0.
+        //   - The max data key (Key = N-1) is the last bucket's upper bound, so
+        //     EstimateLessOrEqual must return the total count.
+        //   - A key above the max (Key = N) also returns the total count.
+        std::vector<TEqHeightHistogramProbe> probes = {
+            {MakeNullPresortKey(), 0},
+            {MakeUint64PresortKey(ColumnTableRowsNumber - 1), ColumnTableRowsNumber},
+            {MakeUint64PresortKey(ColumnTableRowsNumber), ColumnTableRowsNumber},
+        };
+        CheckEqHeightHistogram(runtime, tableInfo.PathId, {1},
+            ColumnTableRowsNumber,  // expectedTotalCount
+            1,                      // expectedMinBuckets
+            probes);
+    }
+
+    Y_UNIT_TEST_TWIN(AnalyzeMultiColumnEqHeightHistogram, ColumnShard) {
+        TTestEnv env(1, 1);
+        auto& runtime = *env.GetServer().GetRuntime();
+        CreateDatabase(env, "Database");
+        // Declares EQ_HEIGHT_HISTOGRAM on (Value1, Value2) -- non-PK String columns.
+        const auto tableInfo = PrepareMultiColumnEqHeightTable(env, "Database", "Table", ColumnShard);
+
+        Analyze(runtime, tableInfo.SaTabletId, {tableInfo.PathId});
+
+        // The histogram is over (Value1, Value2), both String.  Value1 = ToString(key % 10),
+        // Value2 = ToString(key % 20).  The 20 pairs with Value1 == Value2 % 10 each occur
+        // ColumnTableRowsNumber / 20 = 50 times; all 1000 rows are present.
+        // Probes (following the CheckCountMinSketch pattern):
+        //   - A null order key (0x00) sorts before every present key -> 0.
+        //   - A key above all data ("zz", "zz") matches the last bucket, whose
+        //     CumulativeCount is the sum of all entry Weights = TotalCount.
+        //     Note: string order differs from numeric order ("9" > "19" because
+        //     '9' > '1'), so "zz" is safely above all digit-only values.
+        // A null order key (optional NULL -> 0x00 has-value byte) sorts before
+        // every present key -> 0.
+        std::vector<TEqHeightHistogramProbe> probes = {
+            {MakeNullPresortKey(), 0},
+            {MakeStringTuplePresortKey({"zz", "zz"}), ColumnTableRowsNumber},
+        };
+        CheckEqHeightHistogram(runtime, tableInfo.PathId, {2, 3},
+            ColumnTableRowsNumber,  // expectedTotalCount
+            1,                      // expectedMinBuckets
+            probes);
+    }
+
+    Y_UNIT_TEST_TWIN(AnalyzeEqHeightHistogramConfigOff, ColumnShard) {
+        // When AnalyzeCollectPrimaryKeyHistogram is false (the default),
+        // the auto-PK eq-height histogram must NOT be collected.
+        TTestEnv env(1, 1); // default: AnalyzeCollectPrimaryKeyHistogram = false
+        auto& runtime = *env.GetServer().GetRuntime();
+        CreateDatabase(env, "Database");
+        const auto tableInfo = PrepareMultiColumnTable(env, "Database", "Table", ColumnShard);
+
+        Analyze(runtime, tableInfo.SaTabletId, {tableInfo.PathId});
+
+        // The PK eq-height histogram should not be present.
+        // GetStatistics for EQ_HEIGHT_HISTOGRAM on the PK column (tag 1) should
+        // return an empty response (no histogram stored), which is indicated by
+        // Success = false (see CheckCountMinSketch for the same convention).
+        auto responses = GetStatisticsMultiColumn(runtime, tableInfo.PathId, EStatType::EQ_HEIGHT_HISTOGRAM, {1});
+        for (const auto& resp : responses) {
+            UNIT_ASSERT_C(!resp.Success,
+                          "EQ_HEIGHT_HISTOGRAM should not be collected when "
+                          "AnalyzeCollectPrimaryKeyHistogram is false");
+            UNIT_ASSERT_C(!resp.EqHeightHistogram.Data,
+                          "EQ_HEIGHT_HISTOGRAM should not be collected when "
+                          "AnalyzeCollectPrimaryKeyHistogram is false");
+        }
+    }
+
+    Y_UNIT_TEST_TWIN(AnalyzeEmptyTableEqHeightHistogram, ColumnShard) {
+        // With AnalyzeCollectPrimaryKeyHistogram enabled, an empty table
+        // should produce no eq-height histogram: Finalize() returns nullopt
+        // when TotalCount == 0, so no histogram is stored.
+        TTestEnv env(1, 1, false, [](Tests::TServerSettings& settings) {
+            settings.AppConfig->MutableStatisticsConfig()->SetAnalyzeCollectPrimaryKeyHistogram(true);
+        });
+        auto& runtime = *env.GetServer().GetRuntime();
+        CreateDatabase(env, "Database");
+        const auto tableInfo = CreateEmptyTable(env, "Database", "Table", ColumnShard);
+
+        Analyze(runtime, tableInfo.SaTabletId, {tableInfo.PathId});
+
+        // No eq-height histogram should be stored for an empty table.
+        auto responses = GetStatisticsMultiColumn(runtime, tableInfo.PathId, EStatType::EQ_HEIGHT_HISTOGRAM, {1});
+        for (const auto& resp : responses) {
+            UNIT_ASSERT_C(!resp.Success,
+                          "EQ_HEIGHT_HISTOGRAM should not be collected for an empty table");
+            UNIT_ASSERT_C(!resp.EqHeightHistogram.Data,
+                          "EQ_HEIGHT_HISTOGRAM should not be collected for an empty table");
+        }
+    }
+
     Y_UNIT_TEST_TWIN(AnalyzeTwoTables, ColumnShard) {
         TTestEnv env(1, 1);
         auto& runtime = *env.GetServer().GetRuntime();

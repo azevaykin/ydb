@@ -69,7 +69,11 @@ bool TOlapMultiColumnStatisticsSchema::ApplyUpsert(const TOlapSchema& currentSch
                 errors.AddError(NKikimrScheme::StatusInvalidParameter, TStringBuilder() << "MultiColumnStatistics '" << Name << "' type must be specified");
                 return false;
             case NKikimrSchemeOp::EMultiColumnStatisticsType::COUNT_MIN_SKETCH:
+            case NKikimrSchemeOp::EMultiColumnStatisticsType::EQ_HEIGHT_HISTOGRAM:
                 break;
+            default:
+                errors.AddError(NKikimrScheme::StatusInvalidParameter, TStringBuilder() << "Unknown statistic type: " << static_cast<ui32>(rawType));
+                return false;
         }
         Types.emplace_back(type);
     }

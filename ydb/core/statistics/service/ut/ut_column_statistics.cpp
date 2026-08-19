@@ -8,6 +8,8 @@
 #include <ydb/core/statistics/service/service.h>
 #include <ydb/core/protos/statistics.pb.h>
 
+#include <yql/essentials/core/histogram/eq_height_histogram.h>
+
 #include <type_traits>
 
 namespace NKikimr::NStat {
@@ -362,6 +364,56 @@ Y_UNIT_TEST_SUITE(ColumnStatistics) {
         UNIT_ASSERT(histogram->GetType() == EHistogramValueType::Int64);
         auto estimator = TEqWidthHistogramEstimator(histogram);
         UNIT_ASSERT_VALUES_EQUAL(estimator.EstimateLess<i64>(0), 500);
+    }
+
+    Y_UNIT_TEST(EqHeightHistogram) {
+        // Integration test for EQ_HEIGHT_HISTOGRAM, mirroring the existing
+        // EqWidthHistogram test above.  The histogram is a multi-column
+        // statistic over (Value1, Value2), both String.  Value1 = ToString(key % 10),
+        // Value2 = ToString(key % 20); the 20 pairs with Value1 == Value2 % 10
+        // each occur ColumnTableRowsNumber / 20 = 50 times; all 1000 rows present.
+        //
+        // The integration histogram is NOT exact — it goes through per-shard
+        // collection, UDAF merge, and byte-budget compaction, producing fewer
+        // buckets with boundaries that depend on the compaction path.  Therefore
+        // only boundary probes (null, above-max) are asserted here; intermediate-key
+        // exactness is covered by the unit tests in eq_height_histogram_ut.cpp.
+        TTestEnv env(1, 1);
+        auto& runtime = *env.GetServer().GetRuntime();
+
+        CreateDatabase(env, "Database");
+        const auto tableInfo = PrepareMultiColumnEqHeightColumnTable(env, "Database", "Table1");
+
+        Analyze(runtime, tableInfo.SaTabletId, {tableInfo.PathId});
+
+        // Fetch the histogram via the stat service using the multi-column
+        // variant (the single-column GetStatistics would construct a
+        // TColumnTags(ui32) that only collides with the multi-column key by
+        // coincidence of SerializeColumnTags).
+        auto responses = GetStatisticsMultiColumn(
+            runtime, tableInfo.PathId, EStatType::EQ_HEIGHT_HISTOGRAM, {2, 3});
+        UNIT_ASSERT_VALUES_EQUAL(responses.size(), 1);
+
+        const auto& resp = responses.at(0);
+        UNIT_ASSERT(resp.Success);
+        const auto& histogram = resp.EqHeightHistogram.Data;
+        UNIT_ASSERT(histogram);
+        UNIT_ASSERT_VALUES_EQUAL(histogram->GetTotalCount(), ColumnTableRowsNumber);
+        UNIT_ASSERT(histogram->GetNumBuckets() >= 1);
+
+        // Boundary probes (following the CheckCountMinSketch / EqWidth pattern
+        // of probing with known values and asserting exact results):
+        //   - A null order key (0x00) sorts before every present key -> 0.
+        //   - A key above all data ("zz", "zz") matches the last bucket, whose
+        //     CumulativeCount is the sum of all entry Weights = TotalCount.
+        //     String order differs from numeric order ("9" > "19" because
+        //     '9' > '1'), so "zz" is safely above all digit-only values.
+        UNIT_ASSERT_VALUES_EQUAL(
+            histogram->EstimateLessOrEqual(MakeNullPresortKey()), 0);
+        UNIT_ASSERT_VALUES_EQUAL(
+            histogram->EstimateLessOrEqual(
+                MakeStringTuplePresortKey({"zz", "zz"})),
+            ColumnTableRowsNumber);
     }
 
     Y_UNIT_TEST(ManyColumns) {

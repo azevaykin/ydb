@@ -19,6 +19,9 @@ public:
     struct TConfig {
         ui64 MaxTotalScanActorsInFlight = 100;
         i64 MaxPerNodeScanActorsInFlight = 1;
+        bool CollectPrimaryKeyHistogram = false;
+        ui32 HistogramOversampleFactor = 8;
+        ui64 HistogramMaxStateBytes = 4u << 20;
     };
 
 private:

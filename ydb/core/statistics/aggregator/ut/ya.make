@@ -18,8 +18,10 @@ PEERDIR(
     ydb/library/yql/udfs/statistics_internal
     ydb/core/kqp/node_service
     ydb/core/protos
+    ydb/core/scheme
     ydb/core/testlib/default
     ydb/core/statistics/ut_common
+    yql/essentials/core/histogram
     yql/essentials/udfs/common/digest
     yql/essentials/udfs/common/hyperloglog
 )

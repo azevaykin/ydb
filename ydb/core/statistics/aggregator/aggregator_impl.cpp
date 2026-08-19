@@ -1136,9 +1136,22 @@ void TStatisticsAggregator::PersistTraversal(NIceDb::TNiceDb& db) {
 
 void TStatisticsAggregator::StartAnalyzeActor(const TActorContext& ctx, const TString& operationId,
         const TString& database, const TPathId& pathId, const TVector<ui32>& columnTags) {
+    // Clamp the histogram config values where they're read from TStatisticsConfig:
+    //  - OversampleFactor of 0 would make EmissionRate 0 and flush on every row;
+    //    force a minimum of 1.
+    //  - MaxStateBytes above MAX_STATISTIC_SIZE (8 MB) makes the EstimateSize()
+    //    guard in analyze_actor.cpp skip the histogram silently; cap it so the
+    //    configured value is actually usable.
+    const ui32 oversampleFactor = std::max<ui32>(1, StatisticsConfig.GetAnalyzeHistogramOversampleFactor());
+    const ui64 maxStateBytes = std::min<ui64>(
+        StatisticsConfig.GetAnalyzeHistogramMaxStateBytes(),
+        8u << 20); // MAX_STATISTIC_SIZE
     auto analyzeActorConfig = TAnalyzeActor::TConfig{
         .MaxTotalScanActorsInFlight = StatisticsConfig.GetAnalyzeMaxTotalScanActorsInFlight(),
         .MaxPerNodeScanActorsInFlight = StatisticsConfig.GetAnalyzeMaxPerNodeScanActorsInFlight(),
+        .CollectPrimaryKeyHistogram = StatisticsConfig.GetAnalyzeCollectPrimaryKeyHistogram(),
+        .HistogramOversampleFactor = oversampleFactor,
+        .HistogramMaxStateBytes = maxStateBytes,
     };
     AnalyzeActorId = ctx.Register(new TAnalyzeActor(
         SelfId(), operationId, database, pathId, columnTags, analyzeActorConfig),

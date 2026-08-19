@@ -3335,6 +3335,10 @@ message TStatisticsConfig {
     // When (RowUpdates + RowDeletes since last ANALYZE) / RowCount * 100 >= this value,
     // column statistics are considered stale and will be recalculated.
     optional uint32 BackgroundAnalyzeChangeRatioThresholdPercent = 8 [default = 20];
+
+    optional bool AnalyzeCollectPrimaryKeyHistogram = 9 [default = false];
+    optional uint32 AnalyzeHistogramOversampleFactor = 10 [default = 8];
+    optional uint64 AnalyzeHistogramMaxStateBytes = 11 [default = 4194304];
 };
 
 message TSystemTabletBackupConfig {

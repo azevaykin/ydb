@@ -23,6 +23,8 @@ std::optional<EStatType> ConvertMultiColumnStatType(NKikimrSchemeOp::EMultiColum
         return std::nullopt;
     case NKikimrSchemeOp::EMultiColumnStatisticsType::COUNT_MIN_SKETCH:
         return EStatType::COUNT_MIN_SKETCH;
+    case NKikimrSchemeOp::EMultiColumnStatisticsType::EQ_HEIGHT_HISTOGRAM:
+        return EStatType::EQ_HEIGHT_HISTOGRAM;
     }
 }
 
@@ -265,12 +267,16 @@ void TAnalyzeActor::HandleResolveDatabase(const NSchemeCache::TSchemeCacheNaviga
 
 void TAnalyzeActor::HandleNavigateResult() {
     THashMap<ui32, TSysTables::TTableColumnInfo> tag2Column;
+    std::vector<std::pair<TString, ui32>> keyColumns;
     for (const auto& col : NavigateColumns) {
         tag2Column[col.second.Id] = col.second;
 
         if (col.second.KeyOrder >= 0) {
             KeyColumnTypes.resize(Max<size_t>(KeyColumnTypes.size(), col.second.KeyOrder + 1));
             KeyColumnTypes[col.second.KeyOrder] = col.second.PType;
+
+            keyColumns.resize(Max<size_t>(keyColumns.size(), col.second.KeyOrder + 1));
+            keyColumns[col.second.KeyOrder] = {col.second.Name, col.second.Id};
         }
     }
 
@@ -293,22 +299,56 @@ void TAnalyzeActor::HandleNavigateResult() {
             continue;
         }
 
-        if (desc.ColumnIds.size() < 2) {
-            // A 1-column multi-column statistic is degenerate: its column_tags key would collide
-            // with the single-column stat's key in .metadata/statistics_v2, and single-column CMS
-            // already covers it. Skip gathering it.
-            continue;
-        }
-
         for (auto type : def.GetTypes()) {
             auto statType = ConvertMultiColumnStatType(
                 static_cast<NKikimrSchemeOp::EMultiColumnStatisticsType>(type));
-            if (statType) {
-                desc.Types.push_back(*statType);
+            if (!statType) {
+                continue;
             }
+            // A 1-column COUNT_MIN_SKETCH would collide with the single-column sketch's
+            // (column_tags, stat_type) key, and is already covered by it. Other types have their own
+            // stat_type and cannot collide.
+            if (desc.ColumnIds.size() < 2 && *statType == EStatType::COUNT_MIN_SKETCH) {
+                continue;
+            }
+            desc.Types.push_back(*statType);
         }
         if (!desc.Types.empty()) {
             MultiColumnStatDescs.push_back(std::move(desc));
+        }
+    }
+
+    if (Config.CollectPrimaryKeyHistogram && !keyColumns.empty()) {
+        // KeyOrder values are expected to form a contiguous 0..N-1 range, but a
+        // dropped key column can leave a gap filled by a default-constructed
+        // {"", 0} entry.  A histogram over a non-contiguous subset of the key has
+        // a memcmp order that isn't the table's key order, so a consumer that
+        // treats it as "the PK histogram" would be wrong.  Skip the PK histogram
+        // entirely in that case, matching the declared-statistic behavior (which
+        // sets columnDropped and skips the whole descriptor).
+        const bool hasDroppedKeyColumn = AnyOf(keyColumns, [](const auto& kc) {
+            return kc.first.empty();
+        });
+        if (!hasDroppedKeyColumn) {
+            TMultiColumnStatDesc pk;
+            pk.Name = "__pk";
+            for (const auto& [name, id] : keyColumns) {
+                pk.ColumnNames.push_back(name);
+                pk.ColumnIds.push_back(id);
+            }
+            pk.Types = {EStatType::EQ_HEIGHT_HISTOGRAM};
+
+            // A user may legitimately declare WITH (EQ_HEIGHT_HISTOGRAM) over exactly the primary key.
+            // Two descriptors would then produce the same (column_tags, stat_type) row -- the same
+            // duplicate-key problem the COUNT_MIN_SKETCH filter above avoids, reached from the other
+            // side. The declared descriptor wins: it is the one the user can drop.
+            const bool alreadyDeclared = AnyOf(MultiColumnStatDescs, [&](const auto& d) {
+                return d.ColumnIds == pk.ColumnIds
+                    && Find(d.Types, EStatType::EQ_HEIGHT_HISTOGRAM) != d.Types.end();
+            });
+            if (!alreadyDeclared) {
+                MultiColumnStatDescs.push_back(std::move(pk));
+            }
         }
     }
 
@@ -634,12 +674,21 @@ void TAnalyzeActor::HandleImpl(TEvPrivate::TEvAnalyzeScanResult::TPtr& ev) {
                         == supportedMultiColumnTypes.end()) {
                     continue;
                 }
+                IMultiColumnStatisticEval::THistogramSizing sizing;
+                sizing.OversampleFactor = Config.HistogramOversampleFactor;
+                sizing.MaxStateBytes = Config.HistogramMaxStateBytes;
                 auto statEval = IMultiColumnStatisticEval::MaybeCreate(
-                    type, def.ColumnNames, def.ColumnIds, RowCount.value());
+                    type, def.ColumnNames, def.ColumnIds, RowCount.value(), sizing);
                 if (!statEval) {
                     continue;
                 }
                 if (statEval->EstimateSize() > MAX_STATISTIC_SIZE) {
+                    YDB_LOG_WARN("Skipping multi-column statistic: estimated size exceeds MAX_STATISTIC_SIZE",
+                        {"operationId", OperationId.Quote()},
+                        {"pathId", PathId},
+                        {"statType", static_cast<int>(type)},
+                        {"estimatedSize", statEval->EstimateSize()},
+                        {"maxStatisticSize", MAX_STATISTIC_SIZE});
                     continue;
                 }
                 PendingTasks.push(TColumnStatEvalTask{
@@ -682,10 +731,13 @@ void TAnalyzeActor::HandleImpl(TEvPrivate::TEvAnalyzeScanResult::TPtr& ev) {
                 task.Stage2StatEval->GetType(),
                 task.Stage2StatEval->ExtractData(result.AggColumns));
         } else {
-            resultItems.emplace_back(
-                task.MultiStatEval->GetColumnIds(),
-                task.MultiStatEval->GetType(),
-                task.MultiStatEval->ExtractData(result.AggColumns));
+            auto data = task.MultiStatEval->ExtractData(result.AggColumns);
+            if (data) {
+                resultItems.emplace_back(
+                    task.MultiStatEval->GetColumnIds(),
+                    task.MultiStatEval->GetType(),
+                    std::move(*data));
+            }
         }
     }
 

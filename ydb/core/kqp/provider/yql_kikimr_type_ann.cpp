@@ -1926,7 +1926,7 @@ private:
             }
             for (const auto& type : statistics.Types()) {
                 const auto typeName = to_upper(TString(type.Value()));
-                if (typeName != "COUNT_MIN_SKETCH") {
+                if (typeName != "COUNT_MIN_SKETCH" && typeName != "EQ_HEIGHT_HISTOGRAM") {
                     ctx.AddError(TIssue(ctx.GetPosition(type.Pos()), TStringBuilder()
                         << "Unknown statistic type: " << TString(type.Value())));
                     return TStatus::Error;
