@@ -18,17 +18,15 @@ namespace {
 
 TTestEnv CreateTestEnv() {
     return TTestEnv(1, 1, false, [](Tests::TServerSettings& settings) {
-        settings.AppConfig->MutableStatisticsConfig()
-            ->SetEnableBackgroundColumnStatsCollection(true);
+        settings.AppConfig->MutableStatisticsConfig()->SetEnableBackgroundColumnStatsCollection(true);
     });
 }
 
 TTestEnv CreateTestEnv(ui32 changeRatioThresholdPercent) {
     return TTestEnv(1, 1, false, [changeRatioThresholdPercent](Tests::TServerSettings& settings) {
-        settings.AppConfig->MutableStatisticsConfig()
-            ->SetEnableBackgroundColumnStatsCollection(true);
-        settings.AppConfig->MutableStatisticsConfig()
-            ->SetBackgroundAnalyzeChangeRatioThresholdPercent(changeRatioThresholdPercent);
+        auto* stats = settings.AppConfig->MutableStatisticsConfig();
+        stats->SetEnableBackgroundColumnStatsCollection(true);
+        stats->SetBackgroundAnalyzeChangeRatioThresholdPercent(changeRatioThresholdPercent);
     });
 }
 
@@ -224,12 +222,8 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
 
         WaitForPrimaryCollection(runtime, tableInfo.PathId, ColumnTableRowsNumber, 1, ColumnShard);
 
-        TSaveStatisticsObserver observer(runtime, tableInfo.PathId);
         InsertDataIntoTable(env, "Database", "Table", 10);
-
-        WaitForBackgroundAnalyzeToStabilize(runtime);
-
-        UNIT_ASSERT_VALUES_EQUAL(observer.GetSaveCount(), 0);
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
     }
 
     Y_UNIT_TEST_TWIN(CountersResetAfterAnalyze, ColumnShard) {
@@ -241,12 +235,8 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
 
         WaitForPrimaryCollection(runtime, tableInfo.PathId, ColumnTableRowsNumber, 1, ColumnShard);
 
-        TSaveStatisticsObserver observer(runtime, tableInfo.PathId);
         InsertDataIntoTable(env, "Database", "Table", 50);
-
-        WaitForBackgroundAnalyzeToStabilize(runtime);
-
-        UNIT_ASSERT_VALUES_EQUAL(observer.GetSaveCount(), 0);
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
     }
 
     Y_UNIT_TEST_TWIN(ConfigThresholdHigh, ColumnShard) {
@@ -258,12 +248,8 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
 
         WaitForPrimaryCollection(runtime, tableInfo.PathId, ColumnTableRowsNumber, 1, ColumnShard);
 
-        TSaveStatisticsObserver observer(runtime, tableInfo.PathId);
         InsertDataIntoTable(env, "Database", "Table", 500);
-
-        WaitForBackgroundAnalyzeToStabilize(runtime);
-
-        UNIT_ASSERT_VALUES_EQUAL(observer.GetSaveCount(), 0);
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
     }
 
     Y_UNIT_TEST_TWIN(ConfigThresholdLow, ColumnShard) {
@@ -295,15 +281,7 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
         WaitForPrimaryCollection(runtime, tableInfo.PathId, ColumnTableRowsNumber, 1, ColumnShard);
 
         DropTable(env, "Database", "Table");
-
-        // Wait for the background traversal to process the dropped table.
-        WaitForBackgroundAnalyzeToStabilize(runtime);
-
-        TSaveStatisticsObserver observer(runtime, tableInfo.PathId);
-
-        WaitForBackgroundAnalyzeToStabilize(runtime);
-
-        UNIT_ASSERT_VALUES_EQUAL(observer.GetSaveCount(), 0);
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
     }
 
     Y_UNIT_TEST_TWIN(Counters, ColumnShard) {
@@ -368,15 +346,19 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
 
         auto primaryCount = WaitForPrimaryCollection(runtime, tableInfo.PathId, ColumnTableRowsNumber, 1, ColumnShard);
 
+        TSaveStatisticsObserver observer(runtime, tableInfo.PathId);
         InsertDataIntoTable(env, "Database", "Table", 500);
-        WaitForBackgroundAnalyzeToStabilize(runtime);
+        runtime.WaitFor("TEvSaveStatisticsQueryResponse after 50% change", [&] {
+            return observer.GetSaveCount() >= 1;
+        });
+        WaitForBackgroundAnalyzeToStabilize(runtime, /*timeoutSec=*/10, /*stableIterations=*/5);
 
         ui64 saTabletId = 0;
         ResolvePathId(runtime, "/Root/Database/Table", nullptr, &saTabletId);
 
         Analyze(runtime, saTabletId, {{tableInfo.PathId}}, "dedupOp", "/Root/Database");
 
-        WaitForBackgroundAnalyzeToStabilize(runtime);
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
 
         // The force ANALYZE is deduplicated by the background traversal that
         // already collected the same statistics, so it does not increment the
@@ -408,12 +390,8 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
         auto sender = runtime.AllocateEdgeActor();
         RebootTablet(runtime, saTabletId, sender);
 
-        TSaveStatisticsObserver observer(runtime, tableInfo.PathId);
         InsertDataIntoTable(env, "Database", "Table", 50);
-
-        WaitForBackgroundAnalyzeToStabilize(runtime);
-
-        UNIT_ASSERT_VALUES_EQUAL(observer.GetSaveCount(), 0);
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
     }
 
     // SchemeShard restart without persistent partition stats: SS loses
@@ -424,14 +402,13 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
     // re-trigger ANALYZE. A later above-threshold change still must.
     Y_UNIT_TEST_TWIN(SchemeShardRestartWithoutPersistentStats, ColumnShard) {
         TTestEnv env(1, 1, false, [](Tests::TServerSettings& settings) {
-            settings.AppConfig->MutableStatisticsConfig()
-                ->SetEnableBackgroundColumnStatsCollection(true);
-            settings.AppConfig->MutableStatisticsConfig()
-                ->SetBackgroundAnalyzeChangeRatioThresholdPercent(20);
-            // After reboot SS waits 30s before the first SendBaseStatsToSA; keep
-            // the subsequent interval short so recovery is observable quickly.
-            settings.AppConfig->MutableStatisticsConfig()
-                ->SetBaseStatsSendIntervalSecondsDedicated(3);
+            auto* stats = settings.AppConfig->MutableStatisticsConfig();
+            stats->SetEnableBackgroundColumnStatsCollection(true);
+            stats->SetBackgroundAnalyzeChangeRatioThresholdPercent(20);
+            // ColumnShardConfig.Statistics.ReportBaseStatisticsPeriodMs is set to
+            // 1000ms in TTestEnv, so columnshards report partition stats every 1s.
+            // The default 3s initial delay (set in TTestEnv) is enough for them
+            // to report before the first SendBaseStatsToSA fires.
             settings.FeatureFlags.SetEnablePersistentPartitionStats(false);
         });
         auto& runtime = *env.GetServer().GetRuntime();
@@ -446,7 +423,7 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
         // Wait until SA has a full base-stats snapshot and any catch-up
         // re-analysis (baselining LastAnalyze from real counters) has finished.
         WaitForSchemeShardStatsUpdate(runtime, ssTabletId, /*requireFull=*/true);
-        runtime.SimulateSleep(TDuration::Seconds(5));
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
 
         // Reboot tenant SchemeShard. Partition stats are not persisted, so
         // AreStatsFull becomes false until columnshards re-report.
@@ -463,7 +440,7 @@ Y_UNIT_TEST_SUITE(TraverseStatistics) {
         // SA did not replace the live counters with zeros from the incomplete
         // post-reboot report.
         InsertDataIntoTable(env, "Database", "Table", 50);
-        runtime.SimulateSleep(TDuration::Seconds(10));
+        WaitForNoBackgroundAnalyze(runtime, tableInfo.PathId);
         UNIT_ASSERT_VALUES_EQUAL(observer.GetSaveCount(), 0);
 
         // Above-threshold change must still trigger — the pipeline works after

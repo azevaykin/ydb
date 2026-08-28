@@ -146,16 +146,11 @@ Y_UNIT_TEST_SUITE(AnalyzeOpList) {
         TAnalyzedTable analyzedTable(tableInfo.PathId);
         auto req = MakeAnalyzeRequest({analyzedTable}, sharedOpId, secondDb);
         req->Record.MutableTables(0)->SetPath(tableInfo.Path);
-        auto sender = runtime.AllocateEdgeActor();
-        runtime.SendToPipe(tableInfo.SaTabletId, sender, req.release());
-        // Drain enough simulated time for the TxAnalyze to commit (the second
-        // operation may or may not run a full traversal — we only care about the
-        // collision resolution, not the analysis itself).
-        runtime.SimulateSleep(TDuration::MilliSeconds(100));
-
-        // The first entry (firstDb) was replaced: Get under firstDb is now NOT_FOUND.
-        TestGetAnalyzeOp(runtime, tableInfo.SaTabletId, firstDb, sharedOpId,
-            Ydb::StatusIds::NOT_FOUND);
+        runtime.SendToPipe(tableInfo.SaTabletId, runtime.AllocateEdgeActor(), req.release());
+        runtime.WaitFor("firstDb op replaced", [&] {
+            return GetAnalyzeOp(runtime, tableInfo.SaTabletId, firstDb, sharedOpId)
+                .GetStatus() == Ydb::StatusIds::NOT_FOUND;
+        });
 
         // The new entry is present under secondDb (state is whatever the active
         // schedule produced — at minimum it must not be the cached DONE response
@@ -388,7 +383,11 @@ Y_UNIT_TEST_SUITE(AnalyzeOpList) {
             req->Record.MutableTables(0)->SetPath(tableInfo.Path);
             runtime.SendToPipe(saTabletId, runtime.AllocateEdgeActor(), req.release());
         }
-        runtime.SimulateSleep(TDuration::MilliSeconds(100));
+        runtime.WaitFor("queued op ENQUEUED", [&] {
+            const auto rec = GetAnalyzeOp(runtime, saTabletId, "/Root/Database", queuedOpId);
+            return rec.GetStatus() == Ydb::StatusIds::SUCCESS
+                && rec.GetAnalyzeOperation().GetState() == Ydb::Table::AnalyzeState::STATE_ENQUEUED;
+        });
 
         // Sanity: states match the configuration.
         {
@@ -451,22 +450,16 @@ Y_UNIT_TEST_SUITE(AnalyzeOpList) {
         blockResult.Unblock();
         blockResult.Stop();
 
-        bool foundCancelled = false;
-        for (int i = 0; i < 60 && !foundCancelled; ++i) {
-            const auto state =
-                TestGetAnalyzeOp(runtime, saTabletId, "/Root/Database", activeOpId)
-                    .GetAnalyzeOperation().GetState();
+        runtime.WaitFor("active op CANCELLED", [&] {
+            const auto rec = GetAnalyzeOp(runtime, saTabletId, "/Root/Database", activeOpId);
+            UNIT_ASSERT_VALUES_EQUAL_C(rec.GetStatus(), Ydb::StatusIds::SUCCESS,
+                rec.ShortDebugString());
+            const auto state = rec.GetAnalyzeOperation().GetState();
             UNIT_ASSERT_VALUES_UNEQUAL_C(
                 state, Ydb::Table::AnalyzeState::STATE_DONE,
                 "cancelled active op must not transition to DONE");
-            if (state == Ydb::Table::AnalyzeState::STATE_CANCELLED) {
-                foundCancelled = true;
-                break;
-            }
-            runtime.SimulateSleep(TDuration::MilliSeconds(100));
-        }
-        UNIT_ASSERT_C(foundCancelled,
-            "cancelled active op did not transition to STATE_CANCELLED");
+            return state == Ydb::Table::AnalyzeState::STATE_CANCELLED;
+        });
     }
 
     Y_UNIT_TEST(ListAnalyzeNoStatisticsAggregator) {

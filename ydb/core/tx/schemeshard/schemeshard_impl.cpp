@@ -9564,7 +9564,7 @@ TDuration TSchemeShard::SendBaseStatsToSA() {
 
     if (!count) {
         LOG_DEBUG_S(TlsActivationContext->AsActorContext(), NKikimrServices::STATISTICS,
-            "SendBaseStatsToSA() No user tables to send"
+            "SendBaseStatsToSA() No tables to send"
             << ", at schemeshard: " << TabletID());
     }
 

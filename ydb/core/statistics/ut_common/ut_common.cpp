@@ -908,18 +908,18 @@ void WaitForBackgroundAnalyzeCompleted(TTestActorRuntime& runtime, i64 expectedC
     }
 }
 
-// Waits for the background-analyze completed counter to stop incrementing
-// for at least stableSecs seconds, ensuring all race-condition-triggered
-// traversals have finished. Returns the final counter value.
-i64 WaitForBackgroundAnalyzeToStabilize(TTestActorRuntime& runtime, size_t timeoutSec, size_t stableSecs) {
+i64 WaitForBackgroundAnalyzeToStabilize(TTestActorRuntime& runtime, size_t timeoutSec, size_t stableIterations) {
+    const TDuration pollInterval = TDuration::MilliSeconds(200);
+    const size_t pollsPerSecond = 1000 / pollInterval.MilliSeconds();
+    const size_t maxIterations = timeoutSec * pollsPerSecond;
     auto prev = GetBackgroundAnalyzeCompletedCount(runtime);
     size_t stable = 0;
-    for (size_t i = 0; i < timeoutSec; ++i) {
-        runtime.SimulateSleep(TDuration::Seconds(1));
+    for (size_t i = 0; i < maxIterations; ++i) {
+        runtime.SimulateSleep(pollInterval);
         auto curr = GetBackgroundAnalyzeCompletedCount(runtime);
         if (curr == prev) {
             ++stable;
-            if (stable >= stableSecs) {
+            if (stable >= stableIterations) {
                 return curr;
             }
         } else {
@@ -930,21 +930,32 @@ i64 WaitForBackgroundAnalyzeToStabilize(TTestActorRuntime& runtime, size_t timeo
     return prev;
 }
 
-// Ensures the primary background collection has fully completed for the given
-// table. We use the BackgroundAnalyze completed counter, which is monotonically
-// increasing and never misses a traversal. WaitForBackgroundAnalyzeCompleted
-// waits for at least expectedCount traversals to finish;
-// WaitForBackgroundAnalyzeToStabilize then waits for the counter to stop
-// incrementing, ensuring all race-condition-triggered spurious traversals
-// have also completed.
-//
-// The columnShard parameter is accepted for API symmetry with
-// ValidateStatistics but does not change the waiting logic.
 i64 WaitForPrimaryCollection(
-    TTestActorRuntime& runtime, const TPathId& /*pathId*/,
-    ui64 /*expectedRowCount*/, i64 expectedCount, bool /*columnShard*/) {
+    TTestActorRuntime& runtime, const TPathId& pathId,
+    ui64 expectedRowCount, i64 expectedCount, bool /*columnShard*/) {
+    WaitForSchemeShardStatsUpdate(runtime, pathId.OwnerId, /*requireFull=*/true);
+    TSaveStatisticsObserver observer(runtime, pathId);
+    if (expectedRowCount > 0) {
+        if (GetBackgroundAnalyzeCompletedCount(runtime) < expectedCount) {
+            runtime.WaitFor("user table statistics save after full snapshot", [&] {
+                return observer.GetSaveCount() >= 1
+                    || GetBackgroundAnalyzeCompletedCount(runtime) >= expectedCount;
+            });
+        } else {
+            // ANALYZE already finished (e.g. SA reboot resume). Wait two SS
+            // send intervals for a possible catch-up that baselines LastAnalyze.
+            runtime.SimulateSleep(TDuration::Seconds(2));
+        }
+    }
     WaitForBackgroundAnalyzeCompleted(runtime, expectedCount);
-    return WaitForBackgroundAnalyzeToStabilize(runtime);
+    return WaitForBackgroundAnalyzeToStabilize(runtime, /*timeoutSec=*/10, /*stableIterations=*/5);
+}
+
+void WaitForNoBackgroundAnalyze(
+    TTestActorRuntime& runtime, const TPathId& pathId, TDuration wait) {
+    TSaveStatisticsObserver observer(runtime, pathId);
+    runtime.SimulateSleep(wait);
+    UNIT_ASSERT_VALUES_EQUAL(observer.GetSaveCount(), 0);
 }
 
 void WaitForSchemeShardStatsUpdate(
@@ -1039,17 +1050,25 @@ NKikimrAnalyzeOp::TEvListResponse TestListAnalyzeOps(
     return ev->Get()->Record;
 }
 
-NKikimrAnalyzeOp::TEvGetResponse TestGetAnalyzeOp(
+NKikimrAnalyzeOp::TEvGetResponse GetAnalyzeOp(
     TTestActorRuntime& runtime, ui64 saTabletId,
-    const TString& dbName, const TString& binaryOpId,
-    Ydb::StatusIds::StatusCode expectedStatus)
+    const TString& dbName, const TString& binaryOpId)
 {
     auto sender = runtime.AllocateEdgeActor();
     runtime.SendToPipe(saTabletId, sender,
         new TEvStatistics::TEvAnalyzeOpGetRequest(dbName, binaryOpId));
     auto ev = runtime.GrabEdgeEventRethrow<TEvStatistics::TEvAnalyzeOpGetResponse>(sender);
-    UNIT_ASSERT_VALUES_EQUAL_C(ev->Get()->Record.GetStatus(), expectedStatus, ev->Get()->Record.ShortDebugString());
     return ev->Get()->Record;
+}
+
+NKikimrAnalyzeOp::TEvGetResponse TestGetAnalyzeOp(
+    TTestActorRuntime& runtime, ui64 saTabletId,
+    const TString& dbName, const TString& binaryOpId,
+    Ydb::StatusIds::StatusCode expectedStatus)
+{
+    auto record = GetAnalyzeOp(runtime, saTabletId, dbName, binaryOpId);
+    UNIT_ASSERT_VALUES_EQUAL_C(record.GetStatus(), expectedStatus, record.ShortDebugString());
+    return record;
 }
 
 NKikimrAnalyzeOp::TEvCancelResponse TestCancelAnalyzeOp(

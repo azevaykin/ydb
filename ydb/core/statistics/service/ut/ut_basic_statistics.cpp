@@ -304,12 +304,7 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
 
         blockShardStats.Unblock();
         blockShardStats.Stop();
-        // Give SchemeShard time to process shard stats updates
-        runtime.SimulateSleep(TDuration::Seconds(1));
-
-        // Check that after all shard updates reached SchemeShard,
-        // statistics service reports correct row count.
-        WaitForStatsUpdateFromSchemeShard(runtime, ssTabletId, saTabletId);
+        WaitForSchemeShardStatsUpdate(runtime, ssTabletId, /*requireFull=*/true);
         WaitForStatsPropagate(runtime, nodeIdx);
 
         // Block updates from one of the shards again and reboot SchemeShard
@@ -384,9 +379,13 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
             return describe.GetPathDescription().GetTableStats().GetRowCount();
         };
 
-        runtime.SimulateSleep(TDuration::Seconds(100));
-        UNIT_ASSERT_EQUAL(getDescribeRowCount(path1), 1000);
-        UNIT_ASSERT_VALUES_EQUAL(GetRowCount(runtime, nodeIdx, pathId1), 1000);
+        auto waitReady = [&](const TString& path, TPathId pathId) {
+            WaitForRowCount(runtime, nodeIdx, pathId, ColumnTableRowsNumber);
+            runtime.SimulateSleep(TDuration::Seconds(1));
+            UNIT_ASSERT_EQUAL(getDescribeRowCount(path), ColumnTableRowsNumber);
+        };
+
+        waitReady(path1, pathId1);
 
         auto ids = GetColumnTableShards(runtime, sender, path1);
         for (auto& id : ids) {
@@ -396,24 +395,17 @@ Y_UNIT_TEST_SUITE(BasicStatistics) {
         PrepareColumnTable(env, dbName, table2, 4);
         auto pathId2 = ResolvePathId(runtime, path2, nullptr, &saTabletId);
 
-        runtime.SimulateSleep(TDuration::Seconds(100));
-        UNIT_ASSERT_EQUAL(getDescribeRowCount(path1), 1000);
-        UNIT_ASSERT_EQUAL(getDescribeRowCount(path2), 1000);
-        UNIT_ASSERT_VALUES_EQUAL(GetRowCount(runtime, nodeIdx, pathId1), 1000);
-        UNIT_ASSERT_VALUES_EQUAL(GetRowCount(runtime, nodeIdx, pathId2), 1000);
+        waitReady(path1, pathId1);
+        waitReady(path2, pathId2);
 
         RebootTablet(runtime, ssTabletId, runtime.AllocateEdgeActor());
 
         PrepareColumnTable(env, dbName, table3, 4);
         auto pathId3 = ResolvePathId(runtime, path3, nullptr, &saTabletId);
 
-        runtime.SimulateSleep(TDuration::Seconds(140));
-        UNIT_ASSERT_EQUAL(getDescribeRowCount(path1), 1000);
-        UNIT_ASSERT_EQUAL(getDescribeRowCount(path2), 1000);
-        UNIT_ASSERT_EQUAL(getDescribeRowCount(path3), 1000);
-        UNIT_ASSERT_VALUES_EQUAL(GetRowCount(runtime, nodeIdx, pathId1), 1000);
-        UNIT_ASSERT_VALUES_EQUAL(GetRowCount(runtime, nodeIdx, pathId2), 1000);
-        UNIT_ASSERT_VALUES_EQUAL(GetRowCount(runtime, nodeIdx, pathId3), 1000);
+        waitReady(path1, pathId1);
+        waitReady(path2, pathId2);
+        waitReady(path3, pathId3);
     }
 
     Y_UNIT_TEST(SimpleGlobalIndex) {

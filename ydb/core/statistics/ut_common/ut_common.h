@@ -265,19 +265,22 @@ i64 GetBackgroundAnalyzeCompletedCount(TTestActorRuntime& runtime);
 // processed yet when FinishTraversal runs.
 void WaitForBackgroundAnalyzeCompleted(TTestActorRuntime& runtime, i64 expectedCount = 1);
 
-// Waits for the background-analyze completed counter to stop incrementing
-// for at least stableSecs seconds, ensuring all race-condition-triggered
-// traversals have finished. Returns the final counter value.
-i64 WaitForBackgroundAnalyzeToStabilize(TTestActorRuntime& runtime, size_t timeoutSec = 10, size_t stableSecs = 3);
+// Waits until BackgroundAnalyze completed is unchanged for stableIterations
+// consecutive 200ms polls (default 15 = 3s). Returns the final counter value.
+i64 WaitForBackgroundAnalyzeToStabilize(TTestActorRuntime& runtime, size_t timeoutSec = 10, size_t stableIterations = 15);
 
-// Ensures the primary background collection has fully completed for the given
-// table. Polls the BackgroundAnalyze completed counter until it reaches
-// expectedCount, then waits for it to stabilize. Returns the final counter
-// value. The columnShard parameter is for API symmetry with ValidateStatistics.
+// Waits for a full SchemeShard snapshot, then for a statistics save of pathId
+// (so LastAnalyze is baselined from real counters). Empty tables produce no
+// save; those wait on the completed counter only.
 i64 WaitForPrimaryCollection(
     TTestActorRuntime& runtime, const TPathId& pathId,
     ui64 expectedRowCount = ColumnTableRowsNumber, i64 expectedCount = 1,
     bool columnShard = true);
+
+// Asserts that pathId is not saved again for two SS send intervals.
+void WaitForNoBackgroundAnalyze(
+    TTestActorRuntime& runtime, const TPathId& pathId,
+    TDuration wait = TDuration::Seconds(2));
 
 void WaitForSchemeShardStatsUpdate(
     TTestActorRuntime& runtime, ui64 ssTabletId, bool requireFull = false);
@@ -292,6 +295,10 @@ NKikimrAnalyzeOp::TEvListResponse TestListAnalyzeOps(
     TTestActorRuntime& runtime, ui64 saTabletId,
     const TString& dbName, ui64 pageSize = 100, const TString& pageToken = {},
     Ydb::StatusIds::StatusCode expectedStatus = Ydb::StatusIds::SUCCESS);
+
+NKikimrAnalyzeOp::TEvGetResponse GetAnalyzeOp(
+    TTestActorRuntime& runtime, ui64 saTabletId,
+    const TString& dbName, const TString& binaryOpId);
 
 NKikimrAnalyzeOp::TEvGetResponse TestGetAnalyzeOp(
     TTestActorRuntime& runtime, ui64 saTabletId,

@@ -290,7 +290,7 @@ Y_UNIT_TEST_SUITE(AnalyzeStatistics) {
         UNIT_ASSERT(response1);
         UNIT_ASSERT_VALUES_EQUAL(response1->Get()->Record.GetOperationId(), operationId);
 
-        auto response2 = runtime.GrabEdgeEventRethrow<TEvStatistics::TEvAnalyzeResponse>(sender, TDuration::Seconds(5));
+        auto response2 = runtime.GrabEdgeEventRethrow<TEvStatistics::TEvAnalyzeResponse>(sender, TDuration::MilliSeconds(200));
         UNIT_ASSERT(!response2);
     }
 
@@ -337,7 +337,11 @@ Y_UNIT_TEST_SUITE(AnalyzeStatistics) {
         runtime.SendToPipe(tableInfo.SaTabletId, sender, analyzeRequest.release());
 
         runtime.WaitFor("TEvSaveStatisticsQueryResponse", [&]{ return block.size(); });
-        runtime.AdvanceCurrentTime(TDuration::Days(2));
+
+        TBlockEvents<TEvDataShard::TEvPeriodicTableStats> blockPeriodicStats(runtime);
+        TBlockEvents<TEvStatistics::TEvSchemeShardStats> blockSSStats(runtime);
+        runtime.AdvanceCurrentTime(TDuration::Days(1) + TDuration::Seconds(2));
+        runtime.SimulateSleep(TDuration::Seconds(2));
 
         auto analyzeResponse = runtime.GrabEdgeEventRethrow<TEvStatistics::TEvAnalyzeResponse>(sender);
         const auto& record = analyzeResponse->Get()->Record;
