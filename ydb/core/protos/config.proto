@@ -3384,6 +3384,12 @@ message TStatisticsConfig {
     // When (RowUpdates + RowDeletes since last ANALYZE) / RowCount * 100 >= this value,
     // column statistics are considered stale and will be recalculated.
     optional uint32 BackgroundAnalyzeChangeRatioThresholdPercent = 8 [default = 20];
+
+    // Initial delay (in seconds) before SchemeShard sends the first base stats
+    // batch to the StatisticsAggregator after initialization. This gives table
+    // shards time to report their statistics. Not required for correctness,
+    // but avoids sending incomplete stats on the very first cycle.
+    optional uint32 BaseStatsSendInitialDelaySeconds = 10 [default = 30];
 };
 
 message TSystemTabletBackupConfig {
