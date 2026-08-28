@@ -9475,11 +9475,32 @@ TDuration TSchemeShard::SendBaseStatsToSA() {
         }
     }
 
+    auto nextSendInterval = [&]() {
+        if (IsServerlessDomain(SubDomains.at(RootPathId()))) {
+            const auto max = TDuration::Seconds(SendStatsIntervalSecondsServerless);
+            const auto min = max * 3 / 4;
+            return min + TDuration::MilliSeconds(
+                RandomNumber<ui64>(max.MilliSeconds() - min.MilliSeconds()));
+        }
+        return TDuration::Seconds(SendStatsIntervalSecondsDedicated);
+    };
+
+    // ANALYZE writes into .metadata/statistics_v2. Including that table in the
+    // blob schedules it for background ANALYZE, which writes more rows and
+    // retriggers itself.
+    auto isMetadataTable = [this](const TPathId& pathId) {
+        auto path = TPath::Init(pathId, this);
+        return path.IsResolved() && path.PathString().Contains("/.metadata/");
+    };
+
     int count = 0;
     int incompleteCount = 0;
 
     NKikimrStat::TSchemeShardStats record;
     for (const auto& [pathId, tableInfo] : Tables) {
+        if (isMetadataTable(pathId)) {
+            continue;
+        }
         const auto& stats = tableInfo->GetStats();
         const auto& aggregated = stats.Aggregated;
         bool areStatsFull = stats.AreStatsFull();
@@ -9503,6 +9524,9 @@ TDuration TSchemeShard::SendBaseStatsToSA() {
 
     auto columnTablesPathIds = ColumnTables.GetAllPathIds();
     for (const auto& pathId : columnTablesPathIds) {
+        if (isMetadataTable(pathId)) {
+            continue;
+        }
         const auto& tableInfo = ColumnTables.GetVerified(pathId);
         const auto& stats = tableInfo->GetStats();
         const TTableAggregatedStats* aggregatedStats = nullptr;
@@ -9539,9 +9563,8 @@ TDuration TSchemeShard::SendBaseStatsToSA() {
 
     if (!count) {
         LOG_DEBUG_S(TlsActivationContext->AsActorContext(), NKikimrServices::STATISTICS,
-            "SendBaseStatsToSA() No tables to send"
+            "SendBaseStatsToSA() No user tables to send"
             << ", at schemeshard: " << TabletID());
-        return TDuration::Seconds(30);
     }
 
     record.SetAreAllStatsFull(incompleteCount == 0);
@@ -9561,17 +9584,7 @@ TDuration TSchemeShard::SendBaseStatsToSA() {
         << ", paths with incomplete stats: " << incompleteCount
         << ", at schemeshard: " << TabletID());
 
-    if (IsServerlessDomain(SubDomains.at(RootPathId()))) {
-        // In serverless subdomains several schemeshards send stats to a single SA
-        // so we use a bigger interval with jitter.
-        const auto max = TDuration::Seconds(SendStatsIntervalSecondsServerless);
-        const auto min = max * 3 / 4;
-        return min + TDuration::MilliSeconds(
-            RandomNumber<ui64>(max.MilliSeconds() - min.MilliSeconds()));
-    } else {
-        // Dedicated subdomains can use a smaller interval.
-        return TDuration::Seconds(SendStatsIntervalSecondsDedicated);
-    }
+    return nextSendInterval();
 }
 
 void TSchemeShard::ConfigureShredManager(const NKikimrConfig::TDataErasureConfig& config) {
