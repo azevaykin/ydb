@@ -1,7 +1,11 @@
 #include <ydb/core/statistics/ut_common/ut_common.h>
+#include <ydb/library/testlib/helpers.h>
 
 #include <ydb/core/statistics/events.h>
 #include <ydb/core/statistics/database/database.h>
+#include <ydb/core/grpc_services/base/base.h>
+#include <ydb/core/grpc_services/local_rpc/local_rpc.h>
+#include <ydb/public/api/grpc/ydb_scripting_v1.grpc.pb.h>
 
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/table/table.h>
 
@@ -10,6 +14,101 @@
 namespace NKikimr::NStat {
 
 Y_UNIT_TEST_SUITE(StatisticsSaveLoad) {
+    Y_UNIT_TEST_TWIN(SampledRowsReplaceAndInvalidate, MultiColumn) {
+        TTestEnv env(1, 1, false);
+        auto& runtime = *env.GetServer().GetRuntime();
+        CreateDatabase(env, "Database");
+        const auto sender = runtime.AllocateEdgeActor();
+        runtime.Register(CreateStatisticsTableCreator(
+            std::make_unique<TEvStatistics::TEvStatTableCreationResponse>(), "/Root/Database"),
+            0, 0, TMailboxType::Simple, 0, sender);
+        runtime.GrabEdgeEventRethrow<TEvStatistics::TEvStatTableCreationResponse>(sender);
+        const TPathId pathId(1, 1);
+        const auto type = EStatType::COUNT_MIN_SKETCH;
+        const TColumnTags columns = MultiColumn ? TColumnTags(std::vector<ui32>{1, 2}) : TColumnTags(1u);
+        const auto save = [&](TString data, bool sampled) {
+            TStatisticsItem item(1, type, std::move(data));
+            item.ColumnTags = columns;
+            if (sampled) {
+                auto& metadata = item.Sampling.emplace();
+                metadata.SetRequestedRate(0.5);
+                metadata.SetEligibleUnits(4);
+                metadata.SetSelectedUnits(2);
+                metadata.SetSampleRows(100);
+            }
+            runtime.Register(CreateSaveStatisticsQuery(sender, "/Root/Database", pathId, {std::move(item)}));
+            UNIT_ASSERT(runtime.GrabEdgeEventRethrow<TEvStatistics::TEvSaveStatisticsQueryResponse>(sender)->Get()->Success);
+        };
+        const auto read = [&](bool sampled) {
+            runtime.RunCall([&] {
+                DispatchLoadStatisticsQuery(sender, 123, "/Root/Database", pathId, type, columns, sampled);
+                return 0;
+            });
+            return runtime.GrabEdgeEventRethrow<TEvStatistics::TEvLoadStatisticsQueryResponse>(sender);
+        };
+        save("full", false);
+        auto result = read(true);
+        UNIT_ASSERT(result->Get()->Success && !result->Get()->Sampling);
+        UNIT_ASSERT_VALUES_EQUAL(*result->Get()->Data, "full");
+        save("sample", true);
+        result = read(true);
+        UNIT_ASSERT(result->Get()->Success && result->Get()->Sampling);
+        UNIT_ASSERT_VALUES_EQUAL(result->Get()->Sampling->GetSampleRows(), 100);
+        UNIT_ASSERT_VALUES_EQUAL(*result->Get()->Data, "sample");
+        result = read(false);
+        UNIT_ASSERT(result->Get()->Success && !result->Get()->Sampling);
+        UNIT_ASSERT_VALUES_EQUAL(*result->Get()->Data, "full");
+        save("new-sample", true);
+        UNIT_ASSERT_VALUES_EQUAL(*read(true)->Get()->Data, "new-sample");
+        UNIT_ASSERT_VALUES_EQUAL(CountStatisticsV2Rows(env, "Database", pathId, type, MultiColumn ? "sample/1,2" : "sample/1"), 1);
+
+        TStatisticsItem anotherType(1, EStatType::SIMPLE_COLUMN, "another-type");
+        anotherType.ColumnTags = columns;
+        runtime.Register(CreateSaveStatisticsQuery(sender, "/Root/Database", pathId,
+            {TStatisticsItem(3, type, "another-column"), std::move(anotherType)}));
+        UNIT_ASSERT(runtime.GrabEdgeEventRethrow<TEvStatistics::TEvSaveStatisticsQueryResponse>(sender)->Get()->Success);
+        UNIT_ASSERT_VALUES_EQUAL(*read(true)->Get()->Data, "new-sample");
+
+        save("new-full", false);
+        result = read(true);
+        UNIT_ASSERT(result->Get()->Success && !result->Get()->Sampling);
+        UNIT_ASSERT_VALUES_EQUAL(*result->Get()->Data, "new-full");
+        UNIT_ASSERT_VALUES_EQUAL(CountStatisticsV2Rows(env, "Database", pathId, type, MultiColumn ? "sample/1,2" : "sample/1"), 0);
+    }
+
+    Y_UNIT_TEST(MalformedSampleFallsBackToFullStatistics) {
+        TTestEnv env(1, 1, false);
+        auto& runtime = *env.GetServer().GetRuntime();
+        CreateDatabase(env, "Database");
+        const auto sender = runtime.AllocateEdgeActor();
+        runtime.Register(CreateStatisticsTableCreator(
+            std::make_unique<TEvStatistics::TEvStatTableCreationResponse>(), "/Root/Database"),
+            0, 0, TMailboxType::Simple, 0, sender);
+        runtime.GrabEdgeEventRethrow<TEvStatistics::TEvStatTableCreationResponse>(sender);
+        const TPathId pathId(1, 1);
+        runtime.Register(CreateSaveStatisticsQuery(sender, "/Root/Database", pathId,
+            {TStatisticsItem(1, EStatType::SIMPLE_COLUMN, "full")}));
+        UNIT_ASSERT(runtime.GrabEdgeEventRethrow<TEvStatistics::TEvSaveStatisticsQueryResponse>(sender)->Get()->Success);
+        using TEvExecute = NGRpcService::TGrpcRequestOperationCall<
+            Ydb::Scripting::ExecuteYqlRequest, Ydb::Scripting::ExecuteYqlResponse>;
+        Ydb::Scripting::ExecuteYqlRequest request;
+        request.set_script(R"(
+            UPSERT INTO `/Root/Database/.metadata/statistics_v2`
+                (owner_id, local_path_id, stat_type, column_tags, data)
+            VALUES (1ul, 1ul, 1u, "sample/1", "broken");
+        )");
+        const auto saved = runtime.WaitFuture(NRpcService::DoLocalRpc<TEvExecute>(
+            std::move(request), "", "", runtime.GetActorSystem(0)));
+        UNIT_ASSERT_VALUES_EQUAL(saved.operation().status(), Ydb::StatusIds::SUCCESS);
+        runtime.RunCall([&] {
+            DispatchLoadStatisticsQuery(sender, 123, "/Root/Database", pathId, EStatType::SIMPLE_COLUMN, TColumnTags(1u), true);
+            return 0;
+        });
+        const auto result = runtime.GrabEdgeEventRethrow<TEvStatistics::TEvLoadStatisticsQueryResponse>(sender);
+        UNIT_ASSERT(result->Get()->Success && !result->Get()->Sampling);
+        UNIT_ASSERT_VALUES_EQUAL(*result->Get()->Data, "full");
+    }
+
     Y_UNIT_TEST(Simple) {
         TTestEnv env(1, 1);
         auto& runtime = *env.GetServer().GetRuntime();
