@@ -1336,7 +1336,7 @@ TNodeResult TSqlExpression::LambdaRule(const TRule_lambda& rule) {
     for (auto& arg : args) {
         arg.Name = PushNamedAtom(arg.Pos, arg.Name);
     }
-    bool ret = false;
+    TSQLStatus ret;
     TColumnRefScope scope(Ctx_, EColumnRefState::Deny);
     scope.SetNoColumnErrContext("in lambda function");
     if (bodyBlock.GetBlock2().HasAlt1()) {
@@ -1349,11 +1349,11 @@ TNodeResult TSqlExpression::LambdaRule(const TRule_lambda& rule) {
     for (const auto& arg : args) {
         argNames.push_back(arg.Name);
         if (!PopNamedNode(arg.Name)) {
-            return std::unexpected(ESQLError::Basic);
+            ret = std::unexpected(ESQLError::Basic);
         }
     }
     if (!ret) {
-        return std::unexpected(ESQLError::Basic);
+        return std::unexpected(ret.error());
     }
 
     auto lambdaNode = BuildSqlLambda(pos, std::move(argNames), std::move(exprSeq));
@@ -1763,19 +1763,19 @@ bool TSqlExpression::SqlLambdaParams(const TNodePtr& node, TVector<TSymbolNameWi
     return true;
 }
 
-bool TSqlExpression::SqlLambdaExprBody(TContext& ctx, const TRule_expr& node, TVector<TNodePtr>& exprSeq) {
+TSQLStatus TSqlExpression::SqlLambdaExprBody(TContext& ctx, const TRule_expr& node, TVector<TNodePtr>& exprSeq) {
     Y_UNUSED(ctx);
 
     TSqlExpression expr(*this);
-    TNodePtr nodeExpr = Unwrap(expr.Build(node));
+    auto nodeExpr = expr.Build(node);
     if (!nodeExpr) {
-        return false;
+        return std::unexpected(nodeExpr.error());
     }
-    exprSeq.push_back(nodeExpr);
-    return true;
+    exprSeq.push_back(*nodeExpr);
+    return {};
 }
 
-bool TSqlExpression::SqlLambdaExprBody(TContext& ctx, const TRule_lambda_body& node, TVector<TNodePtr>& exprSeq) {
+TSQLStatus TSqlExpression::SqlLambdaExprBody(TContext& ctx, const TRule_lambda_body& node, TVector<TNodePtr>& exprSeq) {
     TSqlExpression expr(*this);
     expr.SetPure(true);
     TVector<TString> localNames;
@@ -1825,22 +1825,22 @@ bool TSqlExpression::SqlLambdaExprBody(TContext& ctx, const TRule_lambda_body& n
         }
     }
 
-    TNodePtr nodeExpr;
+    TNodeResult nodeExpr = std::unexpected(ESQLError::Basic);
     if (!hasError) {
-        nodeExpr = Unwrap(expr.Build(node.GetRule_expr4()));
+        nodeExpr = expr.Build(node.GetRule_expr4());
     }
 
     for (const auto& name : localNames) {
         if (!PopNamedNode(name)) {
-            return false;
+            nodeExpr = std::unexpected(ESQLError::Basic);
         }
     }
 
     if (!nodeExpr) {
-        return false;
+        return std::unexpected(nodeExpr.error());
     }
-    exprSeq.push_back(nodeExpr);
-    return true;
+    exprSeq.push_back(*nodeExpr);
+    return {};
 }
 
 TNodeResult TSqlExpression::SubExpr(const TRule_con_subexpr& node, const TTrailingQuestions& tail) {

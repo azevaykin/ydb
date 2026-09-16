@@ -76,8 +76,8 @@ private:
     TNodeResult UnaryExpr(const TUnarySubExprRule& node, const TTrailingQuestions& tail);
 
     bool SqlLambdaParams(const TNodePtr& node, TVector<TSymbolNameWithPos>& args, ui32& optionalArgumentsCount);
-    bool SqlLambdaExprBody(TContext& ctx, const TRule_lambda_body& node, TVector<TNodePtr>& exprSeq);
-    bool SqlLambdaExprBody(TContext& ctx, const TRule_expr& node, TVector<TNodePtr>& exprSeq);
+    [[nodiscard]] TSQLStatus SqlLambdaExprBody(TContext& ctx, const TRule_lambda_body& node, TVector<TNodePtr>& exprSeq);
+    [[nodiscard]] TSQLStatus SqlLambdaExprBody(TContext& ctx, const TRule_expr& node, TVector<TNodePtr>& exprSeq);
 
     TNodePtr KeyExpr(const TRule_key_expr& node) {
         TSqlExpression expr(*this);

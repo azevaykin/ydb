@@ -4,7 +4,72 @@
 
 using namespace NSQLTranslationV1;
 
+namespace {
+
+void CheckUnsupportedFactoryLambda(TStringBuf mode, bool blockBody, bool localNames = false) {
+    NSQLTranslation::TTranslationSettings settings;
+    settings.LangVer = NYql::NFeature::YqlSelect.MinLangVer;
+
+    TStringBuilder query;
+    query << "PRAGMA YqlSelect = '" << mode << "';\n"
+          << "$factory = ($seed) -> ";
+    if (blockBody) {
+        query << "{ ";
+        if (localNames) {
+            query << "$local = $seed; $identity = ($item) -> ($item + $local); ";
+        }
+        query << "RETURN ";
+    } else {
+        query << "(";
+    }
+    query << R"sql(AggregationFactory("UDAF",
+        ($item, $parent) -> ($item + $seed),
+        ($state, $item, $parent) -> ($state + $item),
+        ($left, $right) -> ($left + $right),
+        ($state) -> ($state),
+        ($state) -> ($state),
+        ($state) -> ($state)))sql";
+    query << (blockBody ? "; };\n" : ");\n");
+    if (localNames) {
+        query << "$local = 0; $identity = ($item) -> ($item + $local);\n";
+    }
+    query << "SELECT AGGREGATE_BY(value, $factory(0)) FROM plato.Input;";
+
+    auto res = SqlToYqlWithSettings(query, settings);
+    if (mode == "force") {
+        UNIT_ASSERT(!res.IsOk());
+        UNIT_ASSERT_STRING_CONTAINS(Err2Str(res), "YqlSelect unsupported: Aggregation");
+        UNIT_ASSERT(!Err2Str(res).Contains("EnsureUnwrappable"));
+    } else {
+        UNIT_ASSERT_C(res.IsOk(), Err2Str(res));
+        TWordCountHive stat = {{TString("YqlSelect"), 0}};
+        VerifyProgram(res, stat);
+        UNIT_ASSERT_VALUES_EQUAL(stat["YqlSelect"], 0);
+    }
+}
+
+} // namespace
+
 Y_UNIT_TEST_SUITE(YqlSelect) {
+
+Y_UNIT_TEST(UnsupportedFactoryLambdaAuto) {
+    CheckUnsupportedFactoryLambda("auto", false);
+    CheckUnsupportedFactoryLambda("auto", true);
+}
+
+Y_UNIT_TEST(UnsupportedFactoryLambdaForce) {
+    CheckUnsupportedFactoryLambda("force", false);
+    CheckUnsupportedFactoryLambda("force", true);
+}
+
+Y_UNIT_TEST(UnsupportedFactoryLambdaDisable) {
+    CheckUnsupportedFactoryLambda("disable", false);
+    CheckUnsupportedFactoryLambda("disable", true);
+}
+
+Y_UNIT_TEST(UnsupportedFactoryLambdaLocalNames) {
+    CheckUnsupportedFactoryLambda("auto", true, true);
+}
 
 Y_UNIT_TEST(LangVer) {
     NSQLTranslation::TTranslationSettings settings;
