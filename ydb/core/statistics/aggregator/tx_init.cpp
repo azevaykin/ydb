@@ -7,18 +7,22 @@
 
 #include <util/string/vector.h>
 
+#include <algorithm>
+
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::STATISTICS
 
 namespace NKikimr::NStat {
 
 struct TStatisticsAggregator::TTxInit : public TTxBase {
+    std::vector<TString> InterruptedSamples;
+
     explicit TTxInit(TSelf* self)
         : TTxBase(self)
     {}
 
     TTxType GetTxType() const override { return TXTYPE_INIT; }
 
-    bool Execute(TTransactionContext& txc, const TActorContext&) override {
+    bool Execute(TTransactionContext& txc, const TActorContext& ctx) override {
         YDB_LOG_DEBUG("TTxInit::Execute",
             {"tabletId", Self->TabletID()});
 
@@ -278,6 +282,33 @@ struct TStatisticsAggregator::TTxInit : public TTxBase {
                 {"tablesCount", size});
         }
 
+        // A seed reproduces draws only within an unchanged layout. Without the
+        // completed work items and continuation state, restarting would redraw
+        // part of an active sample after compaction or a split.
+        InterruptedSamples.clear();
+        for (const auto& operation : Self->ForceTraversals) {
+            if (IsTerminalAnalyzeState(operation.State)) {
+                continue;
+            }
+            const bool interrupted = std::any_of(operation.Tables.begin(), operation.Tables.end(),
+                [](const TForceTraversalTable& table) {
+                    return table.SampleRate < 1.0
+                        && table.Status != TForceTraversalTable::EStatus::None
+                        && table.Status != TForceTraversalTable::EStatus::TraversalFinished;
+                });
+            if (interrupted) {
+                InterruptedSamples.push_back(operation.OperationId);
+            }
+        }
+        for (const auto& operationId : InterruptedSamples) {
+            Self->MarkForceTraversalOperationFinished(operationId,
+                Ydb::Table::AnalyzeState::STATE_FAILED, ctx.Now(), db,
+                {NYql::TIssue("ANALYZE SAMPLE cannot resume after statistics aggregator restart")});
+            if (Self->ForceTraversalOperationId == operationId) {
+                Self->ResetTraversalState(db);
+            }
+        }
+
         return true;
     }
 
@@ -286,6 +317,20 @@ struct TStatisticsAggregator::TTxInit : public TTxBase {
             {"tabletId", Self->TabletID()});
 
         Self->SignalTabletActive(ctx);
+
+        for (const auto& operationId : InterruptedSamples) {
+            auto* operation = Self->ForceTraversalOperation(operationId);
+            if (operation && operation->ReplyToActorId) {
+                auto response = std::make_unique<TEvStatistics::TEvAnalyzeResponse>();
+                response->Record.SetOperationId(operationId);
+                response->Record.SetStatus(NKikimrStat::TEvAnalyzeResponse::STATUS_ERROR);
+                for (const auto& issue : operation->Issues) {
+                    NYql::IssueToMessage(issue, response->Record.AddIssues());
+                }
+                ctx.Send(operation->ReplyToActorId, response.release());
+                operation->ReplyToActorId = {};
+            }
+        }
 
         Self->EnableStatistics = AppData(ctx)->FeatureFlags.GetEnableStatistics();
         Self->EnableColumnStatistics = AppData(ctx)->FeatureFlags.GetEnableColumnStatistics();

@@ -25,6 +25,21 @@ static TString SerializeColumnTags(const TColumnTags& tags) {
     return {};
 }
 
+static bool IsCompleteSamplingMetadata(const NKikimrStat::TSamplingStatistics& sampling) {
+    if (!sampling.HasRequestedRate() || !sampling.HasSampleRows()) {
+        return false;
+    }
+    switch (sampling.GetMethod()) {
+        case NKikimrStat::TSamplingStatistics::METHOD_UNSPECIFIED: // Older shard-subset samples.
+        case NKikimrStat::TSamplingStatistics::SHARD_SUBSET:
+            return sampling.HasEligibleUnits() && sampling.HasSelectedUnits();
+        case NKikimrStat::TSamplingStatistics::PK_UNIT_BERNOULLI:
+            return sampling.HasEffectiveRate() && sampling.HasSeed();
+        default:
+            return false;
+    }
+}
+
 class TStatisticsTableCreator : public TActorBootstrapped<TStatisticsTableCreator> {
 public:
     explicit TStatisticsTableCreator(std::unique_ptr<NActors::IEventBase> resultEvent, const TString& database)
@@ -110,7 +125,7 @@ public:
         , PathId(pathId)
     {
         for (auto& item : items) {
-            if (item.Sampling) {
+            if (item.Sampling || item.ClearSampledData) {
                 SampledItems.push_back(std::move(item));
             } else {
                 FullItems.push_back(std::move(item));
@@ -132,7 +147,7 @@ public:
         sql << R"(
             DECLARE $rows AS List<Struct<
                 column_tags: String,
-                data: String,
+                data: String?,
                 local_path_id: Uint64,
                 owner_id: Uint64,
                 stat_type: Uint32
@@ -162,13 +177,15 @@ public:
             row.AddMember("local_path_id").Uint64(PathId.LocalPathId);
             row.AddMember("owner_id").Uint64(PathId.OwnerId);
             row.AddMember("stat_type").Uint32(static_cast<ui32>(item.Type));
-            if (item.Sampling) {
+            if (item.ClearSampledData) {
+                row.AddMember("data").EmptyOptional(NYdb::EPrimitiveType::String);
+            } else if (item.Sampling) {
                 NKikimrStat::TSampledStatistic payload;
                 *payload.MutableSampling() = *item.Sampling;
                 payload.SetData(item.Data);
-                row.AddMember("data").String(payload.SerializeAsString());
+                row.AddMember("data").OptionalString(payload.SerializeAsString());
             } else {
-                row.AddMember("data").String(item.Data);
+                row.AddMember("data").OptionalString(item.Data);
             }
             row.EndStruct();
         }
@@ -316,8 +333,7 @@ void DispatchLoadStatisticsQuery(
                     const auto sampledData = parser.ColumnParser("sampled_data").GetOptionalString();
                     NKikimrStat::TSampledStatistic payload;
                     if (sampledData && payload.ParseFromString(*sampledData) && payload.HasData() && payload.HasSampling()
-                            && payload.GetSampling().HasRequestedRate() && payload.GetSampling().HasEligibleUnits()
-                            && payload.GetSampling().HasSelectedUnits() && payload.GetSampling().HasSampleRows()) {
+                            && IsCompleteSamplingMetadata(payload.GetSampling())) {
                         query_response->Data = std::move(*payload.MutableData());
                         query_response->Sampling = std::move(*payload.MutableSampling());
                     }

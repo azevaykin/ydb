@@ -40,7 +40,11 @@ struct TStatisticsAggregator::TTxAnalyzeDeadline : public TTxBase {
             } else {
                 if (operation.CreatedAt + Self->AnalyzeDeadline < now) {
                     if (Self->ForceTraversalOperationId == operation.OperationId) {
-                        ActiveDeadlineOperationId = operation.OperationId;
+                        // Once publication is submitted, only its result can
+                        // tell whether the sample has become visible.
+                        if (!Self->IsSampledTraversal() || !Self->SaveQueryActorId) {
+                            ActiveDeadlineOperationId = operation.OperationId;
+                        }
                     } else {
                         toFailDeadline.push_back(operation.OperationId);
                     }

@@ -8,6 +8,8 @@ namespace NKikimr::NStat {
 
 struct TStatisticsAggregator::TTxScheduleTraversal : public TTxBase {
     const bool ForceTraversal;
+    TString AnalyzeOperationId;
+    TPathId AnalyzePathId;
 
     TTxScheduleTraversal(TSelf* self, bool forceTraversal)
         : TTxBase(self)
@@ -17,6 +19,8 @@ struct TStatisticsAggregator::TTxScheduleTraversal : public TTxBase {
     TTxType GetTxType() const override { return TXTYPE_SCHEDULE_TRAVERSAL; }
 
     bool Execute(TTransactionContext& txc, const TActorContext& ctx) override {
+        AnalyzeOperationId.clear();
+        AnalyzePathId = {};
 
         if (!Self->EnableColumnStatistics) {
             YDB_LOG_TRACE("Column statistics disabled, won't schedule traversals",
@@ -39,7 +43,10 @@ struct TStatisticsAggregator::TTxScheduleTraversal : public TTxBase {
         NIceDb::TNiceDb db(txc.DB);
 
         // First try to dispatch a table analyze operation.
-        Self->ScheduleNextAnalyze(db, ctx);
+        if (Self->ScheduleNextAnalyze(db)) {
+            AnalyzeOperationId = Self->ForceTraversalOperationId;
+            AnalyzePathId = Self->TraversalPathId;
+        }
 
         // Avoid immediate retries of failed background scans.
         if (!ForceTraversal
@@ -52,9 +59,17 @@ struct TStatisticsAggregator::TTxScheduleTraversal : public TTxBase {
         return true;
     }
 
-    void Complete(const TActorContext&) override {
+    void Complete(const TActorContext& ctx) override {
         YDB_LOG_TRACE("TTxScheduleTraversal::Complete",
             {"tabletId", Self->TabletID()});
+
+        // Persist AnalyzeStarted before any reads: otherwise a restart between
+        // scan dispatch and this commit could silently redraw the same sample.
+        if (AnalyzePathId && Self->TraversalPathId == AnalyzePathId
+                && Self->ForceTraversalOperationId == AnalyzeOperationId
+                && !Self->FinishingTraversal && !Self->AnalyzeActorId) {
+            Self->StartAnalyzeActor(ctx, AnalyzeOperationId, Self->TraversalDatabase, AnalyzePathId);
+        }
 
         Self->ResolveStatisticsTablePathId();
         if (!ForceTraversal) {

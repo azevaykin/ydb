@@ -69,6 +69,16 @@ struct TStatisticsAggregator::TTxAnalyzeOpCancel : public TTxBase {
             return;
         }
 
+        if (IsActive && Self->ForceTraversalOperationId == operationId
+                && Self->IsSampledTraversal() && Self->SaveQueryActorId) {
+            rec.SetStatus(Ydb::StatusIds::PRECONDITION_FAILED);
+            auto& issue = *rec.AddIssues();
+            issue.set_severity(NYql::TSeverityIds::S_ERROR);
+            issue.set_message("ANALYZE SAMPLE publication is already in progress");
+            ctx.Send(Request->Sender, response.Release(), 0, Request->Cookie);
+            return;
+        }
+
         rec.SetStatus(Ydb::StatusIds::SUCCESS);
         ctx.Send(Request->Sender, response.Release(), 0, Request->Cookie);
 

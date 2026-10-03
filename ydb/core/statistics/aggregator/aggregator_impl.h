@@ -150,6 +150,8 @@ private:
 
     void InitializeStatisticsTable();
     void SaveStatisticsToTable();
+    void SaveStatisticsToTableAtomic();
+    bool IsSampledTraversal();
     void DeleteStatisticsFromTable();
 
     void DispatchFinishTraversalTx(
@@ -163,7 +165,7 @@ private:
         const TPathId& pathId, const TVector<ui32>& columnTags = {});
 
     void ResetTraversalState(NIceDb::TNiceDb& db);
-    void ScheduleNextAnalyze(NIceDb::TNiceDb& db, const TActorContext& ctx);
+    bool ScheduleNextAnalyze(NIceDb::TNiceDb& db);
     void ScheduleNextBackgroundTraversal(NIceDb::TNiceDb& db, const TActorContext& ctx);
     void FinishTraversal(
         NIceDb::TNiceDb& db,

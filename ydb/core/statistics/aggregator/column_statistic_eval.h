@@ -12,6 +12,7 @@ class TSelectBuilder;
 class TSimpleColumnStatisticEval {
     NScheme::TTypeInfo Type;
     TString PgTypeMod;
+    bool Sampled;
 
     std::optional<ui32> CountDistinctSeq;
     std::optional<ui32> MinSeq;
@@ -23,7 +24,7 @@ class TSimpleColumnStatisticEval {
 public:
     using TPtr = std::unique_ptr<TSimpleColumnStatisticEval>;
 
-    TSimpleColumnStatisticEval(NScheme::TTypeInfo type, TString pgTypeMod);
+    TSimpleColumnStatisticEval(NScheme::TTypeInfo type, TString pgTypeMod, bool sampled = false);
     ~TSimpleColumnStatisticEval();
 
     EStatType GetType() const;
@@ -44,6 +45,8 @@ public:
         EStatType,
         const NKikimrStat::TSimpleColumnStatistics&,
         const NScheme::TTypeInfo&);
+    // Fixed-size statistics that need no preliminary count/distinct-count scan.
+    static TPtr CreateSampled(EStatType);
     static bool AreMinMaxNeeded(const NScheme::TTypeInfo&);
 
     virtual EStatType GetType() const = 0;
@@ -64,6 +67,7 @@ public:
     struct THistogramSizing {
         ui32 OversampleFactor = 8;      // f, so C = f * B
         ui64 MaxStateBytes = 4u << 20;
+        bool Sampled = false;
     };
 
     static TVector<EStatType> SupportedMultiColumnTypes();
@@ -79,7 +83,8 @@ public:
     virtual size_t EstimateSize() const = 0;
     virtual void AddAggregations(TSelectBuilder&) = 0;
     virtual void Merge(const TVector<NYdb::TValue>& aggColumns) = 0;
-    // nullopt == "no statistic for this table"; the caller stores no row at all.
+    // nullopt means no usable statistic. Sampled runs must clear a previous
+    // sampled value as part of the atomic publication.
     virtual std::optional<TString> ExtractData(const TVector<NYdb::TValue>& aggColumns) = 0;
     virtual ~IMultiColumnStatisticEval() = default;
 };

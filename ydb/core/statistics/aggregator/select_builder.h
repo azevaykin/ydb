@@ -31,6 +31,10 @@ enum class ETupleEncoding {
 // Class that is used to build internal SELECT queries used to calculate column statistics.
 class TSelectBuilder {
 public:
+    struct TSampling {
+        double Rate;
+        ui64 Seed;
+    };
     // If isIntermediateAggregation is true, results of several SELECTs over different
     // parts of the table are expected to be combined into the final result.
     // UDAFs won't finalize their result and will return an intermediate aggregation state
@@ -57,7 +61,8 @@ public:
         const TStringBuf& table,
         std::optional<ui64> tabletId = {},
         const TStringBuf& where = {},
-        const TStringBuf& declares = {}) const;
+        const TStringBuf& declares = {},
+        std::optional<TSampling> sampling = {}) const;
 
     size_t ColumnCount() const {
         return Columns.size();
@@ -124,13 +129,16 @@ template<typename... TArgs>
 ui32 TSelectBuilder::AddUDAFAggregationTuple(std::vector<TString> columnNames, ETupleEncoding encoding,
                                              const TStringBuf& udafName, TArgs&&... params) {
     auto factory = AddFactory(udafName, sizeof...(params));
-    return PushColumn(TAggColumn{
+    TAggColumn column{
         .TupleColumnNames = std::move(columnNames),
         .TupleEncoding = encoding,
         .UdafFactory = factory,
+    };
+    if constexpr (sizeof...(params) > 0) {
         // TODO: parameters escaping/binding
-        .Params = Join(',', params...),
-    });
+        column.Params = Join(',', params...);
+    }
+    return PushColumn(std::move(column));
 }
 
 } // NKikimr::NStat

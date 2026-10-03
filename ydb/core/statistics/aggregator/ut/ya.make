@@ -35,6 +35,7 @@ SRCS(
     ut_analyze_op.cpp
     ut_key_range_predicate.cpp
     ut_analyze_sampling.cpp
+    ut_column_statistic_eval.cpp
 )
 
 END()

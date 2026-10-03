@@ -30,6 +30,8 @@ class TEqHeightHistogram;
 
 namespace NStat {
 
+inline constexpr ui64 MaxStatisticsBatchSize = 30ull << 20;
+
 struct TStatSimple {
     ui64 RowCount = 0;
     ui64 BytesSize = 0;
@@ -141,6 +143,9 @@ struct TStatisticsItem {
     EStatType Type;
     TString Data;
     std::optional<NKikimrStat::TSamplingStatistics> Sampling;
+    // Omitted sampled histograms must not leave an older sample visible.
+    // The full statistic, if any, is preserved.
+    bool ClearSampledData = false;
 };
 
 struct TEvStatistics {

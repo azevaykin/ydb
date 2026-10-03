@@ -11,6 +11,7 @@ using TAllAggFuncsList = TTypeList<
     TCMSAggFunc,
     TEWHAggFunc,
     TEQHAggFunc,
+    TEQHSampledAggFunc,
     THLLAggFunc
 >;
 

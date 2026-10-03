@@ -116,6 +116,12 @@ void TStatisticsAggregator::DispatchFinishTraversalTx(
     if (FinishingTraversal || (!TraversalPathId && !ForceTraversalOperationId)) {
         return;
     }
+    if (IsSampledTraversal() && SaveQueryActorId) {
+        // The commit may already have succeeded. Let the save response settle
+        // the operation instead of reporting a cancellation or deadline failure
+        // followed by a late publication.
+        return;
+    }
     FinishingTraversal = true;
     Execute(
         new TTxFinishTraversal(this, status, std::move(issues)),

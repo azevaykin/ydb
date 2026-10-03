@@ -32,6 +32,7 @@ public:
         ui32 HistogramOversampleFactor = 8;
         ui64 HistogramMaxStateBytes = 4u << 20;
         double SampleRate = 1.0;
+        TInstant Deadline;
     };
 
 private:
@@ -153,7 +154,10 @@ private:
     TVector<TScanWorkItem> RangeWorkItems;
 
     bool SamplingRequested() const { return Config.SampleRate < 1.0; }
+    bool RowSamplingRequested() const { return SamplingRequested() && !IsColumnTable; }
     ui64 EligibleUnits = 0;
+    ui64 SamplingSeed = 0;
+    TInstant StartedAt;
 
     ui32 PartitionedScanCount() const {
         return ScanMode == EScanMode::PerRange
@@ -199,6 +203,8 @@ private:
     };
 
     std::queue<TColumnStatEvalTask> PendingTasks;
+    bool PrepareSampledTasks();
+    size_t NextRangeWorkItem = 0;
 
     std::optional<TSelectBuilder> SelectBuilder;
     std::optional<ui32> CountSeq;
@@ -215,6 +221,7 @@ private:
 
     struct TScanActorInfo {
         ui32 TabletNodeId = 0;
+        ui32 ShardCount = 1;
     };
     THashMap<TActorId, TScanActorInfo> ScanActorsInFlight;
 

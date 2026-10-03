@@ -22,18 +22,21 @@ namespace NKikimr::NStat {
 struct TSimpleColumnStatisticEval::TIntermediateState {
     using THLLState = NAggFuncs::THybridHyperLogLog<std::allocator>;
 
-    THLLState Hll;
+    std::optional<THLLState> Hll;
     std::optional<NYdb::TValue> Min;
     std::optional<NYdb::TValue> Max;
 
-    TIntermediateState()
-        : Hll(THLLState::Create(NAggFuncs::THLLAggFunc::DEFAULT_PRECISION))
-    {}
+    explicit TIntermediateState(bool sampled) {
+        if (!sampled) {
+            Hll.emplace(THLLState::Create(NAggFuncs::THLLAggFunc::DEFAULT_PRECISION));
+        }
+    }
 };
 
-TSimpleColumnStatisticEval::TSimpleColumnStatisticEval(NScheme::TTypeInfo type, TString pgTypeMod)
+TSimpleColumnStatisticEval::TSimpleColumnStatisticEval(NScheme::TTypeInfo type, TString pgTypeMod, bool sampled)
     : Type(std::move(type))
     , PgTypeMod(std::move(pgTypeMod))
+    , Sampled(sampled)
 {}
 
 TSimpleColumnStatisticEval::~TSimpleColumnStatisticEval() = default;
@@ -43,16 +46,18 @@ EStatType TSimpleColumnStatisticEval::GetType() const {
 }
 
 size_t TSimpleColumnStatisticEval::EstimateSize() const {
-    return 1u << NAggFuncs::THLLAggFunc::DEFAULT_PRECISION;
+    return Sampled ? 1u << 10 : 1u << NAggFuncs::THLLAggFunc::DEFAULT_PRECISION;
 }
 
 void TSimpleColumnStatisticEval::AddAggregations(
         const TString& columnName, TSelectBuilder& builder) {
     if (builder.IsIntermediateAggregation()) {
-        IntermediateState = std::make_unique<TIntermediateState>();
-        CountDistinctSeq = builder.AddUDAFAggregation(columnName, "HLL");
-    } else {
-        CountDistinctSeq = builder.AddBuiltinAggregation(columnName, "HLL");
+        IntermediateState = std::make_unique<TIntermediateState>(Sampled);
+    }
+    if (!Sampled) {
+        CountDistinctSeq = builder.IsIntermediateAggregation()
+            ? builder.AddUDAFAggregation(columnName, "HLL")
+            : builder.AddBuiltinAggregation(columnName, "HLL");
     }
 
     if (IStage2ColumnStatisticEval::AreMinMaxNeeded(Type)) {
@@ -63,6 +68,9 @@ void TSimpleColumnStatisticEval::AddAggregations(
 
 template<template<typename> class TCmp>
 static void UpdateMinmax(std::optional<NYdb::TValue>& left, const NYdb::TValue& right) {
+    if (right.GetProto().has_null_flag_value()) {
+        return;
+    }
     if (!left) {
         left = right;
         return;
@@ -110,7 +118,7 @@ static void UpdateMinmax(std::optional<NYdb::TValue>& left, const NYdb::TValue& 
 void TSimpleColumnStatisticEval::Merge(const TVector<NYdb::TValue>& aggColumns) {
     Y_ENSURE(IntermediateState);
 
-    {
+    if (CountDistinctSeq) {
         NYdb::TValueParser hllVal(aggColumns.at(CountDistinctSeq.value()));
         hllVal.OpenOptional();
         if (hllVal.IsNull()) {
@@ -118,7 +126,7 @@ void TSimpleColumnStatisticEval::Merge(const TVector<NYdb::TValue>& aggColumns) 
         }
         TMemoryInput is(hllVal.GetBytes().data(), hllVal.GetBytes().size());
         auto hll = TIntermediateState::THLLState::Load(is);
-        IntermediateState->Hll.Merge(hll);
+        IntermediateState->Hll->Merge(hll);
     }
 
     if (MinSeq) {
@@ -141,7 +149,9 @@ NKikimrStat::TSimpleColumnStatistics TSimpleColumnStatisticEval::Extract(
 
     if (IntermediateState) {
         Merge(aggColumns);
-        result.SetCountDistinct(IntermediateState->Hll.Estimate());
+        if (IntermediateState->Hll) {
+            result.SetCountDistinct(IntermediateState->Hll->Estimate());
+        }
         if (IntermediateState->Min) {
             result.MutableMin()->CopyFrom(IntermediateState->Min->GetProto());
         }
@@ -149,9 +159,11 @@ NKikimrStat::TSimpleColumnStatistics TSimpleColumnStatisticEval::Extract(
             result.MutableMax()->CopyFrom(IntermediateState->Max->GetProto());
         }
     } else {
-        NYdb::TValueParser hllVal(aggColumns.at(CountDistinctSeq.value()));
-        ui64 countDistinct = hllVal.GetOptionalUint64().value_or(0);
-        result.SetCountDistinct(countDistinct);
+        if (CountDistinctSeq) {
+            NYdb::TValueParser hllVal(aggColumns.at(*CountDistinctSeq));
+            ui64 countDistinct = hllVal.GetOptionalUint64().value_or(0);
+            result.SetCountDistinct(countDistinct);
+        }
 
         if (MinSeq) {
             result.MutableMin()->CopyFrom(aggColumns.at(*MinSeq).GetProto());
@@ -174,6 +186,9 @@ public:
     static constexpr ui64 MIN_WIDTH = 4096;
     static constexpr ui64 DEFAULT_DEPTH = 8;
     static constexpr double RELATIVE_ERROR = 10;
+    static constexpr size_t SAMPLED_MAX_BYTES = 64u << 10;
+    static constexpr ui64 SAMPLED_WIDTH =
+        (SAMPLED_MAX_BYTES - sizeof(TCountMinSketch)) / (DEFAULT_DEPTH * sizeof(ui32));
 
     explicit TCountMinSketchState(ui64 width) : Width(width) {}
 
@@ -282,13 +297,19 @@ class TMultiColumnCountMinSketchEval : public IMultiColumnStatisticEval {
     TCountMinSketchState Sketch;
 
 public:
-    TMultiColumnCountMinSketchEval(std::vector<TString> columnNames, std::vector<ui32> columnIds, ui64 width)
+    TMultiColumnCountMinSketchEval(std::vector<TString> columnNames, std::vector<ui32> columnIds,
+                                  ui64 width)
         : ColumnNames(std::move(columnNames))
         , ColumnIds(std::move(columnIds))
         , Sketch(width)
     {}
 
-    static TPtr MaybeCreate(std::vector<TString> columnNames, std::vector<ui32> columnIds, ui64 rowCount) {
+    static TPtr MaybeCreate(std::vector<TString> columnNames, std::vector<ui32> columnIds,
+                           ui64 rowCount, bool sampled) {
+        if (sampled) {
+            return std::make_unique<TMultiColumnCountMinSketchEval>(
+                std::move(columnNames), std::move(columnIds), TCountMinSketchState::SAMPLED_WIDTH);
+        }
         if (rowCount == 0) {
             // Empty table
             return TPtr{};
@@ -551,6 +572,13 @@ IStage2ColumnStatisticEval::TPtr IStage2ColumnStatisticEval::MaybeCreate(
     }
 }
 
+IStage2ColumnStatisticEval::TPtr IStage2ColumnStatisticEval::CreateSampled(EStatType statType) {
+    if (statType == EStatType::COUNT_MIN_SKETCH) {
+        return std::make_unique<TCMSEval>(TCountMinSketchState::SAMPLED_WIDTH);
+    }
+    return {};
+}
+
 bool IStage2ColumnStatisticEval::AreMinMaxNeeded(const NScheme::TTypeInfo& typeInfo) {
     return TEWHEval::GetHistogramType(typeInfo.GetTypeId()).Defined();
 }
@@ -572,19 +600,27 @@ class TMultiColumnEqHeightHistogramEval : public IMultiColumnStatisticEval {
     std::vector<TString> ColumnNames;
     std::vector<ui32> ColumnIds;
     TEqHeightHistogramBuilder::TParams Params;
+    bool Sampled;
     std::optional<ui32> Seq;
     std::unique_ptr<TEqHeightHistogramBuilder> IntermediateState;
+    std::unique_ptr<NAggFuncs::TEQHSampledAggFunc::TState> SampledIntermediateState;
 
 public:
     TMultiColumnEqHeightHistogramEval(std::vector<TString> columnNames, std::vector<ui32> columnIds,
-                                     TEqHeightHistogramBuilder::TParams params)
+                                     TEqHeightHistogramBuilder::TParams params, bool sampled)
         : ColumnNames(std::move(columnNames))
         , ColumnIds(std::move(columnIds))
         , Params(std::move(params))
+        , Sampled(sampled)
     {}
 
     static TPtr MaybeCreate(std::vector<TString> columnNames, std::vector<ui32> columnIds,
                             ui64 rowCount, const THistogramSizing& sizing) {
+        if (sizing.Sampled) {
+            return std::make_unique<TMultiColumnEqHeightHistogramEval>(
+                std::move(columnNames), std::move(columnIds),
+                TEqHeightHistogramBuilder::TParams{}, true);
+        }
         if (rowCount == 0) {
             return TPtr{};   // empty table
         }
@@ -605,7 +641,7 @@ public:
                 .NumBuckets = numBuckets,
                 .EmissionRate = emissionRate,
                 .MaxStateBytes = sizing.MaxStateBytes,
-            });
+            }, false);
         // Deliberately no width-based rejection here: key width is unknown until the scan runs,
         // so the MIN_ENTRIES guard lives in Finalize().
     }
@@ -616,6 +652,9 @@ public:
     // Scan-batch budget: typical serialized summary is ~EmissionRate entries.
     // Cap at MaxStateBytes (Compact's hard ceiling).
     size_t EstimateSize() const final {
+        if (Sampled) {
+            return NAggFuncs::TEQHSampledAggFunc::MaxStateBytes;
+        }
         constexpr size_t assumedAverageKeyWidth = 128;
         const size_t typical =
             static_cast<size_t>(std::max(Params.NumBuckets, Params.EmissionRate)) * assumedAverageKeyWidth;
@@ -623,22 +662,34 @@ public:
     }
 
     void AddAggregations(TSelectBuilder& builder) final {
-        Seq = builder.AddUDAFAggregationTuple(ColumnNames, ETupleEncoding::PresortKey, "EQH",
-            Ui32Literal(Params.NumBuckets), Ui32Literal(Params.EmissionRate),
-            Ui64Literal(Params.MaxStateBytes));
+        if (Sampled) {
+            Seq = builder.AddUDAFAggregationTuple(ColumnNames, ETupleEncoding::PresortKey, "EQHSampled");
+        } else {
+            Seq = builder.AddUDAFAggregationTuple(ColumnNames, ETupleEncoding::PresortKey, "EQH",
+                Ui32Literal(Params.NumBuckets), Ui32Literal(Params.EmissionRate), Ui64Literal(Params.MaxStateBytes));
+        }
         if (builder.IsIntermediateAggregation()) {
-            IntermediateState = std::make_unique<TEqHeightHistogramBuilder>(Params);
+            if (Sampled) {
+                SampledIntermediateState = std::make_unique<NAggFuncs::TEQHSampledAggFunc::TState>();
+            } else {
+                IntermediateState = std::make_unique<TEqHeightHistogramBuilder>(Params);
+            }
         }
     }
 
     void Merge(const TVector<NYdb::TValue>& aggColumns) final {
-        Y_ENSURE(IntermediateState);
+        Y_ENSURE(IntermediateState || SampledIntermediateState);
         NYdb::TValueParser val(aggColumns.at(Seq.value()));
         val.OpenOptional();
         if (val.IsNull()) {
             return;
         }
         const auto& bytes = val.GetBytes();
+        if (SampledIntermediateState) {
+            SampledIntermediateState->Merge(
+                NAggFuncs::TEQHSampledAggFunc::DeserializeState(bytes.data(), bytes.size()));
+            return;
+        }
         TEqHeightHistogramIntermediateState state;
         Y_ENSURE(state.ParseFromArray(bytes.data(), bytes.size()),
             "truncated or malformed EQ_HEIGHT_HISTOGRAM intermediate state");
@@ -646,9 +697,10 @@ public:
     }
 
     std::optional<TString> ExtractData(const TVector<NYdb::TValue>& aggColumns) final {
-        if (IntermediateState) {
+        if (IntermediateState || SampledIntermediateState) {
             Merge(aggColumns);
-            auto result = IntermediateState->Finalize();
+            auto result = SampledIntermediateState
+                ? SampledIntermediateState->Finalize() : IntermediateState->Finalize();
             return result.Defined()
                 ? std::optional(result->SerializeAsString())
                 : std::nullopt;
@@ -690,7 +742,7 @@ IMultiColumnStatisticEval::TPtr IMultiColumnStatisticEval::MaybeCreate(
     switch (statType) {
     case EStatType::COUNT_MIN_SKETCH:
         return TMultiColumnCountMinSketchEval::MaybeCreate(
-            std::move(columnNames), std::move(columnIds), rowCount);
+            std::move(columnNames), std::move(columnIds), rowCount, sizing.Sampled);
     case EStatType::EQ_HEIGHT_HISTOGRAM:
         return TMultiColumnEqHeightHistogramEval::MaybeCreate(
             std::move(columnNames), std::move(columnIds), rowCount, sizing);

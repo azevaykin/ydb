@@ -4,6 +4,7 @@
 #include "kqp_partition_helper.h"
 
 #include <ydb/core/base/appdata.h>
+#include <ydb/core/base/sampling.h>
 #include <ydb/library/json_index/json_index.h>
 #include <ydb/core/base/feature_flags.h>
 #include <ydb/core/base/table_index.h>
@@ -3588,7 +3589,6 @@ size_t TKqpTasksGraph::BuildAllTasks(std::optional<TLlvmSettings> llvmSettings,
     const TVector<NKikimrKqp::TKqpNodeResources>& resourcesSnapshot, TQueryExecutionStats* stats,
     const TPlacementParams& placementParams)
 {
-    constexpr ui32 SampledShardsPerScan = 12;
     TVector<TStageInfo*> samplingStages;
     for (auto& [_, stageInfo] : GetStagesInfo()) {
         const auto& stage = stageInfo.Meta.GetStage(stageInfo.Id);

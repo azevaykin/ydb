@@ -1520,11 +1520,16 @@ private:
             return result;
         }
 
-        if (SessionCtx->Config().GetEnableNewRBO() && HasSamplingRead(queryExpr)) {
-            // RBO read operators do not preserve sampling settings. Select the
-            // legacy pipeline before optimization, independently of error fallback.
-            SessionCtx->ConfigPtr()->SetEnableNewRBO(false);
-            TypesCtx->IgnoreExpandPg = false;
+        if (HasSamplingRead(queryExpr)) {
+            // Sampling is implemented by the read ranges source, including for
+            // scan queries where the source reader is otherwise disabled.
+            SessionCtx->ConfigPtr()->SetEnableKqpScanQuerySourceRead(true);
+            if (SessionCtx->Config().GetEnableNewRBO()) {
+                // RBO read operators do not preserve sampling settings. Select the
+                // legacy pipeline before optimization, independently of error fallback.
+                SessionCtx->ConfigPtr()->SetEnableNewRBO(false);
+                TypesCtx->IgnoreExpandPg = false;
+            }
         }
 
         YQL_CLOG(INFO, ProviderKqp) << "Compiled query:\n" << KqpExprToPrettyString(*queryExpr, ctx);

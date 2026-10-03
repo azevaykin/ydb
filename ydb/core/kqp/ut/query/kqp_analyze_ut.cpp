@@ -425,28 +425,49 @@ Y_UNIT_TEST(AnalyzeSamplingServerless) {
     UNIT_ASSERT_VALUES_EQUAL(requestedRates[1], 1.0);
 }
 
-Y_UNIT_TEST(AnalyzeSamplingRequiresColumnTable) {
+Y_UNIT_TEST_TWIN(AnalyzeSamplingRowTable, QueryService) {
     TTestEnv env(1, 1, false);
     CreateDatabase(env, "Database");
-    CreateEmptyTable(env, "Database", "Table", false);
+    const auto table = PrepareMultiColumnTable(env, "Database", "Table", false);
     TTableClient client(env.GetDriver());
+    NQuery::TQueryClient queryClient(env.GetDriver());
     auto session = env.RunInThreadPool([&] { return client.CreateSession().GetValueSync().GetSession(); });
-    const auto execute = [&](const TString& query) {
-        return env.RunInThreadPool([&] { return session.ExecuteSchemeQuery(query).GetValueSync(); });
-    };
-    const auto result = execute("ANALYZE `Root/Database/Table` SAMPLE 0.5;");
-    UNIT_ASSERT(!result.IsSuccess());
-    UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "ANALYZE SAMPLE is supported only for column tables");
-    const auto full = execute("ANALYZE `Root/Database/Table` SAMPLE 1;");
-    UNIT_ASSERT_C(full.IsSuccess(), full.GetIssues().ToString());
+    const auto result = env.RunInThreadPool([&]() -> TStatus {
+        const TString query = "ANALYZE `/Root/Database/Table` (Value1) SAMPLE 0.5;";
+        if (QueryService) {
+            return queryClient.ExecuteQuery(query, NQuery::TTxControl::NoTx()).GetValueSync();
+        }
+        return session.ExecuteSchemeQuery(query).GetValueSync();
+    });
+    UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+    const auto stored = ExecuteYqlScriptWithResult(env, TStringBuilder()
+        << "SELECT column_tags, data, sampled_data FROM `/Root/Database/.metadata/statistics_v2`"
+        << " WHERE owner_id = " << table.PathId.OwnerId << "ul AND local_path_id = " << table.PathId.LocalPathId
+        << "ul AND stat_type = " << static_cast<ui32>(EStatType::SIMPLE_COLUMN) << "u;");
+    UNIT_ASSERT_VALUES_EQUAL(stored.rows_size(), 1);
+    UNIT_ASSERT_VALUES_EQUAL(stored.rows(0).items(0).bytes_value(), "2");
+    UNIT_ASSERT(stored.rows(0).items(1).has_null_flag_value());
+    NKikimrStat::TSampledStatistic payload;
+    UNIT_ASSERT(payload.ParseFromString(stored.rows(0).items(2).bytes_value()));
+    const auto& metadata = payload.GetSampling();
+    UNIT_ASSERT(metadata.GetMethod() == NKikimrStat::TSamplingStatistics::PK_UNIT_BERNOULLI);
+    UNIT_ASSERT_VALUES_EQUAL(metadata.GetRequestedRate(), 0.5);
+    UNIT_ASSERT_VALUES_EQUAL(metadata.GetEffectiveRate(), 0.5);
+    UNIT_ASSERT(metadata.HasSeed());
+    UNIT_ASSERT(!metadata.HasEligibleUnits());
+    UNIT_ASSERT(!metadata.HasSelectedUnits());
+    NKikimrStat::TSimpleColumnStatistics statistics;
+    UNIT_ASSERT(statistics.ParseFromString(payload.GetData()));
+    UNIT_ASSERT_VALUES_EQUAL(statistics.GetCount(), metadata.GetSampleRows());
+    UNIT_ASSERT(!statistics.HasCountDistinct());
 }
 
-Y_UNIT_TEST(AnalyzeSamplingDisabled) {
+Y_UNIT_TEST_TWIN(AnalyzeSamplingDisabled, ColumnShard) {
     TTestEnv env(1, 1, false, [](Tests::TServerSettings& settings) {
         settings.FeatureFlags.SetEnableAnalyzeSampling(false);
     });
     CreateDatabase(env, "Database");
-    CreateEmptyTable(env, "Database", "Table", true);
+    CreateEmptyTable(env, "Database", "Table", ColumnShard);
     TTableClient client(env.GetDriver());
     auto session = env.RunInThreadPool([&] { return client.CreateSession().GetValueSync().GetSession(); });
     const auto execute = [&](const TString& query) {

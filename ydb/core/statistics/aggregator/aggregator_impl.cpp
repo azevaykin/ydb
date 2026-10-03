@@ -609,7 +609,7 @@ void TStatisticsAggregator::Handle(TEvStatistics::TEvDeleteStatisticsQueryRespon
 }
 
 void TStatisticsAggregator::Handle(TEvStatistics::TEvAnalyzeActorResult::TPtr& ev) {
-    if (ev->Sender != AnalyzeActorId) {
+    if (ev->Sender != AnalyzeActorId || FinishingTraversal) {
         return;
     }
 
@@ -691,8 +691,9 @@ void TStatisticsAggregator::InitializeStatisticsTable() {
 }
 
 void TStatisticsAggregator::SaveStatisticsToTable() {
-    constexpr ui64 MAX_BATCH_SIZE = 30_MB;
-
+    if (FinishingTraversal) {
+        return;
+    }
     if (!IsStatisticsTableCreated) {
         PendingSaveStatistics = true;
         return;
@@ -704,11 +705,16 @@ void TStatisticsAggregator::SaveStatisticsToTable() {
 
     PendingSaveStatistics = false;
 
+    if (IsSampledTraversal()) {
+        SaveStatisticsToTableAtomic();
+        return;
+    }
+
     size_t dataSize = 0;
     std::vector<TStatisticsItem> items;
     while (!StatisticsToSave.empty()) {
         auto& item = StatisticsToSave.front();
-        if (!items.empty() && dataSize + item.Data.size() > MAX_BATCH_SIZE) {
+        if (!items.empty() && dataSize + item.Data.size() > MaxStatisticsBatchSize) {
             break;
         }
         dataSize += item.Data.size();
@@ -734,6 +740,59 @@ void TStatisticsAggregator::SaveStatisticsToTable() {
         {"itemsLeft", StatisticsToSave.size()});
 }
 
+void TStatisticsAggregator::SaveStatisticsToTableAtomic() {
+    // No sampled result may become visible before every scan has succeeded.
+    if (AnalyzeActorId) {
+        return;
+    }
+    const auto* operation = CurrentForceTraversalOperation();
+    if (operation && TActivationContext::Now() >= operation->CreatedAt + AnalyzeDeadline) {
+        DispatchFinishTraversalTx(NKikimrStat::TEvAnalyzeResponse::STATUS_ERROR,
+            {NYql::TIssue("ANALYZE deadline exceeded")});
+        return;
+    }
+
+    ui64 dataSize = 0;
+    for (const auto& item : StatisticsToSave) {
+        // Include the sampled envelope and row keys in the publication bound.
+        // Each ui32 column tag takes at most 10 decimal digits and a separator.
+        const auto* tags = item.ColumnTags.AsMulti();
+        dataSize += 64 + 11 * (tags ? tags->size() : 1);
+        if (!item.ClearSampledData) {
+            dataSize += item.Data.size();
+            if (item.Sampling) {
+                dataSize += item.Sampling->ByteSizeLong() + 16;
+            }
+        }
+        if (dataSize > MaxStatisticsBatchSize) {
+            DispatchFinishTraversalTx(NKikimrStat::TEvAnalyzeResponse::STATUS_ERROR,
+                {NYql::TIssue("ANALYZE SAMPLE result exceeds the single-publication limit; "
+                    "restrict the column list or drop declared tuple statistics.")});
+            return;
+        }
+    }
+
+    if (StatisticsToSave.empty()) {
+        DispatchFinishTraversalTx(NKikimrStat::TEvAnalyzeResponse::STATUS_SUCCESS);
+        return;
+    }
+    std::vector<TStatisticsItem> items;
+    items.reserve(StatisticsToSave.size());
+    std::move(StatisticsToSave.begin(), StatisticsToSave.end(), std::back_inserter(items));
+    StatisticsToSave.clear();
+    SaveQueryActorId = Register(
+        CreateSaveStatisticsQuery(SelfId(), Database, TraversalPathId, std::move(items)));
+    YDB_LOG_DEBUG("Dispatched atomic SaveStatisticsQuery",
+        {"tabletId", TabletID()},
+        {"actorId", SaveQueryActorId},
+        {"dataSize", HumanReadableSize(dataSize, ESizeFormat::SF_BYTES)});
+}
+
+bool TStatisticsAggregator::IsSampledTraversal() {
+    const auto* table = CurrentForceTraversalTable();
+    return table && table->SampleRate < 1.0;
+}
+
 void TStatisticsAggregator::DeleteStatisticsFromTable() {
     if (!IsStatisticsTableCreated) {
         PendingDeleteStatistics = true;
@@ -745,11 +804,11 @@ void TStatisticsAggregator::DeleteStatisticsFromTable() {
     Register(CreateDeleteStatisticsQuery(SelfId(), Database, TraversalPathId));
 }
 
-void TStatisticsAggregator::ScheduleNextAnalyze(NIceDb::TNiceDb& db, const TActorContext& ctx) {
+bool TStatisticsAggregator::ScheduleNextAnalyze(NIceDb::TNiceDb& db) {
     if (ForceTraversals.empty()) {
         YDB_LOG_TRACE("ScheduleNextAnalyze. Empty ForceTraversals",
             {"tabletId", TabletID()});
-        return;
+        return false;
     }
     YDB_LOG_DEBUG("ScheduleNextAnalyze",
         {"tabletId", TabletID()});
@@ -785,17 +844,12 @@ void TStatisticsAggregator::ScheduleNextAnalyze(NIceDb::TNiceDb& db, const TActo
                 UpdateForceTraversalTableStatus(
                     TForceTraversalTable::EStatus::AnalyzeStarted, operation.OperationId, operationTable, db);
 
-                // operation.Types field is not used, TAnalyzeActor will determine suitable
-                // statistic types itself.
-                StartAnalyzeActor(ctx, operation.OperationId, operation.DatabaseName,
-                    operationTable.PathId, operationTable.ColumnTags);
-                YDB_LOG_DEBUG("ScheduleNextAnalyze. started analyzing table",
+                YDB_LOG_DEBUG("ScheduleNextAnalyze. scheduled analyzing table",
                     {"tabletId", TabletID()},
                     {"operationId", operation.OperationId.Quote()},
-                    {"pathId", operationTable.PathId},
-                    {"analyzeActorId", AnalyzeActorId});
+                    {"pathId", operationTable.PathId});
 
-                return;
+                return true;
             }
         }
 
@@ -807,6 +861,7 @@ void TStatisticsAggregator::ScheduleNextAnalyze(NIceDb::TNiceDb& db, const TActo
 
     YDB_LOG_DEBUG("ScheduleNextAnalyze. All the force traversal operations sent the requests",
         {"tabletId", TabletID()});
+    return false;
 }
 
 void TStatisticsAggregator::ScheduleNextBackgroundTraversal(NIceDb::TNiceDb& db, const TActorContext& ctx) {
@@ -880,7 +935,9 @@ void TStatisticsAggregator::FinishTraversal(
     bool traversalSucceeded = (status == NKikimrStat::TEvAnalyzeResponse::STATUS_SUCCESS);
 
     auto pathIt = ScheduleTraversals.find(pathId);
-    if (pathIt != ScheduleTraversals.end()) {
+    // Sampling does not refresh the full statistics used by ordinary consumers.
+    // Preserve their age and change counters so background ANALYZE still runs.
+    if (!IsSampledTraversal() && pathIt != ScheduleTraversals.end()) {
         auto& traversalTable = pathIt->second;
         traversalTable.LastUpdateTime = TraversalStartTime;
 
@@ -1076,9 +1133,11 @@ void TStatisticsAggregator::MarkForceTraversalOperationFinished(
         {"operationId", operationId.Quote()},
         {"state", static_cast<int>(state)});
 
-    // When the long-running operation API is disabled, fall back to pre-PR behavior:
-    // delete the operation on completion instead of retaining it as history.
-    if (!AppData()->FeatureFlags.GetEnableAnalyzeLongRunningOperation()) {
+    // Sampled operations need a terminal record even without the operation API:
+    // a reconnect must not restart a failed sample with a fresh set of draws.
+    const bool sampled = std::any_of(op->Tables.begin(), op->Tables.end(),
+        [](const TForceTraversalTable& table) { return table.SampleRate < 1.0; });
+    if (!sampled && !AppData()->FeatureFlags.GetEnableAnalyzeLongRunningOperation()) {
         DeleteForceTraversalOperation(operationId, db);
         return;
     }
@@ -1206,6 +1265,7 @@ void TStatisticsAggregator::StartAnalyzeActor(const TActorContext& ctx, const TS
         StatisticsConfig.GetAnalyzeHistogramMaxStateBytes(),
         TAnalyzeActor::MaxStatisticSize));
     const auto* table = ForceTraversalTable(operationId, pathId);
+    const auto* operation = ForceTraversalOperation(operationId);
     auto analyzeActorConfig = TAnalyzeActor::TConfig{
         .MaxTotalScanActorsInFlight = StatisticsConfig.GetAnalyzeMaxTotalScanActorsInFlight(),
         .MaxPerNodeScanActorsInFlight = StatisticsConfig.GetAnalyzeMaxPerNodeScanActorsInFlight(),
@@ -1216,6 +1276,7 @@ void TStatisticsAggregator::StartAnalyzeActor(const TActorContext& ctx, const TS
         .HistogramOversampleFactor = oversampleFactor,
         .HistogramMaxStateBytes = maxStateBytes,
         .SampleRate = table ? table->SampleRate : 1.0,
+        .Deadline = (operation ? operation->CreatedAt : TraversalStartTime) + AnalyzeDeadline,
     };
     AnalyzeActorId = ctx.Register(new TAnalyzeActor(
         SelfId(), operationId, database, pathId, table ? table->ColumnTags : columnTags, analyzeActorConfig),
