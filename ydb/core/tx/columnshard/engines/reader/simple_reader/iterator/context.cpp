@@ -93,6 +93,8 @@ std::shared_ptr<TFetchingScript> TSpecialReadContext::BuildColumnsFetchingPlan(c
             acc.AddStep(std::make_shared<TConflictDetector>());
         } else {
             if (preventDuplicates) {
+                // FulltextMatch is evaluated later, inside the scan program. A newer non-matching version
+                // must still be visible to duplicate resolution so it can suppress an older match.
                 acc.AddStep(std::make_shared<TDuplicateFilter>());
             }
             if (const auto& chainProgram = GetReadMetadata()->GetProgram().GetGraphOptional()) {

@@ -11,6 +11,12 @@
 
 namespace NKikimr::NOlap::NActualizer {
 
+void TSchemeActualizer::PublishOutstandingEligible() {
+    // Zero means no queued portion still lacks a fulltext index id. Writes after the
+    // index schema, and portions whose build was skipped, are outside this queue.
+    Counters.OutstandingEligibleFulltextPortions->SetValue(OutstandingEligibleFulltext);
+}
+
 std::optional<NKikimr::NOlap::NActualizer::TSchemeActualizer::TFullActualizationInfo> TSchemeActualizer::BuildActualizationInfo(
     const TPortionInfo& portion) const {
     AFL_VERIFY(TargetSchema);
@@ -45,7 +51,15 @@ void TSchemeActualizer::DoAddPortion(const TPortionInfo& info, const TAddExterna
     TSchemeGlobalCounters::OnAddPortion();
     NYDBTest::TControllers::GetColumnShardController()->AddPortionForActualizer(1);
     AFL_VERIFY(PortionsToActualizeScheme[actualizationInfo->GetAddress()].emplace(info.GetPortionId()).second);
-    AFL_VERIFY(PortionsInfo.emplace(info.GetPortionId(), actualizationInfo->ExtractFindId()).second);
+    auto findInfo = actualizationInfo->ExtractFindId();
+    const bool fulltextEligible =
+        TargetSchema->GetIndexInfo().NeedsFulltextBuildFrom(info.GetSchema(VersionedIndex)->GetIndexInfo());
+    findInfo.SetFulltextEligible(fulltextEligible);
+    AFL_VERIFY(PortionsInfo.emplace(info.GetPortionId(), std::move(findInfo)).second);
+    if (fulltextEligible) {
+        ++OutstandingEligibleFulltext;
+        PublishOutstandingEligible();
+    }
 }
 
 void TSchemeActualizer::DoRemovePortion(const ui64 portionId) {
@@ -54,6 +68,7 @@ void TSchemeActualizer::DoRemovePortion(const ui64 portionId) {
         TSchemeGlobalCounters::OnSkipPortionToRemove();
         return;
     }
+    const bool fulltextEligible = it->second.GetFulltextEligible();
     auto itAddress = PortionsToActualizeScheme.find(it->second.GetRWAddress());
     AFL_VERIFY(itAddress != PortionsToActualizeScheme.end());
     AFL_VERIFY(itAddress->second.erase(portionId));
@@ -63,6 +78,11 @@ void TSchemeActualizer::DoRemovePortion(const ui64 portionId) {
     }
     TSchemeGlobalCounters::OnRemovePortion();
     PortionsInfo.erase(it);
+    if (fulltextEligible) {
+        AFL_VERIFY(OutstandingEligibleFulltext > 0);
+        --OutstandingEligibleFulltext;
+        PublishOutstandingEligible();
+    }
 }
 
 void TSchemeActualizer::DoExtractTasks(
@@ -140,6 +160,8 @@ void TSchemeActualizer::DoExtractTasks(
 
 void TSchemeActualizer::Refresh(const TAddExternalContext& externalContext) {
     TargetSchema = VersionedIndex.GetLastCriticalSchema();
+    OutstandingEligibleFulltext = 0;
+    PublishOutstandingEligible();
     if (!TargetSchema) {
         TSchemeGlobalCounters::OnRefreshEmpty();
         AFL_VERIFY(PortionsInfo.empty());

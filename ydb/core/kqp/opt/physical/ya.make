@@ -18,6 +18,7 @@ SRCS(
 PEERDIR(
     ydb/core/scheme
     ydb/core/kqp/common
+    ydb/core/kqp/expr_nodes
     ydb/core/kqp/opt/physical/effects
     ydb/library/yql/dq/common
     ydb/library/yql/dq/opt

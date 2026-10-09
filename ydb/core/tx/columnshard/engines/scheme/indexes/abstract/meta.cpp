@@ -55,17 +55,20 @@ std::optional<ui64> IIndexMeta::CalcCategory(const NArrow::NAccessor::NSubColumn
     return DoCalcCategory(subColumnName);
 }
 
-TConclusion<std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>>> IIndexMeta::BuildIndexOptional(
-    const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data, const ui32 recordsCount, const TIndexInfo& indexInfo) const {
-    auto conclusion = DoBuildIndexOptional(data, recordsCount, indexInfo);
+TConclusion<TIndexBuildOutcome> IIndexMeta::BuildIndexOptional(const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data,
+    const ui32 recordsCount, const TIndexInfo& indexInfo, const TIndexBuildContext& context) const {
+    auto conclusion = DoBuildIndexOptional(data, recordsCount, indexInfo, context);
     if (conclusion.IsFail()) {
         return conclusion;
     }
+    if (conclusion->IsSkipped()) {
+        return conclusion;
+    }
     ui32 checkRecordsCount = 0;
-    for (auto&& i : *conclusion) {
+    for (auto&& i : conclusion->GetChunks()) {
         checkRecordsCount += i->GetRecordsCountVerified();
     }
-    AFL_VERIFY(checkRecordsCount == recordsCount);
+    AFL_VERIFY(checkRecordsCount == recordsCount)("index", GetIndexName())("records", recordsCount)("indexed", checkRecordsCount);
     return conclusion;
 }
 

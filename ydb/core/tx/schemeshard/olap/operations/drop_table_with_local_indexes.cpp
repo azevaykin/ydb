@@ -3,6 +3,7 @@
 #include <ydb/core/tx/schemeshard/schemeshard_impl.h>
 
 #include <ydb/core/tx/schemeshard/olap/operations/local_index_helpers.h>
+#include <ydb/core/base/table_index.h>
 
 namespace NKikimr::NSchemeShard {
 
@@ -33,6 +34,13 @@ TVector<ISubOperation::TPtr> DropColumnTableWithLocalIndexes(TOperationId nextId
         }
 
         auto indexInfo = context.SS->Indexes.at(childPathId);
+        if (NTableIndex::IsColumnTableCompactFulltext(indexInfo->Type)) {
+            if (auto reject = AddDropIndex(result, nextId, childPath)) {
+                result = {std::move(reject)};
+                return result;
+            }
+            continue;
+        }
         if (!TTableIndexInfo::IsLocalIndex(indexInfo->Type)) {
             continue;
         }

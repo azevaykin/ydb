@@ -1,4 +1,5 @@
 #include "builder.h"
+#include "fulltext_match.h"
 
 #include <ydb/core/formats/arrow/program/aggr_keys.h>
 #include <ydb/core/formats/arrow/program/assign_internal.h>
@@ -363,6 +364,15 @@ TConclusionStatus TProgramBuilder::ReadAssign(
         case TId::kNull:
         case TId::EXPRESSION_NOT_SET:
             return TConclusionStatus::Fail("unsupported functions");
+        case TId::kFulltextMatch: {
+            const auto& match = assign.GetFulltextMatch();
+            if (!match.GetColumnId() || ColumnResolver.GetColumnName(match.GetColumnId(), false).empty()) {
+                return TConclusionStatus::Fail("Fulltext match column was not found");
+            }
+            // Do not register the text column as an input. It is fetched only for fallback,
+            // a wildcard residual, a projection, or another expression.
+            return AppendFulltextMatch(Builder, match, columnName.GetColumnId(), parameterValues);
+        }
     }
     return TConclusionStatus::Success();
 }

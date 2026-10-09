@@ -1302,7 +1302,8 @@ struct TIndexDescription {
         LocalBloomFilter,
         LocalBloomNgramFilter,
         GlobalJson,
-        LocalMinMax
+        LocalMinMax,
+        LocalFulltext
     };
 
     struct TIndexSetting {

@@ -1500,6 +1500,25 @@ private:
                     YQL_ENSURE(columnPtr);
                     fillCol(columnPtr, indexProto->AddColumns());
                 }
+
+                if (implTable == std::string_view(NTableIndex::NFulltext::StateTable)) {
+                    *fullTextProto.MutableStateTable() = *indexProto;
+                } else if (implTable == std::string_view(NTableIndex::NFulltext::DocIdMapTable)) {
+                    *fullTextProto.MutableDocIdMapTable() = *indexProto;
+                }
+            }
+
+            if (auto* columnFulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&index->SpecializedIndexDescription)) {
+                if (columnFulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED) {
+                    fullTextProto.SetDocIdPolicy(columnFulltext->GetDocIdPolicy());
+                    fullTextProto.SetBuildGeneration(columnFulltext->GetBuildGeneration());
+                    fullTextProto.SetAnalyzerRevision(columnFulltext->GetAnalyzerRevision());
+                    fullTextProto.SetAnalyzerIdentity(columnFulltext->GetAnalyzerIdentity());
+                    fullTextProto.SetIndexState(static_cast<NKikimrSchemeOp::EIndexState>(static_cast<ui32>(index->State)));
+                    if (columnFulltext->HasReadyVersion()) {
+                        *fullTextProto.MutableReadyVersion() = columnFulltext->GetReadyVersion();
+                    }
+                }
             }
 
             // Resolve the unique secondary index over __ydb_row_id used to map doc_id back to the
@@ -1891,6 +1910,7 @@ private:
         columnProto->SetId(column->Id);
         columnProto->SetName(TString(columnName));
         columnProto->SetTypeId(column->TypeInfo.GetTypeId());
+        columnProto->SetNotNull(column->NotNull);
 
         if (NScheme::NTypeIds::IsParametrizedType(column->TypeInfo.GetTypeId())) {
             ProtoFromTypeInfo(column->TypeInfo, column->TypeMod, *columnProto->MutableTypeInfo());
@@ -2017,13 +2037,21 @@ private:
             } else if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompact ||
                 indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance ||
                 indexDescription.Type == TIndexDescription::EType::GlobalJsonCompact) {
+                const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexDescription.SpecializedIndexDescription);
+                const bool columnTableFulltext = fulltext
+                    && fulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED;
                 if (mode == "update" || mode == "update_conditional") {
                     if (AnyColumnAffected(indexDescription.KeyColumns, columnsSet, mainKeyColumnsSet)) {
                         result.Affected.push_back(index);
                         result.AffectedKeys.insert(index);
-                    } else if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance &&
+                    } else if ((indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance || columnTableFulltext) &&
                         AnyColumnAffected(indexDescription.DataColumns, columnsSet, mainKeyColumnsSet)) {
                         result.Affected.push_back(index);
+                    } else if (columnTableFulltext && tableMeta->TableSettings.TtlSettings && tableMeta->TableSettings.TtlSettings.IsSet()) {
+                        const auto& ttlColumn = tableMeta->TableSettings.TtlSettings.GetValueSet().ColumnName;
+                        if (columnsSet.contains(ttlColumn) && !mainKeyColumnsSet.contains(ttlColumn)) {
+                            result.Affected.push_back(index);
+                        }
                     }
                 } else {
                     result.Affected.push_back(index);
@@ -2046,6 +2074,13 @@ private:
             if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompact ||
                 indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance ||
                 indexDescription.Type == TIndexDescription::EType::GlobalJsonCompact) {
+                const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexDescription.SpecializedIndexDescription);
+                const bool columnTableFulltext = fulltext
+                    && fulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED;
+                if (columnTableFulltext) {
+                    // Deletes use saved tokens. Other mutations may omit indexed columns.
+                    return mode != "insert" && mode != "delete";
+                }
                 // Need to lookup old row version for update
                 return mode != "insert";
             }
@@ -2130,17 +2165,26 @@ private:
             } else if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompact ||
                 indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance ||
                 indexDescription.Type == TIndexDescription::EType::GlobalJsonCompact) {
-                for (const auto& col: indexDescription.KeyColumns) {
-                    lookupColumnsSet.insert(col);
-                }
-                if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance) {
-                    for (const auto& col: indexDescription.DataColumns) {
+                const auto* ftDesc = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexDescription.SpecializedIndexDescription);
+                const bool columnTableFulltext = ftDesc
+                    && ftDesc->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED;
+                // Ready and WriteOnly deletes recover tokens from forward state, so the column
+                // old image is not required for the text. Updates still read omitted indexed inputs.
+                if (!(columnTableFulltext && settings.Mode().StringValue() == "delete")) {
+                    for (const auto& col: indexDescription.KeyColumns) {
                         lookupColumnsSet.insert(col);
+                    }
+                    if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance || columnTableFulltext) {
+                        for (const auto& col: indexDescription.DataColumns) {
+                            lookupColumnsSet.insert(col);
+                        }
+                    }
+                    if (columnTableFulltext && tableMeta->TableSettings.TtlSettings && tableMeta->TableSettings.TtlSettings.IsSet()) {
+                        lookupColumnsSet.insert(tableMeta->TableSettings.TtlSettings.GetValueSet().ColumnName);
                     }
                 }
                 // In rowid mode the doc_id is the synthetic __ydb_row_id column, which for UPSERT/UPDATE
                 // must be read back from the existing row (it is not part of the user-supplied columns).
-                const auto* ftDesc = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexDescription.SpecializedIndexDescription);
                 if (ftDesc && ftDesc->GetUseRowIdAsDocId()) {
                     lookupColumnsSet.insert(NKikimr::NTableIndex::NFulltext::RowIdColumn);
                 }
@@ -2221,16 +2265,31 @@ private:
             indexSettings->SetIndexType(NKqpProto::EKqpFullTextIndexType::EKqpFullTextJsonCompact);
         } else if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance) {
             indexSettings->SetIndexType(NKqpProto::EKqpFullTextIndexType::EKqpFullTextCompactRelevance);
-            *indexSettings->MutableFulltextSettings() = std::get<NKikimrSchemeOp::TFulltextIndexDescription>(indexDescription.SpecializedIndexDescription).GetSettings();
+            const auto& fulltextDescription = std::get<NKikimrSchemeOp::TFulltextIndexDescription>(indexDescription.SpecializedIndexDescription);
+            *indexSettings->MutableFulltextSettings() = fulltextDescription.GetSettings();
+            const bool columnTableFulltext = fulltextDescription.GetDocIdPolicy()
+                != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED;
+            auto findImpl = [&](TStringBuf suffix) -> TIntrusivePtr<TKikimrTableMetadata> {
+                for (auto current = tableMeta->ImplTables[index]; current; current = current->Next) {
+                    if (current->Name.EndsWith(suffix)) {
+                        return current;
+                    }
+                }
+                return nullptr;
+            };
             // Get dict, docs, stats tables
             auto dictTable = tableMeta->ImplTables[index];
             if (!dictTable->Name.EndsWith(NTableIndex::NFulltext::DictTable)) {
                 dictTable = nullptr;
             }
-            auto docsTable = dictTable ? dictTable->Next : tableMeta->ImplTables[index];
-            YQL_ENSURE(docsTable->Name.EndsWith(NTableIndex::NFulltext::DocsTable));
-            auto statsTable = docsTable->Next;
-            YQL_ENSURE(statsTable->Name.EndsWith(NTableIndex::NFulltext::StatsTable));
+            auto docsTable = columnTableFulltext
+                ? findImpl(TString("/") + NTableIndex::NFulltext::DocsTable)
+                : (dictTable ? dictTable->Next : tableMeta->ImplTables[index]);
+            YQL_ENSURE(docsTable && docsTable->Name.EndsWith(NTableIndex::NFulltext::DocsTable));
+            auto statsTable = columnTableFulltext
+                ? findImpl(TString("/") + NTableIndex::NFulltext::StatsTable)
+                : docsTable->Next;
+            YQL_ENSURE(statsTable && statsTable->Name.EndsWith(NTableIndex::NFulltext::StatsTable));
             // And pass their metadata
             if (dictTable) {
                 FillTableId(*dictTable, *indexSettings->MutableDictTable());
@@ -2345,6 +2404,60 @@ private:
             }
         }
         indexSettings->SetDataColumnCount(dataColumns);
+
+        const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexDescription.SpecializedIndexDescription);
+        if (!fulltext || fulltext->GetDocIdPolicy() == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED) {
+            return;
+        }
+        indexSettings->SetDocIdPolicy(fulltext->GetDocIdPolicy());
+        indexSettings->SetBuildGeneration(fulltext->GetBuildGeneration());
+        indexSettings->SetAnalyzerRevision(fulltext->GetAnalyzerRevision());
+        indexSettings->SetAnalyzerIdentity(fulltext->GetAnalyzerIdentity());
+        indexSettings->SetIndexState(static_cast<NKikimrSchemeOp::EIndexState>(static_cast<ui32>(indexDescription.State)));
+        if (!indexDescription.KeyColumns.empty()) {
+            indexSettings->SetTextColumn(indexDescription.KeyColumns.back());
+            for (size_t i = 0; i + 1 < indexDescription.KeyColumns.size(); ++i) {
+                indexSettings->AddPrefixColumns(indexDescription.KeyColumns[i]);
+            }
+        }
+        for (const auto& covered : indexDescription.DataColumns) {
+            indexSettings->AddCoveredColumns(covered);
+        }
+        if (tableMeta->TableSettings.TtlSettings && tableMeta->TableSettings.TtlSettings.IsSet()) {
+            const auto& ttlColumn = tableMeta->TableSettings.TtlSettings.GetValueSet().ColumnName;
+            if (ttlColumn) {
+                indexSettings->SetTtlColumn(ttlColumn);
+            }
+        }
+
+        auto findImpl = [&](TStringBuf suffix) -> TIntrusivePtr<TKikimrTableMetadata> {
+            for (auto current = tableMeta->ImplTables[index]; current; current = current->Next) {
+                if (current->Name.EndsWith(suffix)) {
+                    return current;
+                }
+            }
+            return nullptr;
+        };
+        auto fillSupport = [&](const TIntrusivePtr<TKikimrTableMetadata>& support, NKqpProto::TKqpPhyTableId* tableId, auto* columns) {
+            if (!support) {
+                return;
+            }
+            FillTableId(*support, *tableId);
+            FillTablesMap(support->Name, tablesMap);
+            for (const auto& [columnName, columnMeta] : support->Columns) {
+                FillColumnProto(columnName, &columnMeta, columns->Add());
+                tablesMap[support->Name].emplace(columnName);
+            }
+        };
+        fillSupport(findImpl(TString("/") + NTableIndex::NFulltext::StateTable), indexSettings->MutableStateTable(), indexSettings->MutableStateColumns());
+        if (fulltext->GetDocIdPolicy() == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC) {
+            auto mapTable = findImpl(TString("/") + NTableIndex::NFulltext::DocIdMapTable);
+            fillSupport(mapTable, indexSettings->MutableDocIdMapTable(), indexSettings->MutableDocIdMapColumns());
+            if (mapTable) {
+                indexSettings->SetDocIdSequencePath(mapTable->Name + "/" + NTableIndex::NFulltext::DocIdSequence);
+            }
+        }
+        indexSettings->SetGenerationSequencePath(TString(implTable->Name) + "/" + NTableIndex::NFulltext::GenSequence);
     }
 
     // Sets per-index OperationType and NeedDeleteOldRows.
@@ -2392,11 +2505,27 @@ private:
                 indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance ||
                 indexDescription.Type == TIndexDescription::EType::GlobalJsonCompact);
             auto implTable = tableMeta->ImplTables[index];
+            const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexDescription.SpecializedIndexDescription);
+            const bool columnTableFulltext = fulltext
+                && fulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED;
             if (indexDescription.Type == TIndexDescription::EType::GlobalFulltextCompactRelevance) {
-                // Alphabetically impl (posting) is the last table, after Docs and Stats
-                YQL_ENSURE(implTable->Next && implTable->Next->Next);
-                implTable = implTable->Next->Next;
-                YQL_ENSURE(implTable->Name.EndsWith(NTableIndex::ImplTable));
+                if (columnTableFulltext) {
+                    const TString postingSuffix = TString("/") + NTableIndex::ImplTable;
+                    auto found = implTable;
+                    implTable = nullptr;
+                    for (auto current = found; current; current = current->Next) {
+                        if (current->Name.EndsWith(postingSuffix)) {
+                            implTable = current;
+                            break;
+                        }
+                    }
+                    YQL_ENSURE(implTable, "Column-table fulltext posting table was not found");
+                } else {
+                    // Alphabetically impl (posting) is the last table, after Docs and Stats
+                    YQL_ENSURE(implTable->Next && implTable->Next->Next);
+                    implTable = implTable->Next->Next;
+                    YQL_ENSURE(implTable->Name.EndsWith(NTableIndex::ImplTable));
+                }
             }
 
             AFL_ENSURE(implTable->Kind == EKikimrTableKind::Datashard);

@@ -532,6 +532,11 @@ message TRequestedMinMaxIndex {
     optional TIndexDataExtractor DataExtractor = 2;
 }
 
+message TRequestedColumnFulltextIndex {
+    optional string ColumnName = 1;
+    optional Ydb.Table.FulltextIndexSettings.Analyzers Analyzers = 2;
+}
+
 message TRequestedCountMinSketch {
     // sketch built on the combined data from the set of columns
     repeated string ColumnNames = 1;
@@ -550,6 +555,7 @@ message TOlapIndexRequested {
         TRequestedCountMinSketch CountMinSketch = 42;
         TRequestedBloomNGrammFilter BloomNGrammFilter = 43;
         TRequestedMinMaxIndex MinMaxIndex = 44;
+        TRequestedColumnFulltextIndex ColumnFulltextIndex = 45;
     }
 }
 
@@ -588,6 +594,12 @@ message TMinMaxIndex {
     optional TIndexDataExtractor DataExtractor = 2;
 }
 
+message TColumnFulltextIndex {
+    optional uint32 ColumnId = 1;
+    // Normalized analyzer settings. Defaults are explicit so the bytes are stable.
+    optional Ydb.Table.FulltextIndexSettings.Analyzers Analyzers = 2;
+}
+
 message TCountMinSketch {
     repeated uint32 ColumnIds = 1;
 }
@@ -609,6 +621,7 @@ message TOlapIndexDescription {
         TCountMinSketch CountMinSketch = 43;
         TBloomNGrammFilter BloomNGrammFilter = 44;
         TMinMaxIndex MinMaxIndex = 45;
+        TColumnFulltextIndex ColumnFulltextIndex = 46;
     }
 }
 
@@ -1064,6 +1077,10 @@ message TColumnTableDescription {
     optional bool IsBackup = 17;
 
     repeated TMultiColumnStatisticsDescription MultiColumnStatistics = 18;
+
+    // Global fulltext indexes owned by this column table. Filled at describe time from
+    // child index paths. Not stored in the column table schema itself.
+    repeated TIndexDescription TableIndexes = 19;
 }
 
 message TAlterColumnTable {
@@ -1339,6 +1356,7 @@ enum EIndexType {
     EIndexTypeGlobalFulltextCompactRelevance = 12;
     EIndexTypeGlobalJsonCompact = 13;
     EIndexTypeLocalCountMinSketch = 14;
+    EIndexTypeLocalFulltext = 15;
 }
 
 enum EIndexState {
@@ -1358,6 +1376,34 @@ message TFulltextIndexDescription {
     // instead of the main table PK. A unique secondary index on __ydb_row_id is required and is used
     // at read time to resolve __ydb_row_id back to the main table PK.
     optional bool UseRowIdAsDocId = 2;
+    // Portion-local fulltext index id (TOlapIndexDescription.Id). Unset for row-table indexes.
+    // Drop/recreate allocates a new id; rename keeps it.
+    optional uint32 OlapIndexId = 3;
+
+    // How a column-table compact fulltext index obtains document ids.
+    // Unset for row-table indexes, which keep the legacy integer-PK or __ydb_row_id rules.
+    enum EDocIdPolicy {
+        DOC_ID_POLICY_UNSPECIFIED = 0;
+        // The single Int32/Uint32/Int64/Uint64 primary-key column is the document id.
+        DOC_ID_POLICY_NATIVE = 1;
+        // Index-private sequence plus reverse map. The sequence never recycles ids.
+        DOC_ID_POLICY_SYNTHETIC = 2;
+    }
+    optional EDocIdPolicy DocIdPolicy = 4;
+
+    // Publication version of a Ready column-table fulltext index. Unset until publication.
+    message TReadyVersion {
+        optional uint64 Step = 1;
+        optional uint64 TxId = 2;
+    }
+    optional TReadyVersion ReadyVersion = 5;
+
+    // Index build generation. State rows record the generation that initialized them.
+    optional uint64 BuildGeneration = 6;
+
+    // CityHash64 of AnalyzerIdentity. Identity is the canonical serialized analyzer settings.
+    optional uint64 AnalyzerRevision = 7;
+    optional bytes AnalyzerIdentity = 8;
 }
 
 message TIndexDescription {
@@ -1421,6 +1467,7 @@ message TIndexAlteringConfig {
     oneof SpecializedIndexDescription {
         TBloomFilter BloomFilterDescription = 8;
         TBloomNGrammFilter BloomNGrammFilterDescription = 9;
+        TFulltextIndexDescription FulltextIndexDescription = 11;
     }
     optional TVectorIndexKmeansTreeDescription VectorIndexKmeansTreeDescription = 3;
     repeated string DataColumnNames = 10;
@@ -2237,6 +2284,7 @@ enum EPathSubType {
     EPathSubTypeLocalBloomNgramFilterIndex = 8;
     EPathSubTypeLocalMinMaxIndex = 9;
     EPathSubTypeLocalCountMinSketchIndex = 10;
+    EPathSubTypeLocalFulltextIndex = 11;
 }
 
 enum EPathState {

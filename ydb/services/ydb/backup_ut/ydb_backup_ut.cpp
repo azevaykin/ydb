@@ -356,6 +356,8 @@ auto CreateHasIndexChecker(const TString& indexName, EIndexType indexType, bool 
                 case EIndexType::LocalMinMax:
                     UNIT_ASSERT(std::holds_alternative<std::monostate>(indexDesc.GetIndexSettings()));
                     break;
+                case EIndexType::LocalFulltext:
+                    continue;
                 case EIndexType::LocalBloomFilter:
                     UNIT_ASSERT(std::holds_alternative<TLocalBloomFilterSettings>(indexDesc.GetIndexSettings()));
                     break;
@@ -3571,6 +3573,7 @@ Y_UNIT_TEST_SUITE(BackupRestore) {
             case EIndexTypeLocalBloomNgramFilter:
             case EIndexTypeLocalMinMax:
             case EIndexTypeLocalCountMinSketch:
+            case EIndexTypeLocalFulltext:
             case EIndexTypeInvalid:
                 break; // not applicable
         }
@@ -5063,6 +5066,7 @@ Y_UNIT_TEST_SUITE(BackupRestoreS3) {
             case EIndexTypeLocalBloomNgramFilter:
             case EIndexTypeLocalMinMax:
             case EIndexTypeLocalCountMinSketch:
+            case EIndexTypeLocalFulltext:
             case EIndexTypeInvalid:
                 break; // not applicable
         }

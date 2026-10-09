@@ -7,6 +7,7 @@ SRCS(
 )
 
 PEERDIR(
+    ydb/core/base
     ydb/core/formats
     ydb/core/kqp/common
     ydb/core/protos

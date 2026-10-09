@@ -300,6 +300,7 @@ namespace NTabletFlatExecutor {
                 } else {
                     StartFulltextMerge();
                     const auto& ver = FtCurKey.Versions[0];
+                    NFulltext::AccountFulltextCompaction(ver.Segment.size(), 0);
                     FtMerger.Add(ver.Added, TConstArrayRef<ui8>((const ui8*)ver.Segment.data(), ver.Segment.size()));
                     // Try to merge up to MaxId
                     FtMerger.SetMaxId(FtCurKey.MaxId);
@@ -381,6 +382,7 @@ namespace NTabletFlatExecutor {
 
             // Set __ydb_segment = merged segment data
             auto segBuf = wr.GetBuf();
+            NFulltext::AccountFulltextCompaction(0, segBuf.size());
             rs.Set(FtSegmentPos, NTable::ECellOp::Set, TCell((const char*)segBuf.data(), segBuf.size()));
 
             Writer->BeginKey(keyCells);
@@ -408,12 +410,14 @@ namespace NTabletFlatExecutor {
                         continue;
                     }
                     if (Conf->Params->IsFinal || ver.Added) {
+                        NFulltext::AccountFulltextCompaction(ver.Segment.size(), 0);
                         FtMerger.Add(ver.Added, TConstArrayRef<ui8>((const ui8*)ver.Segment.data(), ver.Segment.size()));
                         if (!Conf->Params->IsFinal && AddedGen > key.Gen) {
                             AddedGen = key.Gen;
                         }
                         AddedDeltas++;
                     } else {
+                        NFulltext::AccountFulltextCompaction(ver.Segment.size(), 0);
                         RemovedMerger.Add(true, TConstArrayRef<ui8>((const ui8*)ver.Segment.data(), ver.Segment.size()));
                         if (RemovedGen > key.Gen) {
                             RemovedGen = key.Gen;

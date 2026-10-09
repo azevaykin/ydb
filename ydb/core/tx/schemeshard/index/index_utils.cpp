@@ -1,6 +1,8 @@
 #include <ydb/core/tx/schemeshard/schemeshard_info_types.h>
 #include <ydb/core/tx/schemeshard/schemeshard_generated_column_utils.h>
 #include <ydb/core/tx/schemeshard/index/index_utils.h>
+#include <ydb/core/tx/schemeshard/olap/table/table.h>
+#include <ydb/core/tx/schemeshard/olap/store/store.h>
 
 #include <ydb/core/base/table_index.h>
 #include <ydb/core/persqueue/public/utils.h>
@@ -43,7 +45,8 @@ TIndexObjectCounts GetIndexObjectCounts(const NKikimrSchemeOp::TIndexCreationCon
             break;
         case NKikimrSchemeOp::EIndexTypeLocalBloomFilter:
         case NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter:
-        case NKikimrSchemeOp::EIndexTypeLocalMinMax: {
+        case NKikimrSchemeOp::EIndexTypeLocalMinMax:
+        case NKikimrSchemeOp::EIndexTypeLocalFulltext: {
             // Local indexes create only the index object itself: no impl table, no extra shards.
             res.IndexTableCount = 0;
             break;
@@ -465,13 +468,16 @@ auto CalcFulltextCompactImplTableDescImpl(
     bool isBuild)
 {
     // In rowid mode the doc id is the synthetic Uint64 __ydb_row_id (its dense low-bits seq), so the
-    // source table may have any (incl. composite, non-integer) primary key. Otherwise the legacy
-    // single-integer-PK doc id is used and __ydb_max_id inherits that PK's type.
+    // source table may have any (incl. composite, non-integer) primary key. Column-table synthetic
+    // mode uses the same Uint64 width for __ydb_max_id without putting __ydb_row_id on the base table.
+    // Otherwise the legacy single-integer-PK doc id is used and __ydb_max_id inherits that PK's type.
     const bool useRowId = indexDesc && indexDesc->GetUseRowIdAsDocId();
+    const bool syntheticDocId = indexDesc
+        && indexDesc->GetDocIdPolicy() == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
 
     auto tableColumns = ExtractInfo(baseTable);
     THashSet<TString> indexColumns;
-    if (!useRowId) {
+    if (!useRowId && !syntheticDocId) {
         Y_ENSURE(tableColumns.Keys.size() == 1);
     }
     for (const auto & keyColumn: tableColumns.Keys) {
@@ -490,7 +496,7 @@ auto CalcFulltextCompactImplTableDescImpl(
         tokenColumnType = textColumnInfo.GetTypeId();
     }
 
-    NScheme::TTypeId idType = useRowId
+    NScheme::TTypeId idType = (useRowId || syntheticDocId)
         ? NScheme::NTypeIds::Uint64
         : baseColumnTypes.at(tableColumns.Keys.at(0)).GetTypeId();
 
@@ -686,12 +692,13 @@ auto CalcFulltextDocsImplTableDescImpl(
 {
     auto tableColumns = ExtractInfo(baseTable);
     const bool useRowId = indexDesc.GetUseRowIdAsDocId();
+    const bool syntheticDocId = indexDesc.GetDocIdPolicy() == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
     THashSet<TString> indexColumns = indexDataColumns;
     TVector<TString> docIdKeys;
     if (useRowId) {
         docIdKeys.push_back(NFulltext::RowIdColumn);
         indexColumns.insert(NFulltext::RowIdColumn);
-    } else {
+    } else if (!syntheticDocId) {
         docIdKeys = tableColumns.Keys;
         for (const auto & keyColumn: tableColumns.Keys) {
             indexColumns.insert(keyColumn);
@@ -701,7 +708,18 @@ auto CalcFulltextDocsImplTableDescImpl(
     NKikimrSchemeOp::TTableDescription implTableDesc;
     implTableDesc.SetName(NTableIndex::NFulltext::DocsTable);
     SetImplTablePartitionConfig(baseTablePartitionConfig, indexTableDesc, implTableDesc);
-    FillIndexImplTableColumns(GetColumns(baseTable), docIdKeys, indexColumns, implTableDesc);
+    if (syntheticDocId) {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::DocIdColumn);
+        col->SetType(NScheme::TypeName(NScheme::NTypeIds::Uint64));
+        col->SetTypeId(NScheme::NTypeIds::Uint64);
+        col->SetNotNull(true);
+        implTableDesc.AddKeyColumnNames(NFulltext::DocIdColumn);
+        const TVector<TString> noKeys;
+        FillIndexImplTableColumns(GetColumns(baseTable), noKeys, indexColumns, implTableDesc);
+    } else {
+        FillIndexImplTableColumns(GetColumns(baseTable), docIdKeys, indexColumns, implTableDesc);
+    }
     {
         auto col = implTableDesc.AddColumns();
         col->SetName(NFulltext::DocLengthColumn);
@@ -1456,6 +1474,257 @@ bool IsCompatibleKeyTypes(
     return true;
 }
 
+NKikimrSchemeOp::TColumnTableSchema ReadColumnTableSchema(
+    const NSchemeShard::TColumnTableInfo& table,
+    const NSchemeShard::TOlapStoreInfo* store)
+{
+    if (table.IsStandalone() || table.Description.GetSchema().ColumnsSize() > 0) {
+        return table.Description.GetSchema();
+    }
+    Y_ENSURE(store, "column table schema preset is missing");
+    NKikimrSchemeOp::TColumnTableSchema schema;
+    store->GetPresetVerified(table.Description.GetSchemaPresetId()).Serialize(schema);
+    return schema;
 }
 
+TString ColumnTableTtlColumn(const NSchemeShard::TColumnTableInfo& table) {
+    if (table.Description.GetTtlSettings().HasEnabled()) {
+        return table.Description.GetTtlSettings().GetEnabled().GetColumnName();
+    }
+    return {};
+}
+
+ui32 ColumnTableShardCount(const NSchemeShard::TColumnTableInfo& table) {
+    ui32 shards = table.Description.GetSharding().ColumnShardsSize();
+    if (shards == 0) {
+        shards = table.Description.GetColumnShardCount();
+    }
+    return shards == 0 ? 1 : shards;
+}
+
+bool ColumnTableHasCompactFulltextIndex(const NSchemeShard::TSchemeShard* ss, const TPathId& tablePathId) {
+    const auto* path = ss->PathsById.FindPtr(tablePathId);
+    if (!path || !*path) {
+        return false;
+    }
+    for (const auto& [childName, childPathId] : (*path)->GetChildren()) {
+        Y_UNUSED(childName);
+        const auto* child = ss->PathsById.FindPtr(childPathId);
+        if (!child || !*child || (*child)->Dropped() || !(*child)->IsTableIndex()) {
+            continue;
+        }
+        const auto* indexInfo = ss->Indexes.FindPtr(childPathId);
+        if (indexInfo && *indexInfo && IsColumnTableCompactFulltext((*indexInfo)->Type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+NKikimrSchemeOp::TTableDescription ColumnSchemaToTableDescription(const NKikimrSchemeOp::TColumnTableSchema& schema) {
+    NKikimrSchemeOp::TTableDescription desc;
+    for (const auto& column : schema.GetColumns()) {
+        auto* out = desc.AddColumns();
+        out->SetName(column.GetName());
+        TString typeName = column.GetType();
+        if (typeName.empty() && column.GetTypeId()) {
+            typeName = NScheme::TypeName(NScheme::TTypeInfo(static_cast<NScheme::TTypeId>(column.GetTypeId())));
+        }
+        out->SetType(typeName);
+        if (column.GetTypeId()) {
+            out->SetTypeId(column.GetTypeId());
+        }
+        if (column.HasTypeInfo()) {
+            *out->MutableTypeInfo() = column.GetTypeInfo();
+        }
+        out->SetNotNull(column.GetNotNull());
+    }
+    for (const auto& key : schema.GetKeyColumnNames()) {
+        desc.AddKeyColumnNames(key);
+    }
+    return desc;
+}
+
+bool PrepareColumnTableFulltext(
+    NKikimrSchemeOp::TFulltextIndexDescription& description,
+    const TTableColumns& baseColumns,
+    const TColumnTypes& baseTypes,
+    const TVector<TString>& indexKeyColumns,
+    TString& error)
+{
+    if (description.GetUseRowIdAsDocId()) {
+        error = "Column-table fulltext indexes do not store __ydb_row_id on the column table";
+        return false;
+    }
+    if (description.GetSettings().columns_size() != 1 || indexKeyColumns.empty()
+        || indexKeyColumns.back() != description.GetSettings().columns(0).column())
+    {
+        error = ColumnTableGlobalFulltextOneTextColumn;
+        return false;
+    }
+    const auto& textColumn = indexKeyColumns.back();
+    const auto* type = baseTypes.FindPtr(textColumn);
+    if (!type || (type->GetTypeId() != NScheme::NTypeIds::String && type->GetTypeId() != NScheme::NTypeIds::Utf8)) {
+        error = ColumnTableGlobalFulltextOneTextColumn;
+        return false;
+    }
+
+    NKikimr::NFulltext::NormalizeFulltextSettings(*description.MutableSettings());
+    const auto& analyzers = description.GetSettings().columns(0).analyzers();
+    description.SetAnalyzerIdentity(NKikimr::NFulltext::FulltextAnalyzerIdentity(analyzers));
+    description.SetAnalyzerRevision(NKikimr::NFulltext::FulltextAnalyzerRevision(analyzers));
+    if (description.GetBuildGeneration() == 0) {
+        description.SetBuildGeneration(1);
+    }
+
+    const bool native = baseColumns.Keys.size() == 1 && baseTypes.contains(baseColumns.Keys[0]) && (
+        baseTypes.at(baseColumns.Keys[0]).GetTypeId() == NScheme::NTypeIds::Int32
+        || baseTypes.at(baseColumns.Keys[0]).GetTypeId() == NScheme::NTypeIds::Uint32
+        || baseTypes.at(baseColumns.Keys[0]).GetTypeId() == NScheme::NTypeIds::Int64
+        || baseTypes.at(baseColumns.Keys[0]).GetTypeId() == NScheme::NTypeIds::Uint64);
+    description.SetDocIdPolicy(native
+        ? NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_NATIVE
+        : NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC);
+    return true;
+}
+
+TIndexObjectCounts GetColumnTableFulltextObjectCounts(const NKikimrSchemeOp::TIndexCreationConfig& indexDesc) {
+    TIndexObjectCounts res;
+    const auto type = GetIndexType(indexDesc);
+    const bool synthetic = indexDesc.GetFulltextIndexDescription().GetDocIdPolicy()
+        == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+    const bool relevance = type == NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance;
+    // Posting table and forward-state table, plus docs and stats for relevance.
+    res.IndexTableCount = relevance ? 4 : 2;
+    if (synthetic) {
+        ++res.IndexTableCount;
+    }
+    // Generation sequence, plus the synthetic document-id sequence when needed.
+    res.SequenceCount = synthetic ? 2 : 1;
+    res.ShardsPerPath = 1;
+    if (indexDesc.IndexImplTableDescriptionsSize() == res.IndexTableCount) {
+        for (const auto& indexTableDesc : indexDesc.GetIndexImplTableDescriptions()) {
+            auto implShards = NSchemeShard::TTableInfo::ShardsToCreate(indexTableDesc);
+            res.IndexTableShards += implShards;
+            if (res.ShardsPerPath < implShards) {
+                res.ShardsPerPath = implShards;
+            }
+        }
+    } else {
+        res.IndexTableShards = res.IndexTableCount;
+    }
+    return res;
+}
+
+NKikimrSchemeOp::TTableDescription CalcColumnTableFulltextStateTableDesc(
+    const NKikimrSchemeOp::TTableDescription& baseTableDescr,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc,
+    const NKikimrSchemeOp::TFulltextIndexDescription& indexDesc,
+    bool withLength,
+    const TVector<TString>& prefixColumns,
+    const THashSet<TString>& coveredColumns,
+    const TString& ttlColumn)
+{
+    const auto tableColumns = ExtractInfo(baseTableDescr);
+    TColumnTypes baseColumnTypes;
+    TString error;
+    Y_ENSURE(ExtractTypes(baseTableDescr, baseColumnTypes, error), error);
+    const bool synthetic = indexDesc.GetDocIdPolicy() == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+    const NScheme::TTypeId docIdType = synthetic
+        ? NScheme::NTypeIds::Uint64
+        : baseColumnTypes.at(tableColumns.Keys.at(0)).GetTypeId();
+
+    THashSet<TString> keySet(tableColumns.Keys.begin(), tableColumns.Keys.end());
+    THashSet<TString> columns = keySet;
+    auto addExtra = [&](const TString& name) {
+        if (name && !keySet.contains(name)) {
+            columns.insert(name);
+        }
+    };
+    for (const auto& prefix : prefixColumns) {
+        addExtra(prefix);
+    }
+    for (const auto& covered : coveredColumns) {
+        addExtra(covered);
+    }
+    addExtra(ttlColumn);
+
+    NKikimrSchemeOp::TTableDescription implTableDesc;
+    implTableDesc.SetName(NFulltext::StateTable);
+    SetImplTablePartitionConfig(baseTablePartitionConfig, indexTableDesc, implTableDesc);
+    FillIndexImplTableColumns(GetColumns(baseTableDescr), tableColumns.Keys, columns, implTableDesc);
+
+    {
+        // Nullable only so a never-live tombstone can omit the document id.
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::DocIdColumn);
+        col->SetType(NScheme::TypeName(docIdType));
+        col->SetTypeId(docIdType);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::ExistsColumn);
+        col->SetType("Bool");
+        col->SetTypeId(Ydb::Type::BOOL);
+        col->SetNotNull(true);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::BuildGenerationColumn);
+        col->SetType(NScheme::TypeName(NScheme::NTypeIds::Uint64));
+        col->SetTypeId(NScheme::NTypeIds::Uint64);
+        col->SetNotNull(true);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::StateFormatColumn);
+        col->SetType(NScheme::TypeName(NScheme::NTypeIds::Uint32));
+        col->SetTypeId(NScheme::NTypeIds::Uint32);
+        col->SetNotNull(true);
+    }
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::TokensColumn);
+        col->SetType("String");
+        col->SetTypeId(NScheme::NTypeIds::String);
+        col->SetNotNull(true);
+    }
+    if (withLength) {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::DocLengthColumn);
+        col->SetType(NFulltext::TokenCountTypeName);
+        col->SetTypeId(NFulltext::TokenCountType);
+        col->SetNotNull(true);
+    }
+    implTableDesc.SetSystemColumnNamesAllowed(true);
+    return implTableDesc;
+}
+
+NKikimrSchemeOp::TTableDescription CalcColumnTableFulltextDocIdMapTableDesc(
+    const NKikimrSchemeOp::TTableDescription& baseTableDescr,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc)
+{
+    const auto tableColumns = ExtractInfo(baseTableDescr);
+    const THashSet<TString> pkColumns(tableColumns.Keys.begin(), tableColumns.Keys.end());
+
+    NKikimrSchemeOp::TTableDescription implTableDesc;
+    implTableDesc.SetName(NFulltext::DocIdMapTable);
+    SetImplTablePartitionConfig(baseTablePartitionConfig, indexTableDesc, implTableDesc);
+    {
+        auto col = implTableDesc.AddColumns();
+        col->SetName(NFulltext::DocIdColumn);
+        col->SetType(NScheme::TypeName(NScheme::NTypeIds::Uint64));
+        col->SetTypeId(NScheme::NTypeIds::Uint64);
+        col->SetNotNull(true);
+        implTableDesc.AddKeyColumnNames(NFulltext::DocIdColumn);
+    }
+    const TVector<TString> noKeys;
+    FillIndexImplTableColumns(GetColumns(baseTableDescr), noKeys, pkColumns, implTableDesc);
+    implTableDesc.SetSystemColumnNamesAllowed(true);
+    return implTableDesc;
+}
+
+}
 }

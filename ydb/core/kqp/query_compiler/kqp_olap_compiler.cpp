@@ -1,6 +1,8 @@
 #include "kqp_olap_compiler.h"
 
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/formats/arrow/arrow_helpers.h>
+#include <ydb/core/kqp/provider/yql_kikimr_gateway.h>
 #include <ydb/library/formats/arrow/protos/ssa.pb.h>
 
 #include <yql/essentials/core/arrow_kernels/request/request.h>
@@ -37,6 +39,7 @@ public:
         NKqpProto::TKqpPhyOpReadOlapRanges& readProto, const std::vector<std::string>& resultColNames,
         TExprContext &exprCtx, TTypeAnnotationContext& typesCtx)
         : Row(row)
+        , TableMeta(tableMeta)
         , MaxColumnId(0)
         , ReadProto(readProto)
         , ResultColNames(resultColNames)
@@ -281,6 +284,7 @@ private:
     static std::unordered_map<std::string, EAggFunctionType> AggFuncTypesMap;
 
     TCoArgument Row;
+    const TKikimrTableMetadata& TableMeta;
     std::unordered_map<std::string, ui32> ReadColumns;
     ui32 MaxColumnId;
     TProgram Program;
@@ -937,7 +941,61 @@ ui64 CompileComparison(const TKqpOlapFilterBinaryOp& comparison, TKqpOlapCompile
     }
 }
 
+ui64 CompileColumnFulltextMatch(const TKqpOlapFulltextMatch& match, TKqpOlapCompileContext& ctx) {
+    const TString indexName(match.IndexName().Value());
+    const TIndexDescription* index = nullptr;
+    for (const auto& candidate : ctx.TableMeta.Indexes) {
+        if (candidate.Name == indexName) {
+            index = &candidate;
+            break;
+        }
+    }
+    YQL_ENSURE(index && index->Type == TIndexDescription::EType::LocalFulltext,
+        "Local fulltext index '" << indexName << "' was not found");
+    const auto* description = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&index->SpecializedIndexDescription);
+    YQL_ENSURE(description && description->GetSettings().columns_size() == 1, "Local fulltext index has no analyzer settings");
+    const auto analyzers = NKikimr::NFulltext::NormalizeAnalyzers(description->GetSettings().columns(0).analyzers());
+
+    auto* assign = ctx.CreateAssignCmd();
+    auto* fulltext = assign->MutableFulltextMatch();
+    fulltext->SetIndexId(description->GetOlapIndexId());
+    fulltext->SetColumnId(ctx.GetColumnId(TString(match.ColumnName().Value())));
+    fulltext->SetAnalyzerSettings(NKikimr::NFulltext::FulltextAnalyzerIdentity(analyzers));
+    fulltext->SetAnalyzerRevision(NKikimr::NFulltext::FulltextAnalyzerRevision(analyzers));
+    if (match.DefaultOperator().Value()) {
+        fulltext->SetDefaultOperator(TString(match.DefaultOperator().Value()));
+    }
+    if (match.MinimumShouldMatch().Value()) {
+        fulltext->SetMinimumShouldMatch(TString(match.MinimumShouldMatch().Value()));
+    }
+    if (match.Mode().Value()) {
+        fulltext->SetMode(TString(match.Mode().Value()));
+    }
+
+    TExprBase query = match.Query();
+    if (const auto just = query.Maybe<TCoJust>()) {
+        query = just.Cast().Input();
+    }
+    if (const auto parameter = query.Maybe<TCoParameter>()) {
+        const TString name(parameter.Cast().Name().Value());
+        fulltext->SetQueryParameter(name);
+        ctx.AddParameterName(name);
+    } else if (query.Maybe<TCoUtf8>() || query.Maybe<TCoString>() || query.Maybe<TCoAtom>()) {
+        const TString text = query.Maybe<TCoAtom>()
+            ? TString(query.Cast<TCoAtom>().Value())
+            : TString(query.Ref().Child(0)->Content());
+        fulltext->SetQueryText(text);
+    } else {
+        YQL_ENSURE(false, "Fulltext query must be a literal or a parameter");
+    }
+    return assign->GetColumn().GetId();
+}
+
 ui64 CompileCondition(const TExprBase& condition, TKqpOlapCompileContext& ctx) {
+    if (const auto match = condition.Maybe<TKqpOlapFulltextMatch>()) {
+        return CompileColumnFulltextMatch(match.Cast(), ctx);
+    }
+
     if (const auto maybeUdf = condition.Maybe<TKqpOlapUdf>()) {
         return CompileYqlKernelUdf(maybeUdf.Cast(), ctx).Id;
     }

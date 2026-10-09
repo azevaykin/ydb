@@ -494,6 +494,21 @@ public:
     NMonitoring::THistogramPtr ForwardActorWritesSizeHistogram;
     NMonitoring::THistogramPtr ForwardActorWritesLatencyHistogram;
 
+    // Column-table fulltext maintenance. Compaction bytes are also incremented from tablet compaction.
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextStateBytes;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextPostingBytes;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextBatchMemory;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextRetries;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextCompactionInputBytes;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextCompactionOutputBytes;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextCandidates;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextBm25BufferedBytes;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextFetchBatches;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextFetchBytes;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextBypassRejections;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextBuildRowsInitialized;
+    ::NMonitoring::TDynamicCounters::TCounterPtr ColumnFulltextBuildRowsSkipped;
+
     // Scheduler signals
     ::NMonitoring::TDynamicCounters::TCounterPtr SchedulerThrottled;
     ::NMonitoring::TDynamicCounters::TCounterPtr SchedulerCapacity;

@@ -1054,6 +1054,7 @@ TVector<ISubOperation::TPtr> CreateCopyTable(TOperationId nextId, const TTxTrans
                 case NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance:
                 case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
                 case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
+                case NKikimrSchemeOp::EIndexTypeLocalFulltext:
                     *operation->MutableFulltextIndexDescription() =
                         std::get<NKikimrSchemeOp::TFulltextIndexDescription>(indexInfo->SpecializedIndexDescription);
                     break;

@@ -18,6 +18,7 @@ SRCS(
 )
 
 PEERDIR(
+    ydb/core/base
     ydb/core/mind/hive
     ydb/services/bg_tasks
     ydb/core/tx/schemeshard/olap/operations/alter

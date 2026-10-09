@@ -273,6 +273,8 @@ TString IndexTypeToName(NYql::TIndexDescription::EType type) {
             return "local bloom_ngram_filter";
         case NYql::TIndexDescription::EType::LocalMinMax:
             return "local min_max";
+        case NYql::TIndexDescription::EType::LocalFulltext:
+            return "local fulltext";
     }
     Y_UNREACHABLE();
     return "unknown";
@@ -1217,6 +1219,7 @@ TExprBase BuildUpdateTableWithIndex(const TKiUpdateTable& update, const TKikimrT
             case TIndexDescription::EType::LocalBloomFilter:
             case TIndexDescription::EType::LocalBloomNgramFilter:
             case TIndexDescription::EType::LocalMinMax:
+            case TIndexDescription::EType::LocalFulltext:
                 return true;
         }
         Y_UNREACHABLE();
@@ -1421,6 +1424,34 @@ TExprNode::TPtr HandleReadTable(const TKiReadTable& read, TExprContext& ctx, con
 
     if (view && !view->PrimaryFlag) {
         const auto& indexName = view->Name;
+        const TIndexDescription* localFulltext = nullptr;
+        for (const auto& index : tableData.Metadata->Indexes) {
+            if (index.Name == indexName && index.Type == TIndexDescription::EType::LocalFulltext) {
+                localFulltext = &index;
+                break;
+            }
+        }
+        if (localFulltext) {
+            if (localFulltext->State != TIndexDescription::EIndexState::Ready) {
+                ctx.AddError(YqlIssue(ctx.GetPosition(read.Pos()), TIssuesIds::KIKIMR_INDEX_IS_NOT_READY,
+                    TStringBuilder() << "Requested index: " << indexName << " is not ready to use"));
+                return nullptr;
+            }
+            auto readNode = BuildReadTable(read, tableData, true, withSystemColumns, ctx);
+            if (!readNode) {
+                return nullptr;
+            }
+            auto rangesRead = TExprBase(readNode).Cast<TKqlReadTableRanges>();
+            auto settings = TKqpReadTableSettings::Parse(rangesRead);
+            settings.LocalFulltextIndex = indexName;
+            return Build<TKqlReadTableRanges>(ctx, read.Pos())
+                .Table(rangesRead.Table())
+                .Ranges(rangesRead.Ranges())
+                .Columns(rangesRead.Columns())
+                .Settings(settings.BuildNode(ctx, read.Pos()))
+                .ExplainPrompt(rangesRead.ExplainPrompt())
+                .Done().Ptr();
+        }
         if (!ValidateTableHasIndex(tableData.Metadata, ctx, read.Pos())) {
             return nullptr;
         }

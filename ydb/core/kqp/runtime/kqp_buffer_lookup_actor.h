@@ -76,6 +76,9 @@ struct TKqpBufferTableLookupSettings {
 
     TString Database;
     TString PoolId;
+
+    // ColumnShard full-primary-key read. Row impl tables stay on the DataShard lookup.
+    bool IsOlap = false;
 };
 
 std::pair<IKqpBufferTableLookup*, NActors::IActor*> CreateKqpBufferTableLookup(TKqpBufferTableLookupSettings&& settings);

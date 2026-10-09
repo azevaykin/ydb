@@ -57,6 +57,36 @@ bool IsLocalTableIndex(Ydb::Table::TableIndex::TypeCase type);
 std::span<const std::string_view> GetImplTables(
     NKikimrSchemeOp::EIndexType indexType,
     std::span<const TString> indexKeys);
+
+// Support tables of a column-table compact fulltext index. Row-table GetImplTables stays unchanged.
+std::span<const std::string_view> GetColumnTableFulltextImplTables(
+    NKikimrSchemeOp::EIndexType indexType,
+    NKikimrSchemeOp::TFulltextIndexDescription::EDocIdPolicy docIdPolicy);
+
+inline constexpr TStringBuf ColumnTableGlobalFulltextDisabled =
+    "Column-table global fulltext index support is disabled";
+inline constexpr TStringBuf ColumnTableGlobalFulltextCompactOnly =
+    "Only compact fulltext indexes are supported on column tables";
+inline constexpr TStringBuf ColumnTableGlobalFulltextOneTextColumn =
+    "Column-table fulltext index requires exactly one String or Utf8 text column";
+inline constexpr TStringBuf ColumnTableGlobalFulltextPrefixEquality =
+    "Every prefix column of a column-table fulltext index must be equality-bound for a search";
+inline constexpr TStringBuf ColumnTableGlobalFulltextInlineCreate =
+    "Global fulltext indexes on column tables are created with ALTER TABLE ADD INDEX";
+inline constexpr TStringBuf ColumnTableGlobalFulltextBulkUpsertRejected =
+    "BulkUpsert is not supported for column tables with a global fulltext index until the bulk adapter is enabled";
+inline constexpr TStringBuf ColumnTableGlobalFulltextTtlRejected =
+    "Deletion TTL is not supported for column tables with a global fulltext index until the TTL adapter is enabled";
+inline constexpr TStringBuf ColumnTableGlobalFulltextImportRejected =
+    "Import and restore into a live column table with a global fulltext index are not supported; restore the base table first, then build the index";
+inline constexpr TStringBuf ColumnTableGlobalFulltextBypassRejected =
+    "This mutation path is not supported for column tables with a global fulltext index";
+
+inline bool IsColumnTableCompactFulltext(NKikimrSchemeOp::EIndexType indexType) {
+    return indexType == NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact
+        || indexType == NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance;
+}
+
 bool IsImplTable(std::string_view tableName);
 bool IsBuildImplTable(std::string_view tableName);
 
@@ -182,6 +212,34 @@ namespace NFulltext {
     inline constexpr const char* SegmentColumn = "__ydb_segment";
 
     inline constexpr const char* GenSequence = "__ydb_gen_sequence";
+
+    // Column-table forward state. Keyed by the complete typed base primary key.
+    // A present row is initialized. __ydb_exists=false is a tombstone: empty tokens,
+    // zero length, and no reverse-map entry. Live rows, including null or zero-token
+    // text, keep a state row.
+    inline constexpr const char* StateTable = "indexImplStateTable";
+    inline constexpr const char* DocIdColumn = "__ydb_doc_id";
+    inline constexpr const char* ExistsColumn = "__ydb_exists";
+    inline constexpr const char* BuildGenerationColumn = "__ydb_build_generation";
+    inline constexpr const char* StateFormatColumn = "__ydb_state_format";
+    inline constexpr const char* TokensColumn = "__ydb_tokens";
+    inline constexpr ui32 DocumentStateFormatVersion = 1;
+
+    // Synthetic-id mode only. Uint64 doc id -> complete typed base primary key.
+    // The allocator is an index-private sequence. Ids are never recycled.
+    inline constexpr const char* DocIdMapTable = "indexImplDocIdMapTable";
+    inline constexpr const char* DocIdSequence = "__ydb_doc_id_sequence";
+
+    // RowIdFromSeq keeps 48 sequence bits. seq must be strictly below this limit.
+    inline constexpr ui64 SyntheticDocIdSeqLimit = ui64(1) << (64 - RowIdSpreadBits);
+    inline constexpr i64 SyntheticDocIdSeqMaxInclusive = i64(SyntheticDocIdSeqLimit - 1);
+
+    inline bool IsSyntheticDocIdSeq(ui64 seq) {
+        return seq < SyntheticDocIdSeqLimit;
+    }
+
+    // Exhaustion is an error. The function does not wrap.
+    ui64 SyntheticDocIdFromSeq(ui64 seq);
 
     // Impl table positions in partitioning setting list
     inline constexpr const int DictTablePosition = 0;

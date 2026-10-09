@@ -7,6 +7,7 @@
 
 #include <util/generic/hash.h>
 #include <util/generic/hash_set.h>
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/cms/console/configs_dispatcher.h>
 #include <ydb/core/engine/mkql_proto.h>
 #include <ydb/core/local_indexes/bloom/const.h>
@@ -323,6 +324,58 @@ private:
                     auto it = colNameToId.find(index.index_columns(0));
                     min_max->SetColumnId(it->second);
                     NKikimr::NOlap::NIndexes::NMinMax::SetAppropriateStoregeIdAndInheritPortionStorageBasedOnType(*olapIndex, columnDesc->GetType());
+                    break;
+                }
+                case Ydb::Table::TableIndex::kLocalFulltextIndex: {
+                    if (!AppData()->FeatureFlags.GetEnableLocalFulltextIndex()) {
+                        issues.AddIssue(NYql::TIssue(TString(NKikimr::NFulltext::LocalFulltextIndexDisabled)));
+                        code = StatusIds::BAD_REQUEST;
+                        return false;
+                    }
+                    if (index.index_columns().size() != 1) {
+                        issues.AddIssue(NYql::TIssue(TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn)));
+                        code = StatusIds::BAD_REQUEST;
+                        return false;
+                    }
+                    if (!index.data_columns().empty()) {
+                        issues.AddIssue(NYql::TIssue(TString(NKikimr::NFulltext::LocalFulltextIndexNoDataColumns)));
+                        code = StatusIds::BAD_REQUEST;
+                        return false;
+                    }
+                    const NKikimrSchemeOp::TOlapColumnDescription* columnDesc = nullptr;
+                    for (const auto& column : schema->GetColumns()) {
+                        if (column.GetName() == index.index_columns(0)) {
+                            columnDesc = &column;
+                            break;
+                        }
+                    }
+                    if (!columnDesc || (columnDesc->GetType() != "String" && columnDesc->GetType() != "Utf8")) {
+                        issues.AddIssue(NYql::TIssue(TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn)));
+                        code = StatusIds::BAD_REQUEST;
+                        return false;
+                    }
+                    auto it = colNameToId.find(index.index_columns(0));
+                    if (it == colNameToId.end()) {
+                        issues.AddIssue(NYql::TIssue(TStringBuilder() << "Unknown column '" << index.index_columns(0) << "'"));
+                        code = StatusIds::BAD_REQUEST;
+                        return false;
+                    }
+                    Ydb::Table::FulltextIndexSettings settings = index.local_fulltext_index().fulltext_settings();
+                    if (settings.columns().empty()) {
+                        settings.add_columns()->set_column(index.index_columns(0));
+                    }
+                    TString validationError;
+                    if (!NKikimr::NFulltext::ValidateSettings(settings, validationError)) {
+                        issues.AddIssue(NYql::TIssue(validationError));
+                        code = StatusIds::BAD_REQUEST;
+                        return false;
+                    }
+                    NKikimr::NFulltext::NormalizeFulltextSettings(settings);
+                    olapIndex->SetClassName(TString(NKikimr::NFulltext::LocalFulltextClassName));
+                    olapIndex->SetInheritPortionStorage(true);
+                    auto* section = olapIndex->MutableColumnFulltextIndex();
+                    section->SetColumnId(it->second);
+                    *section->MutableAnalyzers() = settings.columns(0).analyzers();
                     break;
                 }
                 case Ydb::Table::TableIndex::TYPE_NOT_SET:

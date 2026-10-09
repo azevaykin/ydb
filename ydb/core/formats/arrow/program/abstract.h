@@ -270,7 +270,9 @@ enum class EProcessorType {
     ReserveMemory,
     // Stateless DISTINCT marker (see distinct_marker.h). Must not be treated as a real Filter:
     // TGraph::Collapse() AND-merges all Filter nodes, and the marker input is the (non-bool) key column.
-    DistinctMarker
+    DistinctMarker,
+    // Exact FulltextMatch. Not CheckIndexData: a partial skip-index checker may become all-true.
+    FulltextMatch
 };
 
 class TFetchingInfo {

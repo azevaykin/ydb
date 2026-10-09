@@ -1255,7 +1255,7 @@ TStatus AnnotateOlapBinaryLogicOperator(const TExprNode::TPtr& node, TExprContex
 }
 
 bool ValidateOlapFilterConditions(const TExprNode* node, const TStructExprType* itemType, TExprContext& ctx) {
-    if (TKqpOlapApply::Match(node) || TKqpOlapUdf::Match(node)) {
+    if (TKqpOlapApply::Match(node) || TKqpOlapUdf::Match(node) || TKqpOlapFulltextMatch::Match(node)) {
         return true;
     } else if (TKqpOlapAnd::Match(node) || TKqpOlapOr::Match(node) || TKqpOlapXor::Match(node) || TKqpOlapNot::Match(node)) {
         bool res = true;
@@ -1433,6 +1433,19 @@ TStatus AnnotateOlapProjections(const TExprNode::TPtr& node, TExprContext& ctx) 
 
     // Create a final type (Flow(Struct{items}))
     node->SetTypeAnn(ctx.MakeType<TFlowExprType>(ctx.MakeType<TStructExprType>(newItemTypes)));
+    return TStatus::Ok;
+}
+
+TStatus AnnotateOlapFulltextMatch(const TExprNode::TPtr& node, TExprContext& ctx) {
+    if (!EnsureArgsCount(*node, 6, ctx)) {
+        return TStatus::Error;
+    }
+    for (ui32 i = 0; i < 5; ++i) {
+        if (!EnsureAtom(*node->Child(i), ctx)) {
+            return TStatus::Error;
+        }
+    }
+    node->SetTypeAnn(ctx.MakeType<TDataExprType>(EDataSlot::Bool));
     return TStatus::Ok;
 }
 
@@ -4066,6 +4079,7 @@ public:
         AddHandler({TKqpOlapProjections::CallableName()}, Hndl(&AnnotateOlapProjections));
         AddHandler({TKqpPredicateClosure::CallableName()}, Hndl(&AnnotateKqpPredicateClosure));
         AddHandler({TKqpOlapFilter::CallableName()}, Hndl(&AnnotateOlapFilter));
+        AddHandler({TKqpOlapFulltextMatch::CallableName()}, Hndl(&AnnotateOlapFulltextMatch));
         AddHandler({TKqpOlapApplyColumnArg::CallableName()}, Hndl(&AnnotateOlapApplyColumnArg));
         AddHandler({TKqpOlapApply::CallableName()}, Hndl(&AnnotateOlapApply));
         AddHandler({TKqpOlapUdf::CallableName()}, Hndl(&AnnotateOlapUdf));

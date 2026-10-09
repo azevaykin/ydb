@@ -389,6 +389,12 @@ message LocalBloomNgramFilterIndex {
 
 message LocalMinMaxIndex {}
 
+// Boolean fulltext index stored with a column table. One String or Utf8 column.
+// fulltext_settings.columns holds that column and the normalized analyzer settings.
+message LocalFulltextIndex {
+    FulltextIndexSettings fulltext_settings = 1;
+}
+
 message GlobalJsonIndex {
     GlobalIndexSettings settings = 1;
 }
@@ -411,6 +417,7 @@ message TableIndex {
        LocalBloomNgramFilterIndex local_bloom_ngram_filter_index = 11;
        GlobalJsonIndex global_json_index = 12;
        LocalMinMaxIndex local_min_max_index = 14;
+       LocalFulltextIndex local_fulltext_index = 15;
     }
     // list of columns content to be copied in to index table
     repeated string data_columns = 5;
@@ -443,6 +450,7 @@ message TableIndexDescription {
        LocalBloomNgramFilterIndex local_bloom_ngram_filter_index = 13;
        GlobalJsonIndex global_json_index = 14;
        LocalMinMaxIndex local_min_max_index = 15;
+       LocalFulltextIndex local_fulltext_index = 16;
     }
     Status status = 4;
     // list of columns content to be copied in to index table

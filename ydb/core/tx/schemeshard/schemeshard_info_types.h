@@ -3347,6 +3347,13 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
                 // no specialized index description
                 Y_ASSERT(description.empty());
                 break;
+            case NKikimrSchemeOp::EIndexTypeLocalFulltext: {
+                auto success = SpecializedIndexDescription
+                    .emplace<NKikimrSchemeOp::TFulltextIndexDescription>()
+                    .ParseFromString(description);
+                Y_ENSURE(success, description);
+                break;
+            }
             case NKikimrSchemeOp::EIndexTypeGlobalJson:
             case NKikimrSchemeOp::EIndexTypeGlobalJsonCompact:
                 // JSON indexes carry a fulltext description only when rowid mode (__ydb_row_id as doc_id)
@@ -3432,7 +3439,8 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
         return type == NKikimrSchemeOp::EIndexTypeLocalBloomFilter
             || type == NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter
             || type == NKikimrSchemeOp::EIndexTypeLocalMinMax
-            || type == NKikimrSchemeOp::EIndexTypeLocalCountMinSketch;
+            || type == NKikimrSchemeOp::EIndexTypeLocalCountMinSketch
+            || type == NKikimrSchemeOp::EIndexTypeLocalFulltext;
     }
 
     static TPtr Create(const NKikimrSchemeOp::TIndexCreationConfig& config, TString& errMsg) {
@@ -3475,6 +3483,7 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
             case NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance:
             case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
             case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
+            case NKikimrSchemeOp::EIndexTypeLocalFulltext:
                 alterData->SpecializedIndexDescription = config.GetFulltextIndexDescription();
                 break;
             case NKikimrSchemeOp::EIndexTypeLocalBloomFilter:
@@ -3522,6 +3531,13 @@ struct TTableIndexInfo : public TSimpleRefCount<TTableIndexInfo> {
             case NKikimrSchemeOp::EIndexTypeLocalMinMax:
             case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
                 alterData->SpecializedIndexDescription = std::monostate{};
+                break;
+            case NKikimrSchemeOp::EIndexTypeLocalFulltext:
+                if (!config.HasFulltextIndexDescription()) {
+                    errMsg += "Analyzer settings of a local fulltext index cannot be changed; drop the index and create it again";
+                    return nullptr;
+                }
+                alterData->SpecializedIndexDescription = config.GetFulltextIndexDescription();
                 break;
             default:
                 errMsg += TStringBuilder() << "TIndexAlteringConfig only supports local index types, got: " << NKikimrSchemeOp::EIndexType_Name(config.GetType());

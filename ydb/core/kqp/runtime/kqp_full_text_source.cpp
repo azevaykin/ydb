@@ -22,8 +22,14 @@
  *     with amortized O(1) nth_element compaction so only the highest-scoring
  *     documents survive.
  *  7. Fetch full row data from the main table (unless "covered" -- all requested
- *     columns are already available from the index key).
+ *     columns are already available from the index key). A column-table index
+ *     does not read a DataShard base table: native integer ids are the primary
+ *     key, synthetic ids are resolved through the reverse map, and any other
+ *     column is read from ColumnShard by the complete typed primary key.
  *  8. Stream result rows to the compute actor via ResultQueue / NotifyCA().
+ *     Column-table queries leave ItemsLimit unset. Residual predicates and
+ *     ORDER BY / OFFSET / LIMIT run in KQP after this source. Those predicates
+ *     do not change N or df.
  *
  * === Tables involved (relevance index) ===
  *
@@ -46,6 +52,7 @@
  */
 
 #include "kqp_full_text_source.h"
+#include "kqp_column_fulltext_fetch.h"
 
 #include <ydb/library/actors/wilson/wilson_span.h>
 #include <ydb/library/wilson_ids/wilson.h>
@@ -103,7 +110,14 @@ constexpr double K1_FACTOR_DEFAULT = 1.2;
 constexpr double B_FACTOR_DEFAULT = 0.75;
 
 // Threshold below which floating-point settings are treated as "not set".
+// Explicit K1/B at or below this value leave the defaults above in place.
 constexpr double EPSILON = 1e-6;
+
+// Column-table BM25 keeps every matched candidate until df is known. Past this
+// budget the query fails instead of dropping candidates.
+constexpr i64 ColumnFulltextCandidateMemoryBudget = 64ll * 1024 * 1024;
+constexpr size_t ColumnFetchQueueLimit = 256;
+constexpr size_t ColumnFetchBatchKeys = 128;
 
 // Sentinel column index used in ResultCellIndices to indicate that the column
 // should be filled with the computed BM25 relevance score rather than a table cell.
@@ -229,6 +243,10 @@ public:
         LockMode = lockMode;
     }
 
+    void SetSnapshot(const IKqpGateway::TKqpSnapshot& snapshot) {
+        Snapshot = snapshot;
+    }
+
     void SetQuerySpanId(ui64 spanId) {
         QuerySpanId = spanId;
     }
@@ -350,11 +368,19 @@ public:
  * TQueryCtx -- per-query BM25 scoring context.
  *
  * Holds corpus-level statistics needed by the BM25 formula:
- *   - DocCount:  total number of documents in the corpus (from stats table).
+ *   - DocCount:  N from the stats table for the selected index-prefix corpus.
+ *     N counts every live logical document, including null and zero-token text.
+ *     It is not a sum of ColumnShard portion row counts. Ordinary query filters
+ *     do not redefine this corpus.
  *   - AvgDL:     average document length = SumDocLength / DocCount.
+ *     SumDocLength is the sum of analyzer output counts.
  *   - IDFValues: one IDF value per query token, computed as:
  *                  IDF(t) = ln( (N - df(t) + 0.5) / (df(t) + 0.5) + 1 )
- *                where N = DocCount, df(t) = document frequency of token t.
+ *                where N = DocCount and df(t) is the number of live documents
+ *                that contain token t after compact additions and removals.
+ *     The score oracle is GetBM25Score. Absolute error against a row table with
+ *     the same documents must stay within 1e-4. The conventional (k1+1)
+ *     multiplier is omitted. K1/B values at or below EPSILON leave the defaults.
  *   - K1Factor / BFactor: BM25 tuning knobs (overridable per query).
  *
  * Also stores the result column mapping (ResultCellIndices) and the boolean
@@ -516,9 +542,17 @@ public:
         return PkResolved;
     }
 
+    TConstArrayRef<TCell> GetKeyCells() const {
+        return KeyCells;
+    }
+
+    bool MemoryCharged = false;
+
     // Compute the BM25 score for this document:
     //   score = SUM_over_tokens[ IDF(t) * tf(t,d) / (tf(t,d) + K1*(1-B+B*|d|/avgdl)) ]
     // where tf(t,d) = TokenFrequencies[t], |d| = DocumentLength.
+    // This is the repository score oracle. It has no (k1+1) multiplier.
+    // Compare it with an equivalent row table; absolute error must be at most 1e-4.
     double GetBM25Score(const TQueryCtx& queryCtx) const {
         double score = 0;
         const double avgDocLength = queryCtx.GetAvgDL();
@@ -1803,6 +1837,7 @@ enum EReadKind : ui32 {
     EReadKind_Document = 3,       // Main table: full row data for matched docs
     EReadKind_TotalStats = 4,     // Stats table: corpus-wide aggregates
     EReadKind_RowIdResolve = 5,   // Unique index: __ydb_row_id -> PK resolution
+    EReadKind_DocIdMap = 6,       // Synthetic column-table doc id -> typed PK
 };
 
 // Metadata stored for each in-flight read so we can route the response.
@@ -1971,6 +2006,61 @@ public:
             "Unique-index impl-table must have at least 2 key columns (__ydb_row_id, pk...)");
 
         return MakeIntrusive<TUniqueIndexReader>(
+            counters, FromProto(info.GetTable()), info.GetTable().GetPath(),
+            snapshot, logPrefix, settings->GetDatabase(), settings->GetPoolId(),
+            keyColumnTypes, resultColumnTypes, resultColumnIds);
+    }
+};
+
+// Reverse map for column-table synthetic document ids. The key is Uint64
+// __ydb_doc_id. The result is that id followed by the base table primary key,
+// in primary-key order, read at the same snapshot as the postings.
+class TDocIdMapReader : public TTableReader<TDocIdMapReader> {
+public:
+    using TTableReader::TTableReader;
+
+    static TIntrusivePtr<TDocIdMapReader> FromSettings(
+        const TIntrusivePtr<TKqpCounters>& counters,
+        const IKqpGateway::TKqpSnapshot& snapshot,
+        const TString& logPrefix,
+        const NKikimrKqp::TKqpFullTextSourceSettings* settings)
+    {
+        if (settings->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC
+            || !settings->HasDocIdMapTable())
+        {
+            return nullptr;
+        }
+
+        const auto& info = settings->GetDocIdMapTable();
+        THashMap<TString, const NKikimrKqp::TKqpColumnMetadataProto*> byName;
+        for (const auto& column : info.GetColumns()) {
+            byName.emplace(column.GetName(), &column);
+        }
+        for (const auto& column : info.GetKeyColumns()) {
+            byName.emplace(column.GetName(), &column);
+        }
+
+        const auto* docIdColumn = byName.FindPtr(NTableIndex::NFulltext::DocIdColumn);
+        YQL_ENSURE(docIdColumn, "Reverse map is missing " << NTableIndex::NFulltext::DocIdColumn);
+        YQL_ENSURE((*docIdColumn)->GetTypeId() == NScheme::NTypeIds::Uint64);
+
+        TVector<NScheme::TTypeInfo> keyColumnTypes;
+        TVector<NScheme::TTypeInfo> resultColumnTypes;
+        TVector<i32> resultColumnIds;
+        auto addColumn = [&](const NKikimrKqp::TKqpColumnMetadataProto& column) {
+            auto type = NScheme::TypeInfoFromProto(column.GetTypeId(), column.GetTypeInfo());
+            resultColumnTypes.push_back(type);
+            resultColumnIds.push_back(column.GetId());
+            return type;
+        };
+        keyColumnTypes.push_back(addColumn(**docIdColumn));
+        for (const auto& keyColumn : settings->GetKeyColumns()) {
+            const auto* column = byName.FindPtr(keyColumn.GetName());
+            YQL_ENSURE(column, "Reverse map is missing primary key column " << keyColumn.GetName());
+            addColumn(**column);
+        }
+
+        return MakeIntrusive<TDocIdMapReader>(
             counters, FromProto(info.GetTable()), info.GetTable().GetPath(),
             snapshot, logPrefix, settings->GetDatabase(), settings->GetPoolId(),
             keyColumnTypes, resultColumnTypes, resultColumnIds);
@@ -2513,6 +2603,13 @@ private:
     TIntrusivePtr<TDocsTableReader> DocsTableReader;
     TIntrusivePtr<TStatsTableReader> StatsTableReader;
     TIntrusivePtr<TUniqueIndexReader> UniqueIndexReader;  // Resolves __ydb_row_id -> PK via unique secondary index
+    TIntrusivePtr<TDocIdMapReader> DocIdMapReader;        // Synthetic column-table doc id -> typed PK
+    std::unique_ptr<TColumnShardPkFetch> ColumnFetch;
+    std::deque<TDocInfoPtr> ColumnFetchPending;
+    absl::flat_hash_map<TString, TDocInfoPtr> FetchByPk;
+    absl::flat_hash_map<ui64, std::vector<TDocInfoPtr>> DocIdMapItems;
+    i64 CandidateMemory = 0;
+    bool Failed = false;
     TReadLockInfo LockInfo;
 
     // True when the fulltext index uses __ydb_row_id as the synthetic doc_id, and the
@@ -2533,6 +2630,9 @@ private:
     TReadsState ReadsState;                                // Tracks all in-flight reads
     TReadItemsQueue<TDocInfoPtr> DocsReadingQueue;         // Docs table + main table reads
     TVector<TWordStatePtr> Words;                          // Tokenized query terms
+    // Shared boolean query for a text index. JSON indexes keep precompiled tokens in Words
+    // and leave this empty. Unknown Mode values are not rejected here.
+    std::optional<::NKikimr::NFulltext::TCompiledFulltextQuery> CompiledQuery;
 
     // Merge algorithm.
     std::unique_ptr<TMergeAlgo> MergeAlgo;
@@ -2567,33 +2667,45 @@ private:
                 Words.emplace_back(MakeIntrusive<TWordState>(wordIndex++, token, IndexTableReader, PrefixCells));
             }
         } else {
-            YQL_ENSURE(Settings->GetQuerySettings().GetQuery().size() > 0, "Expected non-empty query");
             const auto& expr = Settings->GetQuerySettings().GetQuery();
-
-            THashMap<TStringBuf, TWordStatePtr> seen;
+            std::optional<Ydb::Table::FulltextIndexSettings::Analyzers> matchedAnalyzers;
             for (const auto& column : Settings->GetQuerySettings().GetColumns()) {
                 for (const auto& analyzer : Settings->GetIndexDescription().GetSettings().columns()) {
                     if (analyzer.analyzers().use_filter_ngram() || analyzer.analyzers().use_filter_edge_ngram()) {
                         IsNgram = true;
                     }
-
-                    if (analyzer.column() == column.GetName()) {
-                        size_t wordIndex = 0;
-                        for (const auto& term: NFulltext::BuildSearchTermsStructured(expr, analyzer.analyzers())) {
-                            YQL_ENSURE(IndexTableReader);
-                            auto wordIt = seen.find(term.Token);
-                            if (wordIt != seen.end()) {
-                                // Don't add duplicate words
-                                wordIt->second->Required = wordIt->second->Required || term.Required;
-                            } else {
-                                auto word = MakeIntrusive<TWordState>(wordIndex++, term.Token, IndexTableReader, PrefixCells);
-                                word->Required = term.Required;
-                                seen[word->Word] = word;
-                                Words.emplace_back(std::move(word));
-                            }
-                        }
+                    if (!matchedAnalyzers && analyzer.column() == column.GetName()) {
+                        matchedAnalyzers = analyzer.analyzers();
                     }
                 }
+            }
+
+            if (!matchedAnalyzers) {
+                RuntimeError(expr.empty()
+                    ? "Empty fulltext query"
+                    : "No search terms were extracted from the query",
+                    NYql::NDqProto::StatusIds::BAD_REQUEST);
+                return false;
+            }
+
+            ::NKikimr::NFulltext::TFulltextQueryOptions options;
+            options.DefaultOperator = Settings->GetDefaultOperator();
+            options.MinimumShouldMatch = Settings->GetMinimumShouldMatch();
+            options.Mode = Settings->GetMode();
+            options.Checks = ::NKikimr::NFulltext::EFulltextQueryChecks::RowTable;
+            const auto validation = ::NKikimr::NFulltext::CompileFulltextQuery(expr, *matchedAnalyzers, options);
+            if (!validation) {
+                RuntimeError(validation.Error, NYql::NDqProto::StatusIds::BAD_REQUEST);
+                return false;
+            }
+
+            CompiledQuery.emplace(std::move(*validation.Compiled));
+            YQL_ENSURE(IndexTableReader);
+            size_t wordIndex = 0;
+            for (const auto& term : CompiledQuery->Terms) {
+                auto word = MakeIntrusive<TWordState>(wordIndex++, term.Token, IndexTableReader, PrefixCells);
+                word->Required = term.Required;
+                Words.emplace_back(std::move(word));
             }
         }
 
@@ -2782,7 +2894,8 @@ private:
     // Steps:
     //   1. Detect token frequency imbalance.  For n-gram queries, drop the
     //      most frequent n-grams.
-    //   2. Compute MinimumShouldMatch from the query operator and settings.
+    //   2. Use the compiled query's operator and minimum_should_match.
+    //      JSON indexes still parse those settings here.
     //   3. Build TTokenStream instances and instantiate the appropriate
     //      merge algorithm:
     //        - AND -> TAndOptimizedMergeAlgorithm (leapfrog)
@@ -2790,13 +2903,6 @@ private:
     //   4. Apply user-overridden BM25 K1/B factors.
     //   5. Issue initial posting list reads for all tokens.
     void StartWordReads() {
-        TString explain;
-        EDefaultOperator defaultOperator = DefaultOperatorFromString(Settings->GetDefaultOperator(), explain);
-        if (!explain.empty()) {
-            RuntimeError(explain, NYql::NDqProto::StatusIds::BAD_REQUEST);
-            return;
-        }
-
         // `+term` required-term mode (Lucene MUST). Under the OR operator, terms
         // marked required must appear in every match while minimum_should_match
         // applies to the remaining optional terms. Required terms drive the read as
@@ -2810,12 +2916,26 @@ private:
             }
         }
 
-        // minimum_should_match counts only the optional (non-required) terms.
-        const size_t optionalCount = Words.size() - requiredCount;
-        ui32 minimumShouldMatch = requiredCount + MinimumShouldMatchFromString(optionalCount, defaultOperator, Settings->GetMinimumShouldMatch(), explain);
-        if (!explain.empty()) {
-            RuntimeError(explain, NYql::NDqProto::StatusIds::BAD_REQUEST);
-            return;
+        EDefaultOperator defaultOperator;
+        ui32 minimumShouldMatch = 0;
+        if (CompiledQuery) {
+            defaultOperator = CompiledQuery->Operator;
+            minimumShouldMatch = CompiledQuery->MinimumShouldMatch;
+        } else {
+            // JSON indexes supply tokens directly and still parse operator settings here.
+            TString explain;
+            defaultOperator = DefaultOperatorFromString(Settings->GetDefaultOperator(), explain);
+            if (!explain.empty()) {
+                RuntimeError(explain, NYql::NDqProto::StatusIds::BAD_REQUEST);
+                return;
+            }
+
+            const size_t optionalCount = Words.size() - requiredCount;
+            minimumShouldMatch = requiredCount + MinimumShouldMatchFromString(optionalCount, defaultOperator, Settings->GetMinimumShouldMatch(), explain);
+            if (!explain.empty()) {
+                RuntimeError(explain, NYql::NDqProto::StatusIds::BAD_REQUEST);
+                return;
+            }
         }
 
         QueryCtx = MakeIntrusive<TQueryCtx>(
@@ -2922,6 +3042,7 @@ public:
         , DocsTableReader(TDocsTableReader::FromSettings(Counters, Snapshot, LogPrefix, Settings, MainTableReader->GetWithRelevance()))
         , StatsTableReader(TStatsTableReader::FromSettings(Counters, Snapshot, LogPrefix, Settings, MainTableReader->GetWithRelevance(), PrefixCells))
         , UniqueIndexReader(TUniqueIndexReader::FromSettings(Counters, Snapshot, LogPrefix, Settings))
+        , DocIdMapReader(TDocIdMapReader::FromSettings(Counters, Snapshot, LogPrefix, Settings))
         , UseRowIdAsDocId(UniqueIndexReader != nullptr)
         , ReadSpan(TWilsonKqp::ReadActor, NWilson::TTraceId(traceId), "Full-text search")
         , ReadsState(Counters, LogPrefix, ReadSpan.GetTraceId())
@@ -2961,7 +3082,22 @@ public:
             if (UniqueIndexReader) {
                 UniqueIndexReader->SetLockTxId(lockTxId, lockNodeId, lockMode);
             }
+            if (DocIdMapReader) {
+                DocIdMapReader->SetLockTxId(lockTxId, lockNodeId, lockMode);
+            }
         }
+
+        auto applySnapshot = [&](auto& reader) {
+            if (reader) {
+                reader->SetSnapshot(Snapshot);
+            }
+        };
+        applySnapshot(MainTableReader);
+        applySnapshot(IndexTableReader);
+        applySnapshot(DocsTableReader);
+        applySnapshot(StatsTableReader);
+        applySnapshot(UniqueIndexReader);
+        applySnapshot(DocIdMapReader);
 
         if (Settings->GetQuerySpanId()) {
             const ui64 spanId = Settings->GetQuerySpanId();
@@ -2980,13 +3116,59 @@ public:
             if (UniqueIndexReader) {
                 UniqueIndexReader->SetQuerySpanId(spanId);
             }
+            if (DocIdMapReader) {
+                DocIdMapReader->SetQuerySpanId(spanId);
+            }
         }
+    }
+
+    bool IsColumnTableFulltext() const {
+        const auto policy = Settings->GetDocIdPolicy();
+        return policy == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_NATIVE
+            || policy == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+    }
+
+    bool IsSyntheticDocId() const {
+        return Settings->GetDocIdPolicy() == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+    }
+
+    bool SnapshotCoversReadyVersion() const {
+        const auto& ready = Settings->GetReadyVersion();
+        if (!Snapshot.IsValid() || (ready.GetStep() == 0 && ready.GetTxId() == 0)) {
+            return false;
+        }
+        if (Snapshot.Step != ready.GetStep()) {
+            return Snapshot.Step > ready.GetStep();
+        }
+        return Snapshot.TxId >= ready.GetTxId();
+    }
+
+    bool CheckColumnIndexReadable() {
+        if (!IsColumnTableFulltext()) {
+            return true;
+        }
+        const bool published = Settings->HasReadyVersion()
+            && (Settings->GetReadyVersion().GetStep() != 0 || Settings->GetReadyVersion().GetTxId() != 0)
+            && (!Settings->HasIndexState() || Settings->GetIndexState() == NKikimrSchemeOp::EIndexStateReady);
+        if (!published) {
+            RuntimeError("Index is not ready", NYql::NDqProto::StatusIds::PRECONDITION_FAILED);
+            return false;
+        }
+        if (!SnapshotCoversReadyVersion()) {
+            RuntimeError("Query snapshot is older than the fulltext index publication version",
+                NYql::NDqProto::StatusIds::PRECONDITION_FAILED);
+            return false;
+        }
+        return true;
     }
 
     void Bootstrap() {
         ReadsState.SetSelfId(this->SelfId());
         LogPrefix = TStringBuilder() << "SelfId: " << this->SelfId() << ", " << LogPrefix;
         this->Become(&TThis::StateWork);
+        if (!CheckColumnIndexReadable()) {
+            return;
+        }
         PrepareTableReaders();
     }
 
@@ -3008,6 +3190,11 @@ public:
         i64 freeSpace) override
     {
         YQL_ENSURE(!resultBatch.IsWide(), "Wide stream is not supported");
+
+        if (Failed) {
+            finished = true;
+            return 0;
+        }
 
         PendingNotify = false;
         auto guard = BindAllocator();
@@ -3034,6 +3221,7 @@ public:
             NotifyCA();
         }
 
+        PumpColumnFetch();
         finished = IsFinished();
         return computeBytes;
     }
@@ -3050,6 +3238,9 @@ public:
 
     // Cancel all in-flight reads and disconnect all pipes on actor destruction.
     void PassAway() override {
+        if (ColumnFetch) {
+            ColumnFetch->Cancel();
+        }
         {
             for (auto& [id, state] : ReadsState.GetReads()) {
                 auto cancel = MakeHolder<TEvDataShard::TEvReadCancel>();
@@ -3072,6 +3263,13 @@ public:
     void RuntimeError(const TString& message, NYql::NDqProto::StatusIds::StatusCode statusCode,
         const NYql::TIssues& subIssues = {})
     {
+        if (Failed) {
+            return;
+        }
+        Failed = true;
+        if (ColumnFetch) {
+            ColumnFetch->Cancel();
+        }
         if (ReadSpan) {
             ReadSpan.EndError(message);
         }
@@ -3085,7 +3283,14 @@ public:
     }
 
     bool IsFinished() {
-        return (ReadsState.Empty() && !ResolveInProgress && ResultQueue.empty() && TopKQueue.empty() && RowIdResolvePendingQueue.empty()) || (Limit > 0 && ProducedItemsCount >= static_cast<ui64>(Limit));
+        if (Failed) {
+            return true;
+        }
+        const bool columnBusy = !ColumnFetchPending.empty() || !FetchByPk.empty() || !DocIdMapItems.empty()
+            || (ColumnFetch && !ColumnFetch->Idle());
+        return (ReadsState.Empty() && !ResolveInProgress && ResultQueue.empty() && TopKQueue.empty()
+                && RowIdResolvePendingQueue.empty() && !columnBusy)
+            || (Limit > 0 && ProducedItemsCount >= static_cast<ui64>(Limit));
     }
 
     // Send TEvNewAsyncInputDataArrived to the compute actor so it calls

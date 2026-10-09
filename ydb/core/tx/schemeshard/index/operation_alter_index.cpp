@@ -42,6 +42,20 @@ public:
 
         Y_ABORT_UNLESS(context.SS->Indexes.contains(path->PathId));
         TTableIndexInfo::TPtr indexData = context.SS->Indexes.at(path->PathId);
+        // Publish ReadyVersion with the plan step when a column-table compact
+        // fulltext index becomes Ready. Snapshot S alone is not enough for queries.
+        if (indexData->AlterData
+                && indexData->AlterData->State == NKikimrSchemeOp::EIndexStateReady
+                && NTableIndex::IsColumnTableCompactFulltext(indexData->AlterData->Type))
+        {
+            if (auto* ft = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(
+                    &indexData->AlterData->SpecializedIndexDescription))
+            {
+                auto* ready = ft->MutableReadyVersion();
+                ready->SetStep(ui64(step));
+                ready->SetTxId(ui64(OperationId.GetTxId()));
+            }
+        }
         context.SS->PersistTableIndex(db, path->PathId);
         context.SS->Indexes.Set(path->PathId, indexData->AlterData);
 
@@ -135,8 +149,13 @@ public:
                 .IsResolved()
                 .NotDeleted()
                 .NotUnderDeleting()
-                .IsCommonSensePath()
-                .IsTable();
+                .IsCommonSensePath();
+
+            if (parentPath.IsResolved() && parentPath->IsColumnTable()) {
+                checks.IsColumnTable();
+            } else {
+                checks.IsTable();
+            }
 
             if (!Transaction.GetInternal()) {
                 checks.NotAsyncReplicaTable();
@@ -196,6 +215,9 @@ public:
 
         if (tableIndexAlter.HasVectorIndexKmeansTreeDescription()) {
             newIndexData->SpecializedIndexDescription = tableIndexAlter.GetVectorIndexKmeansTreeDescription();
+        }
+        if (tableIndexAlter.HasFulltextIndexDescription()) {
+            newIndexData->SpecializedIndexDescription = tableIndexAlter.GetFulltextIndexDescription();
         }
 
         Y_ABORT_UNLESS(!context.SS->FindTx(OperationId));

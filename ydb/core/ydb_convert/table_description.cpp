@@ -4,6 +4,7 @@
 #include "ydb_convert.h"
 
 #include <ydb/core/base/appdata.h>
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/base/path.h>
 #include <ydb/core/kqp/provider/yql_kikimr_gateway.h>
 #include <ydb/core/tablet_flat/bloom_filter_defaults.h>
@@ -192,6 +193,8 @@ bool FillColumnTableIndexesFromCreateRequest(NKikimrSchemeOp::TColumnTableDescri
         if (index.index_columns_size() != 1) {
             if (index.type_case() == Ydb::Table::TableIndex::kLocalMinMaxIndex) {
                 return fail(NKikimr::NOlap::NIndexes::NMinMax::IncorrectIndexColumnsErrorMessage(index.index_columns()));
+            } else if (index.type_case() == Ydb::Table::TableIndex::kLocalFulltextIndex) {
+                return fail(TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn));
             } else {
                 return fail("Only one index column is supported for local bloom indexes");
             }
@@ -200,6 +203,8 @@ bool FillColumnTableIndexesFromCreateRequest(NKikimrSchemeOp::TColumnTableDescri
         if (!index.data_columns().empty()) {
             if (index.type_case() == Ydb::Table::TableIndex::kLocalMinMaxIndex) {
                 return fail(NKikimr::NOlap::NIndexes::NMinMax::IncorrectDataColumnsErrorMessage(index.data_columns()));
+            } else if (index.type_case() == Ydb::Table::TableIndex::kLocalFulltextIndex) {
+                return fail(TString(NKikimr::NFulltext::LocalFulltextIndexNoDataColumns));
             } else {
                 return fail("Data columns are not supported for local bloom indexes");
             }
@@ -266,6 +271,36 @@ bool FillColumnTableIndexesFromCreateRequest(NKikimrSchemeOp::TColumnTableDescri
                     }
                 }
                 NKikimr::NOlap::NIndexes::NMinMax::SetAppropriateStoregeIdAndInheritPortionStorageBasedOnType(*olapIndex, columnDesc->GetType());
+                break;
+            }
+            case Ydb::Table::TableIndex::kLocalFulltextIndex: {
+                if (!AppData()->FeatureFlags.GetEnableLocalFulltextIndex()) {
+                    return fail(TString(NKikimr::NFulltext::LocalFulltextIndexDisabled));
+                }
+                const NKikimrSchemeOp::TOlapColumnDescription* columnDesc = nullptr;
+                for (const auto& column : tableDesc.GetSchema().GetColumns()) {
+                    if (column.GetName() == colName) {
+                        columnDesc = &column;
+                        break;
+                    }
+                }
+                if (!columnDesc || (columnDesc->GetType() != "String" && columnDesc->GetType() != "Utf8")) {
+                    return fail(TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn));
+                }
+                Ydb::Table::FulltextIndexSettings settings = index.local_fulltext_index().fulltext_settings();
+                if (settings.columns().empty()) {
+                    settings.add_columns()->set_column(colName);
+                }
+                TString validationError;
+                if (!NKikimr::NFulltext::ValidateSettings(settings, validationError)) {
+                    return fail(validationError);
+                }
+                NKikimr::NFulltext::NormalizeFulltextSettings(settings);
+                olapIndex->SetClassName(TString(NKikimr::NFulltext::LocalFulltextClassName));
+                olapIndex->SetInheritPortionStorage(true);
+                auto* section = olapIndex->MutableColumnFulltextIndex();
+                section->SetColumnId(columnId);
+                *section->MutableAnalyzers() = settings.columns(0).analyzers();
                 break;
             }
 
@@ -980,6 +1015,9 @@ void FillMultiColumnStatisticsDescriptionImpl(TYdbProto& out,
         const google::protobuf::RepeatedPtrField<NKikimrSchemeOp::TMultiColumnStatisticsDescription>& in);
 
 template <typename TYdbProto>
+void FillIndexDescriptionImpl(TYdbProto& out, const NKikimrSchemeOp::TTableDescription& in);
+
+template <typename TYdbProto>
 void FillColumnDescriptionImpl(TYdbProto& out, const NKikimrSchemeOp::TColumnTableDescription& in) {
     auto& schema = in.GetSchema();
 
@@ -1030,6 +1068,12 @@ void FillColumnDescriptionImpl(TYdbProto& out, const NKikimrSchemeOp::TColumnTab
     }
 
     FillMultiColumnStatisticsDescriptionImpl(out, in.GetMultiColumnStatistics());
+
+    if (in.TableIndexesSize() > 0) {
+        NKikimrSchemeOp::TTableDescription indexesOnly;
+        *indexesOnly.MutableTableIndexes() = in.GetTableIndexes();
+        FillIndexDescriptionImpl(out, indexesOnly);
+    }
 
     out.set_store_type(Ydb::Table::StoreType::STORE_TYPE_COLUMN);
 }
@@ -1155,6 +1199,27 @@ void FillColumnTableIndexesFromOlapColumnSchema(
                 ydbIndex->add_index_columns(it->second);
                 ydbIndex->mutable_local_min_max_index();
 
+                break;
+            }
+            case NKikimrSchemeOp::TOlapIndexDescription::kColumnFulltextIndex: {
+                const auto& fulltext = olapIndex.GetColumnFulltextIndex();
+                if (!fulltext.HasColumnId()) {
+                    continue;
+                }
+                const auto columnIt = idToName.find(fulltext.GetColumnId());
+                if (columnIt == idToName.end()) {
+                    continue;
+                }
+                auto* ydbIndex = out.add_indexes();
+                if constexpr (kSetDescribeIndexStatus) {
+                    ydbIndex->set_status(Ydb::Table::TableIndexDescription::STATUS_READY);
+                }
+                ydbIndex->set_name(olapIndex.GetName());
+                ydbIndex->add_index_columns(columnIt->second);
+                auto* settings = ydbIndex->mutable_local_fulltext_index()->mutable_fulltext_settings();
+                auto* column = settings->add_columns();
+                column->set_column(columnIt->second);
+                *column->mutable_analyzers() = fulltext.GetAnalyzers();
                 break;
             }
             default:
@@ -1668,10 +1733,25 @@ bool BuildAlterColumnTableModifyScheme(const TString& path, const Ydb::Table::Al
             }
         }
 
+        if (index.type_case() == Ydb::Table::TableIndex::kLocalFulltextIndex) {
+            if (index.index_columns_size() != 1) {
+                status = Ydb::StatusIds::BAD_REQUEST;
+                error = TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn);
+                return false;
+            }
+            if (alteredTable->Columns.find(index.index_columns(0)) == alteredTable->Columns.end()) {
+                status = Ydb::StatusIds::BAD_REQUEST;
+                error = TStringBuilder() << "Unknown index column '" << index.index_columns(0) << "'";
+                return false;
+            }
+        }
+
         if (!index.data_columns().empty()) {
             status = Ydb::StatusIds::BAD_REQUEST;
             if (index.type_case() == Ydb::Table::TableIndex::kLocalMinMaxIndex) {
                 error = NKikimr::NOlap::NIndexes::NMinMax::IncorrectDataColumnsErrorMessage(index.data_columns());
+            } else if (index.type_case() == Ydb::Table::TableIndex::kLocalFulltextIndex) {
+                error = TString(NKikimr::NFulltext::LocalFulltextIndexNoDataColumns);
             } else {
                 error = "Data columns are not supported for local bloom indexes";
             }
@@ -1754,11 +1834,43 @@ bool BuildAlterColumnTableModifyScheme(const TString& path, const Ydb::Table::Al
                 NKikimr::NOlap::NIndexes::NMinMax::SetAppropriateStoregeIdAndInheritPortionStorageBasedOnType(*upsert, TypeName(it->second.TypeInfo.GetTypeId()));
                 return true;
             }
+            case Ydb::Table::TableIndex::kLocalFulltextIndex: {
+                if (!AppData()->FeatureFlags.GetEnableLocalFulltextIndex()) {
+                    status = Ydb::StatusIds::UNSUPPORTED;
+                    error = TString(NKikimr::NFulltext::LocalFulltextIndexDisabled);
+                    return false;
+                }
+                const auto columnIt = alteredTable->Columns.find(index.index_columns(0));
+                if (columnIt == alteredTable->Columns.end()
+                    || (columnIt->second.Type != "String" && columnIt->second.Type != "Utf8"))
+                {
+                    status = Ydb::StatusIds::BAD_REQUEST;
+                    error = TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn);
+                    return false;
+                }
+                Ydb::Table::FulltextIndexSettings settings = index.local_fulltext_index().fulltext_settings();
+                if (settings.columns().empty()) {
+                    settings.add_columns()->set_column(index.index_columns(0));
+                }
+                TString validationError;
+                if (!NKikimr::NFulltext::ValidateSettings(settings, validationError)) {
+                    status = Ydb::StatusIds::BAD_REQUEST;
+                    error = validationError;
+                    return false;
+                }
+                NKikimr::NFulltext::NormalizeFulltextSettings(settings);
+                upsert->SetClassName(TString(NKikimr::NFulltext::LocalFulltextClassName));
+                upsert->SetInheritPortionStorage(true);
+                auto* section = upsert->MutableColumnFulltextIndex();
+                section->SetColumnName(index.index_columns(0));
+                *section->MutableAnalyzers() = settings.columns(0).analyzers();
+                return true;
+            }
             default:
                 status = Ydb::StatusIds::BAD_REQUEST;
                 const google::protobuf::Reflection* reflection = index.GetReflection();
                 const google::protobuf::Descriptor* descriptor = index.GetDescriptor();
-                error = TStringBuilder() << "Only local_bloom_filter_index, local_bloom_ngram_filter_index and local_min_max_index oneof variants are supported for column tables, got "
+                error = TStringBuilder() << "Only local_bloom_filter_index, local_bloom_ngram_filter_index, local_min_max_index and local_fulltext_index oneof variants are supported for column tables, got "
                         << reflection->GetOneofFieldDescriptor(index, descriptor->FindOneofByName("type"))->full_name();
                 return false;
         }
@@ -1915,6 +2027,19 @@ void FillPartitioningSettingsImpl(TYdbProto& out,
     }
 }
 
+const NKikimrSchemeOp::TTableDescription& FindImplTableDescription(
+    const NKikimrSchemeOp::TIndexDescription& tableIndex,
+    const char* name,
+    int fallbackIndex)
+{
+    for (const auto& impl : tableIndex.GetIndexImplTableDescriptions()) {
+        if (impl.GetName() == name) {
+            return impl;
+        }
+    }
+    return tableIndex.GetIndexImplTableDescriptions(fallbackIndex);
+}
+
 void FillGlobalIndexSettings(Ydb::Table::GlobalIndexSettings& settings,
     const NKikimrSchemeOp::TTableDescription& indexImplTableDescription
 ) {
@@ -2027,7 +2152,7 @@ void FillIndexDescriptionImpl(TYdbProto& out, const NKikimrSchemeOp::TTableDescr
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
             FillGlobalIndexSettings(
                 *index->mutable_global_fulltext_plain_index()->mutable_settings(),
-                tableIndex.GetIndexImplTableDescriptions(0)
+                FindImplTableDescription(tableIndex, NTableIndex::ImplTable, 0)
             );
 
             *index->mutable_global_fulltext_plain_index()->mutable_fulltext_settings() = tableIndex.GetFulltextIndexDescription().GetSettings();
@@ -2057,15 +2182,15 @@ void FillIndexDescriptionImpl(TYdbProto& out, const NKikimrSchemeOp::TTableDescr
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
             FillGlobalIndexSettings(
                 *index->mutable_global_fulltext_relevance_index()->mutable_docs_table_settings(),
-                tableIndex.GetIndexImplTableDescriptions(NTableIndex::NFulltext::DocsTablePosition - 1)
+                FindImplTableDescription(tableIndex, NTableIndex::NFulltext::DocsTable, NTableIndex::NFulltext::DocsTablePosition - 1)
             );
             FillGlobalIndexSettings(
                 *index->mutable_global_fulltext_relevance_index()->mutable_stats_table_settings(),
-                tableIndex.GetIndexImplTableDescriptions(NTableIndex::NFulltext::StatsTablePosition - 1)
+                FindImplTableDescription(tableIndex, NTableIndex::NFulltext::StatsTable, NTableIndex::NFulltext::StatsTablePosition - 1)
             );
             FillGlobalIndexSettings(
                 *index->mutable_global_fulltext_relevance_index()->mutable_posting_table_settings(),
-                tableIndex.GetIndexImplTableDescriptions(NTableIndex::NFulltext::PostingTablePosition - 1)
+                FindImplTableDescription(tableIndex, NTableIndex::ImplTable, NTableIndex::NFulltext::PostingTablePosition - 1)
             );
 
             *index->mutable_global_fulltext_relevance_index()->mutable_fulltext_settings() = tableIndex.GetFulltextIndexDescription().GetSettings();
@@ -2086,6 +2211,9 @@ void FillIndexDescriptionImpl(TYdbProto& out, const NKikimrSchemeOp::TTableDescr
             break;
         case NKikimrSchemeOp::EIndexTypeLocalMinMax:
             index->mutable_local_min_max_index();
+            break;
+        case NKikimrSchemeOp::EIndexTypeLocalFulltext:
+            *index->mutable_local_fulltext_index()->mutable_fulltext_settings() = tableIndex.GetFulltextIndexDescription().GetSettings();
             break;
         case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
             // count_min_sketch is a scheme object visible in the scheme tree, but is
@@ -2291,6 +2419,8 @@ bool FillIndexDescription(NKikimrSchemeOp::TIndexedTableCreationConfig& out,
             return returnError(Ydb::StatusIds::UNSUPPORTED, "Local bloom index types are not supported in indexed table creation config");
         case Ydb::Table::TableIndex::kLocalMinMaxIndex:
             return returnError(Ydb::StatusIds::UNSUPPORTED, "Local min_max index is not supported in indexed table creation config");
+        case Ydb::Table::TableIndex::kLocalFulltextIndex:
+            return returnError(Ydb::StatusIds::UNSUPPORTED, "Local fulltext index is not supported in indexed table creation config");
         case Ydb::Table::TableIndex::TYPE_NOT_SET:
             // FIXME: python sdk can create a table with a secondary index without a type
             // so it's not possible to return an invalid index type error here for now

@@ -4888,6 +4888,26 @@ Y_UNIT_TEST(AlterTableAddMinMaxIndex) {
     UNIT_ASSERT_C(result.IsOk(), result.Issues.ToString());
 }
 
+Y_UNIT_TEST(AlterTableAddIndexLocalFulltext) {
+    const auto result = SqlToYql(R"sql(
+        USE ydb;
+        ALTER TABLE logs
+          ADD INDEX message_idx LOCAL USING fulltext ON (message)
+          WITH (tokenizer = standard, use_filter_lowercase = true);
+    )sql");
+    UNIT_ASSERT_C(result.IsOk(), result.Issues.ToString());
+}
+
+Y_UNIT_TEST(AlterTableAddIndexGlobalFulltextIsNotSupported) {
+    ExpectFailWithError("USE ydb; ALTER TABLE table ADD INDEX idx GLOBAL USING fulltext ON (col)",
+                        "<main>:1:55: Error: FULLTEXT index can only be LOCAL\n");
+}
+
+Y_UNIT_TEST(AlterTableAddIndexLocalFulltextCoverIsNotSupported) {
+    ExpectFailWithFuzzyError("USE ydb; ALTER TABLE table ADD INDEX idx LOCAL USING fulltext ON (col) COVER (payload)",
+                        "COVER is not supported for local fulltext index");
+}
+
 Y_UNIT_TEST(AlterTableAddIndexGlobalMinMaxIsNotSupported) {
     ExpectFailWithError("USE ydb; ALTER TABLE table ADD INDEX idx GLOBAL USING min_max ON (col)",
                         "<main>:1:55: Error: MIN_MAX index can only be LOCAL\n");

@@ -250,6 +250,7 @@ public:
         }
 
         TPath tablePath = TPath::Resolve(workingDir, context.SS).Dive(mainTableName);
+        const bool columnParent = tablePath.IsResolved() && tablePath->IsColumnTable();
         {
             TPath::TChecker checks = tablePath.Check();
             checks
@@ -259,9 +260,13 @@ public:
                 .IsResolved()
                 .NotDeleted()
                 .NotUnderDeleting()
-                .IsTable()
                 .NotUnderOperation()
                 .IsCommonSensePath();
+            if (columnParent) {
+                checks.IsColumnTable();
+            } else {
+                checks.IsTable();
+            }
 
             if (!Transaction.GetInternal()) {
                 checks.NotAsyncReplicaTable();
@@ -304,10 +309,12 @@ public:
             }
         }
 
-        Y_ABORT_UNLESS(context.SS->Tables.contains(tablePath.Base()->PathId));
-        TTableInfo::TPtr table = context.SS->Tables.at(tablePath.Base()->PathId);
-
-        Y_ABORT_UNLESS(table->AlterVersion != 0);
+        TTableInfo::TPtr table;
+        if (!columnParent) {
+            Y_ABORT_UNLESS(context.SS->Tables.contains(tablePath.Base()->PathId));
+            table = context.SS->Tables.at(tablePath.Base()->PathId);
+            Y_ABORT_UNLESS(table->AlterVersion != 0);
+        }
 
         Y_ABORT_UNLESS(context.SS->Indexes.contains(indexPath.Base()->PathId));
         TTableIndexInfo::TPtr index = context.SS->Indexes.at(indexPath.Base()->PathId);
@@ -325,19 +332,22 @@ public:
         context.DbChanges.PersistTxState(OperationId);
 
         TTxState& txState = context.SS->CreateTx(OperationId, TTxState::TxDropTableIndexAtMainTable, tablePath.Base()->PathId);
-        txState.State = TTxState::ConfigureParts;
+        // A column table has no datashard to notify. Mark it under this operation and finish.
+        txState.State = columnParent ? TTxState::Done : TTxState::ConfigureParts;
         // do not fill txShards until all splits are done
 
         tablePath.Base()->PathState = NKikimrSchemeOp::EPathStateAlter;
         tablePath.Base()->LastTxId = OperationId.GetTxId();
 
-        for (auto splitTx: table->GetSplitOpsInFlight()) {
-            context.OnComplete.Dependence(splitTx.GetTxId(), OperationId.GetTxId());
+        if (table) {
+            for (auto splitTx: table->GetSplitOpsInFlight()) {
+                context.OnComplete.Dependence(splitTx.GetTxId(), OperationId.GetTxId());
+            }
         }
 
         context.OnComplete.ActivateTx(OperationId);
 
-        SetState(NextState());
+        SetState(columnParent ? TTxState::Done : NextState());
         return result;
     }
 
@@ -384,19 +394,24 @@ TVector<ISubOperation::TPtr> CreateDropIndex(TOperationId nextId, const TTxTrans
 
     TPath workingDirPath = TPath::Resolve(workingDir, context.SS);
 
-    TPath mainTablePath = workingDirPath.Child(mainTableName);
-    {
-        TPath::TChecker checks = mainTablePath.Check();
-        checks
-            .NotEmpty()
-            .NotUnderDomainUpgrade()
-            .IsAtLocalSchemeShard()
-            .IsResolved()
-            .NotDeleted()
-            .IsTable()
-            .NotUnderDeleting()
-            .NotUnderOperation()
-            .IsCommonSensePath();
+        TPath mainTablePath = workingDirPath.Child(mainTableName);
+        const bool columnParent = mainTablePath.IsResolved() && mainTablePath->IsColumnTable();
+        {
+            TPath::TChecker checks = mainTablePath.Check();
+            checks
+                .NotEmpty()
+                .NotUnderDomainUpgrade()
+                .IsAtLocalSchemeShard()
+                .IsResolved()
+                .NotDeleted()
+                .NotUnderDeleting()
+                .NotUnderOperation()
+                .IsCommonSensePath();
+            if (columnParent) {
+                checks.IsColumnTable();
+            } else {
+                checks.IsTable();
+            }
 
         if (!tx.GetInternal()) {
             checks.NotAsyncReplicaTable();
@@ -422,6 +437,13 @@ TVector<ISubOperation::TPtr> CreateDropIndex(TOperationId nextId, const TTxTrans
 
         if (!checks) {
             return {CreateReject(nextId, checks.GetStatus(), checks.GetError())};
+        }
+    }
+
+    if (columnParent) {
+        const auto* indexInfo = context.SS->Indexes.FindPtr(indexPath.Base()->PathId);
+        if (!indexInfo || !NTableIndex::IsColumnTableCompactFulltext((*indexInfo)->Type)) {
+            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter, NTableIndex::ColumnTableGlobalFulltextCompactOnly)};
         }
     }
 

@@ -2971,6 +2971,36 @@ void TKqpTasksGraph::BuildFullTextScanTasksFromSource(TStageInfo& stageInfo, TQu
         uniqueProto->MutableColumns()->CopyFrom(uniqueIdx.GetColumns());
     }
 
+    auto copyIndexTable = [](const NKqpProto::TKqpFullTextSource::TIndexTable& from, NKikimrKqp::TKqpFullTextSourceSettings::TIndexTable* to) {
+        to->MutableTable()->CopyFrom(from.GetTable());
+        to->MutableKeyColumns()->CopyFrom(from.GetKeyColumns());
+        to->MutableColumns()->CopyFrom(from.GetColumns());
+    };
+    if (fullTextSource.HasDocIdPolicy()) {
+        settings->SetDocIdPolicy(fullTextSource.GetDocIdPolicy());
+    }
+    if (fullTextSource.HasBuildGeneration()) {
+        settings->SetBuildGeneration(fullTextSource.GetBuildGeneration());
+    }
+    if (fullTextSource.HasAnalyzerRevision()) {
+        settings->SetAnalyzerRevision(fullTextSource.GetAnalyzerRevision());
+    }
+    if (fullTextSource.HasAnalyzerIdentity()) {
+        settings->SetAnalyzerIdentity(fullTextSource.GetAnalyzerIdentity());
+    }
+    if (fullTextSource.HasIndexState()) {
+        settings->SetIndexState(fullTextSource.GetIndexState());
+    }
+    if (fullTextSource.HasReadyVersion()) {
+        *settings->MutableReadyVersion() = fullTextSource.GetReadyVersion();
+    }
+    if (fullTextSource.HasStateTable()) {
+        copyIndexTable(fullTextSource.GetStateTable(), settings->MutableStateTable());
+    }
+    if (fullTextSource.HasDocIdMapTable()) {
+        copyIndexTable(fullTextSource.GetDocIdMapTable(), settings->MutableDocIdMapTable());
+    }
+
     settings->MutableKeyColumns()->CopyFrom(fullTextSource.GetKeyColumns());
     settings->MutableColumns()->CopyFrom(fullTextSource.GetColumns());
     if (GetMeta().Snapshot.IsValid()) {
@@ -3468,9 +3498,9 @@ bool TKqpTasksGraph::StageNeedsLocalPlacement(const NKqpProto::TKqpPhyStage& sta
             settings = *stageInfo.Meta.ResolvedSinkSettings;
         }
 
-        // Mirrors FillKqpTableSinkSettings: the buffer actor is attached (and thus the local-node requirement) exactly
-        // for consistent-tx, non-OLAP writes.
-        if (!settings.GetInconsistentTx() && !settings.GetIsOlap()) {
+        // Same predicate as FillKqpTableSinkSettings. An OLAP sink that also writes
+        // row support tables shares the buffer actor with those targets.
+        if (!settings.GetInconsistentTx() && (!settings.GetIsOlap() || settings.IndexesSize() > 0)) {
             return true;
         }
     }
@@ -3502,7 +3532,7 @@ void TKqpTasksGraph::FillKqpTableSinkSettings(NKikimrKqp::TKqpTableSinkSettings&
         settings.SetLockTxId(*lockTxId);
         settings.SetLockNodeId(GetMeta().ExecuterId.NodeId());
     }
-    if (!settings.GetInconsistentTx() && !settings.GetIsOlap()) {
+    if (!settings.GetInconsistentTx() && (!settings.GetIsOlap() || settings.IndexesSize() > 0)) {
         ActorIdToProto(BufferActorId, settings.MutableBufferActorId());
     }
     if (!settings.GetInconsistentTx() && GetMeta().Snapshot.IsValid()) {

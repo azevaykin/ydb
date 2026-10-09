@@ -7,6 +7,7 @@
 #include <ydb/core/tx/columnshard/hooks/testing/controller.h>
 #include <ydb/public/lib/ut_helpers/ut_helpers_query.h>
 #include <ydb/core/base/tablet_pipecache.h>
+#include <ydb/core/tx/data_events/events.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/operation/operation.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/proto/accessor.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/types/exceptions/exceptions.h>
@@ -4144,6 +4145,209 @@ Y_UNIT_TEST_SUITE(KqpQueryService) {
             )", NYdb::NQuery::TTxControl::BeginTx().CommitTx()).ExtractValueSync();
             UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
             CompareYson(R"([[1];[2];[3];[4]])", FormatResultSetYson(result.GetResultSet(0)));
+        }
+    }
+
+    // Protocol gate for a column base table plus manually created DataShard support tables.
+    // One transaction manager commits both engines, a full-PK column read observes the
+    // pre-mutation row under snapshot locks, a later read sees both engines' writes, and a
+    // failure after one engine has prepared leaves neither write committed.
+    Y_UNIT_TEST(MixedEngineHtapProtocol) {
+        auto settings = TKikimrSettings().SetWithSampleTables(false);
+        settings.AppConfig.MutableTableServiceConfig()->SetEnableOlapSink(true);
+        settings.AppConfig.MutableTableServiceConfig()->SetEnableHtapTx(true);
+        TKikimrRunner kikimr(settings);
+        Tests::NCommon::TLoggerInit(kikimr).Initialize();
+
+        auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+        auto result = session.ExecuteSchemeQuery(R"(
+            CREATE TABLE `/Root/HtapBase` (
+                Pk Uint64 NOT NULL,
+                Text String NOT NULL,
+                Payload Int32 NOT NULL,
+                PRIMARY KEY (Pk)
+            )
+            PARTITION BY HASH(Pk)
+            WITH (STORE = COLUMN, AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = 1);
+
+            CREATE TABLE `/Root/HtapState` (
+                Pk Uint64 NOT NULL,
+                Tokens String NOT NULL,
+                PRIMARY KEY (Pk)
+            );
+
+            CREATE TABLE `/Root/HtapPosting` (
+                Token String NOT NULL,
+                DocId Uint64 NOT NULL,
+                PRIMARY KEY (Token, DocId)
+            );
+        )").GetValueSync();
+        UNIT_ASSERT_C(result.GetStatus() == EStatus::SUCCESS, result.GetIssues().ToString());
+
+        auto client = kikimr.GetQueryClient();
+        {
+            auto seeded = client.ExecuteQuery(R"(
+                UPSERT INTO `/Root/HtapBase` (Pk, Text, Payload) VALUES (1u, "old text", 10);
+                UPSERT INTO `/Root/HtapState` (Pk, Tokens) VALUES (1u, "old");
+                UPSERT INTO `/Root/HtapPosting` (Token, DocId) VALUES ("old", 1u);
+            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+            UNIT_ASSERT_C(seeded.IsSuccess(), seeded.GetIssues().ToString());
+        }
+
+        // Property 2: full primary key read of the column row returns the committed
+        // old image, and that read participates in conflict detection.
+        {
+            auto reader = client.GetSession().GetValueSync().GetSession();
+            auto writer = client.GetSession().GetValueSync().GetSession();
+            auto read = reader.ExecuteQuery(R"(
+                SELECT Text, Payload FROM `/Root/HtapBase` WHERE Pk = 1u;
+            )", TTxControl::BeginTx(TTxSettings::SerializableRW())).ExtractValueSync();
+            UNIT_ASSERT_C(read.IsSuccess(), read.GetIssues().ToString());
+            CompareYson(R"([["old text";10]])", FormatResultSetYson(read.GetResultSet(0)));
+            auto tx = read.GetTransaction();
+            UNIT_ASSERT(tx);
+
+            auto raced = writer.ExecuteQuery(R"(
+                UPSERT INTO `/Root/HtapBase` (Pk, Text, Payload) VALUES (1u, "raced", 77);
+            )", TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx()).ExtractValueSync();
+            UNIT_ASSERT_C(raced.IsSuccess(), raced.GetIssues().ToString());
+
+            auto commit = tx->Commit().ExtractValueSync();
+            UNIT_ASSERT_VALUES_EQUAL_C(commit.GetStatus(), EStatus::ABORTED, commit.GetIssues().ToString());
+
+            auto visible = client.ExecuteQuery(R"(
+                SELECT Text, Payload FROM `/Root/HtapBase` WHERE Pk = 1u;
+            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+            UNIT_ASSERT_C(visible.IsSuccess(), visible.GetIssues().ToString());
+            CompareYson(R"([["raced";77]])", FormatResultSetYson(visible.GetResultSet(0)));
+        }
+
+        // Properties 1 and 3: one transaction writes an Arrow base batch and row support
+        // batches, then a later statement in that transaction sees both engines.
+        {
+            auto txSession = client.GetSession().GetValueSync().GetSession();
+            auto written = txSession.ExecuteQuery(R"(
+                UPSERT INTO `/Root/HtapBase` (Pk, Text, Payload) VALUES (2u, "indexed", 20);
+                UPSERT INTO `/Root/HtapState` (Pk, Tokens) VALUES (2u, "indexed-tokens");
+                UPSERT INTO `/Root/HtapPosting` (Token, DocId) VALUES ("indexed", 2u);
+            )", TTxControl::BeginTx(TTxSettings::SerializableRW())).ExtractValueSync();
+            UNIT_ASSERT_C(written.IsSuccess(), written.GetIssues().ToString());
+            auto tx = written.GetTransaction();
+            UNIT_ASSERT(tx);
+
+            auto observed = txSession.ExecuteQuery(R"(
+                SELECT Text, Payload FROM `/Root/HtapBase` WHERE Pk = 2u;
+                SELECT Tokens FROM `/Root/HtapState` WHERE Pk = 2u;
+                SELECT Token, DocId FROM `/Root/HtapPosting` WHERE Token = "indexed" AND DocId = 2u;
+            )", TTxControl::Tx(*tx)).ExtractValueSync();
+            UNIT_ASSERT_C(observed.IsSuccess(), observed.GetIssues().ToString());
+            CompareYson(R"([["indexed";20]])", FormatResultSetYson(observed.GetResultSet(0)));
+            CompareYson(R"([["indexed-tokens"]])", FormatResultSetYson(observed.GetResultSet(1)));
+            CompareYson(R"([["indexed";2u]])", FormatResultSetYson(observed.GetResultSet(2)));
+
+            auto committed = txSession.ExecuteQuery(R"(
+                SELECT Text, Payload FROM `/Root/HtapBase` WHERE Pk = 2u;
+            )", TTxControl::Tx(*tx).CommitTx()).ExtractValueSync();
+            UNIT_ASSERT_C(committed.IsSuccess(), committed.GetIssues().ToString());
+            CompareYson(R"([["indexed";20]])", FormatResultSetYson(committed.GetResultSet(0)));
+        }
+
+        {
+            auto committed = client.ExecuteQuery(R"(
+                SELECT Tokens FROM `/Root/HtapState` WHERE Pk = 2u;
+                SELECT DocId FROM `/Root/HtapPosting` WHERE Token = "indexed";
+            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+            UNIT_ASSERT_C(committed.IsSuccess(), committed.GetIssues().ToString());
+            CompareYson(R"([["indexed-tokens"]])", FormatResultSetYson(committed.GetResultSet(0)));
+            CompareYson(R"([[2u]])", FormatResultSetYson(committed.GetResultSet(1)));
+        }
+
+        // Property 4: after one engine's prepare succeeds, failing the other rolls the
+        // transaction back. Neither the column row nor the support rows change.
+        {
+            struct TPrepareFailure {
+                TMutex Mutex;
+                THashMap<ui64, bool> IsOlapTablet;
+                bool PreparedOlap = false;
+                bool PreparedRow = false;
+                bool Injected = false;
+            } state;
+
+            auto& runtime = *kikimr.GetTestServer().GetRuntime();
+            runtime.SetObserverFunc([&state](TAutoPtr<IEventHandle>& ev) {
+                if (ev->GetTypeRewrite() == TEvPipeCache::EvForward) {
+                    auto* forward = ev->Get<TEvPipeCache::TEvForward>();
+                    if (!forward->Ev || forward->Ev->Type() != NEvents::TDataEvents::TEvWrite::EventType) {
+                        return TTestActorRuntime::EEventAction::PROCESS;
+                    }
+                    const auto& record = static_cast<const NEvents::TDataEvents::TEvWrite&>(*forward->Ev).Record;
+                    bool sawArrow = false;
+                    bool sawRow = false;
+                    for (const auto& operation : record.GetOperations()) {
+                        if (!operation.HasPayloadFormat()) {
+                            continue;
+                        }
+                        if (operation.GetPayloadFormat() == NKikimrDataEvents::FORMAT_ARROW) {
+                            sawArrow = true;
+                        } else {
+                            sawRow = true;
+                        }
+                    }
+                    if (sawArrow != sawRow) {
+                        with_lock (state.Mutex) {
+                            state.IsOlapTablet[forward->TabletId] = sawArrow;
+                        }
+                    }
+                    return TTestActorRuntime::EEventAction::PROCESS;
+                }
+                if (ev->GetTypeRewrite() != NEvents::TDataEvents::TEvWriteResult::EventType) {
+                    return TTestActorRuntime::EEventAction::PROCESS;
+                }
+                auto* writeResult = ev->Get<NEvents::TDataEvents::TEvWriteResult>();
+                if (writeResult->Record.GetStatus() != NKikimrDataEvents::TEvWriteResult::STATUS_PREPARED) {
+                    return TTestActorRuntime::EEventAction::PROCESS;
+                }
+                with_lock (state.Mutex) {
+                    const auto engine = state.IsOlapTablet.find(writeResult->Record.GetOrigin());
+                    if (engine == state.IsOlapTablet.end() || state.Injected) {
+                        return TTestActorRuntime::EEventAction::PROCESS;
+                    }
+                    bool& prepared = engine->second ? state.PreparedOlap : state.PreparedRow;
+                    if (!prepared) {
+                        prepared = true;
+                        if (state.PreparedOlap && state.PreparedRow) {
+                            state.Injected = true;
+                            writeResult->Record.SetStatus(NKikimrDataEvents::TEvWriteResult::STATUS_ABORTED);
+                        }
+                    }
+                }
+                return TTestActorRuntime::EEventAction::PROCESS;
+            });
+
+            auto failed = client.ExecuteQuery(R"(
+                UPSERT INTO `/Root/HtapBase` (Pk, Text, Payload) VALUES (2u, "lost", 99);
+                UPSERT INTO `/Root/HtapState` (Pk, Tokens) VALUES (2u, "lost");
+                UPSERT INTO `/Root/HtapPosting` (Token, DocId) VALUES ("lost", 2u);
+                DELETE FROM `/Root/HtapPosting` WHERE Token = "indexed" AND DocId = 2u;
+            )", TTxControl::BeginTx(TTxSettings::SerializableRW()).CommitTx()).ExtractValueSync();
+            runtime.SetObserverFunc(TTestActorRuntime::DefaultObserverFunc);
+
+            UNIT_ASSERT_C(!failed.IsSuccess(), failed.GetIssues().ToString());
+            bool injected = false;
+            with_lock (state.Mutex) {
+                injected = state.Injected;
+            }
+            UNIT_ASSERT_C(injected, "prepare failure was not injected after one engine prepared");
+
+            auto visible = client.ExecuteQuery(R"(
+                SELECT Text, Payload FROM `/Root/HtapBase` WHERE Pk = 2u;
+                SELECT Tokens FROM `/Root/HtapState` WHERE Pk = 2u;
+                SELECT Token, DocId FROM `/Root/HtapPosting` WHERE DocId = 2u ORDER BY Token;
+            )", TTxControl::BeginTx().CommitTx()).ExtractValueSync();
+            UNIT_ASSERT_C(visible.IsSuccess(), visible.GetIssues().ToString());
+            CompareYson(R"([["indexed";20]])", FormatResultSetYson(visible.GetResultSet(0)));
+            CompareYson(R"([["indexed-tokens"]])", FormatResultSetYson(visible.GetResultSet(1)));
+            CompareYson(R"([["indexed";2u]])", FormatResultSetYson(visible.GetResultSet(2)));
         }
     }
 

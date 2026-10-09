@@ -3,6 +3,8 @@
 #include "superlemmer.h"
 #include "table_index.h"
 
+#include <util/digest/city.h>
+
 #include <library/cpp/json/json_reader.h>
 #include <library/cpp/resource/resource.h>
 #include <library/cpp/testing/unittest/registar.h>
@@ -92,6 +94,60 @@ namespace NKikimr::NFulltext {
         void ApplyTestSuperLemmer(const TString& languages, TString&) {
             SuperLemmerCallState.Languages = languages;
             ++SuperLemmerCallState.Calls;
+        }
+
+        Ydb::Table::FulltextIndexSettings::Analyzers StandardAnalyzers(bool lowercase = false) {
+            Ydb::Table::FulltextIndexSettings::Analyzers analyzers;
+            analyzers.set_tokenizer(Ydb::Table::FulltextIndexSettings::STANDARD);
+            if (lowercase) {
+                analyzers.set_use_filter_lowercase(true);
+            }
+            return analyzers;
+        }
+
+        Ydb::Table::FulltextIndexSettings::Analyzers KeywordAnalyzers() {
+            Ydb::Table::FulltextIndexSettings::Analyzers analyzers;
+            analyzers.set_tokenizer(Ydb::Table::FulltextIndexSettings::KEYWORD);
+            return analyzers;
+        }
+
+        Ydb::Table::FulltextIndexSettings::Analyzers NgramAnalyzers(i32 minLength, i32 maxLength, bool edge = false) {
+            Ydb::Table::FulltextIndexSettings::Analyzers analyzers;
+            analyzers.set_tokenizer(Ydb::Table::FulltextIndexSettings::WHITESPACE);
+            analyzers.set_filter_ngram_min_length(minLength);
+            analyzers.set_filter_ngram_max_length(maxLength);
+            if (edge) {
+                analyzers.set_use_filter_edge_ngram(true);
+            } else {
+                analyzers.set_use_filter_ngram(true);
+            }
+            return analyzers;
+        }
+
+        TFulltextQueryOptions Options(TString defaultOperator = {}, TString minimumShouldMatch = {}, TString mode = {}) {
+            TFulltextQueryOptions options;
+            options.DefaultOperator = std::move(defaultOperator);
+            options.MinimumShouldMatch = std::move(minimumShouldMatch);
+            options.Mode = std::move(mode);
+            return options;
+        }
+
+        TCompiledFulltextQuery MustCompile(
+            const TString& query,
+            const Ydb::Table::FulltextIndexSettings::Analyzers& analyzers,
+            TFulltextQueryOptions options = {})
+        {
+            const auto validation = CompileFulltextQuery(query, analyzers, options);
+            UNIT_ASSERT_C(validation, validation.Error);
+            return *validation.Compiled;
+        }
+
+        THashSet<TString> TokenSet(const TCompiledFulltextQuery& query, TStringBuf text) {
+            THashSet<TString> tokens;
+            for (const auto& token : TokenizeFulltextDocument(query, text)) {
+                tokens.insert(token);
+            }
+            return tokens;
         }
 
     } // anonymous namespace
@@ -1093,6 +1149,353 @@ namespace NKikimr::NFulltext {
             // Punctuation breaks tokens: "1,2.foo" — the period before a letter is MidLetter territory,
             // but here it follows digits so the chain stops at "1,2" and "foo" is separate.
             UNIT_ASSERT_VALUES_EQUAL(Analyze("1,2.foo", analyzers), (TVector<TString>{"1,2", "foo"}));
+        }
+
+        Y_UNIT_TEST(CompiledQueryAndOr) {
+            const auto analyzers = StandardAnalyzers(true);
+            const auto land = MustCompile("quick fox", analyzers, Options("and"));
+            UNIT_ASSERT(land.Operator == NTableIndex::NFulltext::EDefaultOperator::And);
+            UNIT_ASSERT(!land.OptionalThreshold.has_value());
+            UNIT_ASSERT_VALUES_EQUAL(land.Terms, (TVector<TCompiledFulltextTerm>{{"quick", false}, {"fox", false}}));
+            UNIT_ASSERT(EvaluateFulltextText(land, TStringBuf("quick brown fox")));
+            UNIT_ASSERT(!EvaluateFulltextText(land, TStringBuf("quick brown")));
+
+            const auto lor = MustCompile("quick fox", analyzers, Options("OR"));
+            UNIT_ASSERT(lor.Operator == NTableIndex::NFulltext::EDefaultOperator::Or);
+            UNIT_ASSERT_VALUES_EQUAL(*lor.OptionalThreshold, 1u);
+            UNIT_ASSERT(EvaluateFulltextText(lor, TStringBuf("quick brown")));
+            UNIT_ASSERT(EvaluateFulltextText(lor, TStringBuf("the fox")));
+            UNIT_ASSERT(!EvaluateFulltextText(lor, TStringBuf("lazy dog")));
+
+            const auto def = MustCompile("quick fox", analyzers);
+            UNIT_ASSERT(def.Operator == NTableIndex::NFulltext::EDefaultOperator::And);
+            UNIT_ASSERT(def.Mode == EFulltextQueryMode::Keywords);
+            UNIT_ASSERT(def.WildcardPattern.empty());
+        }
+
+        Y_UNIT_TEST(CompiledQueryRequiredTerms) {
+            const auto analyzers = StandardAnalyzers(true);
+            const TVector<TString> docs = {
+                "the quick brown fox jumps over the lazy dog",
+                "quick quick fox",
+                "lazy dog sleeps",
+                "brown bear eats honey",
+                "xylophone music is rare",
+            };
+            auto keys = [&](const TString& search, TFulltextQueryOptions options) {
+                const auto query = MustCompile(search, analyzers, options);
+                TVector<ui64> matched;
+                for (size_t i = 0; i < docs.size(); ++i) {
+                    if (EvaluateFulltextText(query, TStringBuf(docs[i]))) {
+                        matched.push_back(i);
+                    }
+                }
+                return matched;
+            };
+
+            const auto or1 = Options("or", "1");
+            const auto or2 = Options("or", "2");
+            UNIT_ASSERT_VALUES_EQUAL(keys("+brown +fox", or1), (TVector<ui64>{0}));
+            UNIT_ASSERT_VALUES_EQUAL(keys("+quick fox", or1), (TVector<ui64>{0, 1}));
+            UNIT_ASSERT_VALUES_EQUAL(keys("+honey quick", or1), (TVector<ui64>{}));
+            UNIT_ASSERT_VALUES_EQUAL(keys("+brown lazy honey", or1), (TVector<ui64>{0, 3}));
+            UNIT_ASSERT_VALUES_EQUAL(keys("+brown +lazy dog", or1), (TVector<ui64>{0}));
+            UNIT_ASSERT_VALUES_EQUAL(keys("+quick fox brown", or1), (TVector<ui64>{0, 1}));
+            UNIT_ASSERT_VALUES_EQUAL(keys("+quick fox brown", or2), (TVector<ui64>{0}));
+
+            const auto allRequired = MustCompile("+brown +fox", analyzers, or1);
+            UNIT_ASSERT(!allRequired.OptionalThreshold.has_value());
+            // Explicit "1" against zero optional terms clamps to 0, so the row-table
+            // total is the required-term count. An omitted threshold adds the parser's
+            // default 1 before that same count is clamped back to the term count.
+            UNIT_ASSERT_VALUES_EQUAL(allRequired.MinimumShouldMatch, 2u);
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("+brown +fox", analyzers, Options("or")).MinimumShouldMatch, 3u);
+            UNIT_ASSERT(EvaluateFulltextText(allRequired, TStringBuf(docs[0])));
+            UNIT_ASSERT(!EvaluateFulltextText(allRequired, TStringBuf(docs[3])));
+        }
+
+        Y_UNIT_TEST(CompiledQueryDuplicateTerms) {
+            const auto analyzers = StandardAnalyzers();
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("apple apple", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"apple", false}}));
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("apple +apple", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"apple", true}}));
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("+apple apple", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"apple", true}}));
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("banana apple +apple", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"banana", false}, {"apple", true}}));
+
+            const auto ngram = NgramAnalyzers(2, 2);
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("aaaa", ngram).Terms,
+                (TVector<TCompiledFulltextTerm>{{"aa", false}}));
+        }
+
+        Y_UNIT_TEST(CompiledQueryPlusFoo) {
+            const auto analyzers = StandardAnalyzers();
+            const auto required = MustCompile("+foo", analyzers, Options("or"));
+            UNIT_ASSERT_VALUES_EQUAL(required.Terms, (TVector<TCompiledFulltextTerm>{{"foo", true}}));
+            UNIT_ASSERT(!required.OptionalThreshold.has_value());
+            UNIT_ASSERT(EvaluateFulltextText(required, TStringBuf("foo bar")));
+            UNIT_ASSERT(!EvaluateFulltextText(required, TStringBuf("bar")));
+
+            const auto plain = MustCompile("foo", analyzers, Options("or"));
+            UNIT_ASSERT_VALUES_EQUAL(plain.Terms, (TVector<TCompiledFulltextTerm>{{"foo", false}}));
+            UNIT_ASSERT(EvaluateFulltextText(plain, TStringBuf("foo")));
+        }
+
+        Y_UNIT_TEST(CompiledQueryBarePlus) {
+            const auto analyzers = StandardAnalyzers();
+            for (const char* query : {"+", "+ ", " + ", "+ +"}) {
+                const auto validation = CompileFulltextQuery(query, analyzers);
+                UNIT_ASSERT_C(!validation, query);
+                UNIT_ASSERT_STRING_CONTAINS(validation.Error, "No search terms were extracted from the query");
+            }
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("+ foo", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"foo", false}}));
+
+            const auto keyword = KeywordAnalyzers();
+            const auto plusPlus = CompileFulltextQuery("++", keyword);
+            UNIT_ASSERT(plusPlus);
+            UNIT_ASSERT_VALUES_EQUAL(plusPlus.Compiled->Terms, (TVector<TCompiledFulltextTerm>{{"+", true}}));
+            const auto standardPlusPlus = CompileFulltextQuery("++", analyzers);
+            UNIT_ASSERT(!standardPlusPlus);
+            UNIT_ASSERT_STRING_CONTAINS(standardPlusPlus.Error, "No search terms were extracted from the query");
+        }
+
+        Y_UNIT_TEST(CompiledQueryCPlusPlus) {
+            const auto standard = StandardAnalyzers();
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("c++", standard).Terms,
+                (TVector<TCompiledFulltextTerm>{{"c", false}}));
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("c++ test", standard).Terms,
+                (TVector<TCompiledFulltextTerm>{{"c", false}, {"test", false}}));
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("+c++", standard).Terms,
+                (TVector<TCompiledFulltextTerm>{{"c", true}}));
+
+            const auto keyword = KeywordAnalyzers();
+            const auto whole = MustCompile("c++", keyword);
+            UNIT_ASSERT_VALUES_EQUAL(whole.Terms, (TVector<TCompiledFulltextTerm>{{"c++", false}}));
+            UNIT_ASSERT(EvaluateFulltextText(whole, TStringBuf("c++")));
+            UNIT_ASSERT(!EvaluateFulltextText(whole, TStringBuf("c")));
+        }
+
+        Y_UNIT_TEST(CompiledQueryWhitespace) {
+            const auto analyzers = StandardAnalyzers();
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("  apple\t\tbanana\nbaz  ", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"apple", false}, {"banana", false}, {"baz", false}}));
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("\t+apple\r\nbanana\f\vbaz", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"apple", true}, {"banana", false}, {"baz", false}}));
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("+apple   banana", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"apple", true}, {"banana", false}}));
+        }
+
+        Y_UNIT_TEST(CompiledQueryKeywordWithSpaces) {
+            const auto analyzers = KeywordAnalyzers();
+            const auto spaced = MustCompile("foo bar", analyzers);
+            UNIT_ASSERT_VALUES_EQUAL(spaced.Terms, (TVector<TCompiledFulltextTerm>{{"foo bar", false}}));
+            UNIT_ASSERT(EvaluateFulltextText(spaced, TStringBuf("foo bar")));
+            UNIT_ASSERT(!EvaluateFulltextText(spaced, TStringBuf("foo")));
+            UNIT_ASSERT(!EvaluateFulltextText(spaced, TStringBuf("foo  bar")));
+
+            const auto padded = MustCompile(" foo bar ", analyzers);
+            UNIT_ASSERT_VALUES_EQUAL(padded.Terms, (TVector<TCompiledFulltextTerm>{{" foo bar ", false}}));
+            UNIT_ASSERT(EvaluateFulltextText(padded, TStringBuf(" foo bar ")));
+            UNIT_ASSERT(!EvaluateFulltextText(padded, TStringBuf("foo bar")));
+
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("+foo bar", analyzers).Terms,
+                (TVector<TCompiledFulltextTerm>{{"foo", true}, {"bar", false}}));
+        }
+
+        Y_UNIT_TEST(CompiledQueryThresholdBoundaries) {
+            const auto analyzers = StandardAnalyzers();
+            const TString query = "a b c d";
+
+            auto threshold = [&](const TString& minimumShouldMatch) {
+                const auto compiled = MustCompile(query, analyzers, Options("or", minimumShouldMatch));
+                UNIT_ASSERT(compiled.OptionalThreshold.has_value());
+                return *compiled.OptionalThreshold;
+            };
+
+            UNIT_ASSERT_VALUES_EQUAL(threshold(""), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("1"), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("0"), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("4"), 4u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("100"), 4u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("-1"), 3u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("-3"), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("-4"), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("-100"), 1u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("50%"), 2u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("100%"), 4u);
+            UNIT_ASSERT_VALUES_EQUAL(threshold("1%"), 1u);
+
+            const auto three = MustCompile("a b c", analyzers, Options("or", "50%"));
+            UNIT_ASSERT_VALUES_EQUAL(*three.OptionalThreshold, 1u);
+            UNIT_ASSERT(EvaluateFulltextText(three, TStringBuf("a")));
+            UNIT_ASSERT(!EvaluateFulltextText(three, TStringBuf("z")));
+            const auto threeAll = MustCompile("a b c", analyzers, Options("or", "100%"));
+            UNIT_ASSERT_VALUES_EQUAL(*threeAll.OptionalThreshold, 3u);
+            UNIT_ASSERT(!EvaluateFulltextText(threeAll, TStringBuf("a b")));
+            UNIT_ASSERT(EvaluateFulltextText(threeAll, TStringBuf("c b a")));
+
+            const auto one = MustCompile("a", analyzers, Options("or", "50%"));
+            UNIT_ASSERT_VALUES_EQUAL(*one.OptionalThreshold, 1u);
+
+            const auto withRequired = MustCompile("+a b c", analyzers, Options("or", "1"));
+            UNIT_ASSERT_VALUES_EQUAL(*withRequired.OptionalThreshold, 1u);
+            UNIT_ASSERT_VALUES_EQUAL(withRequired.MinimumShouldMatch, 2u);
+            UNIT_ASSERT(!EvaluateFulltextText(withRequired, TStringBuf("a")));
+            UNIT_ASSERT(EvaluateFulltextText(withRequired, TStringBuf("a b")));
+            UNIT_ASSERT(!EvaluateFulltextText(withRequired, TStringBuf("b c")));
+            const auto bothOptionals = MustCompile("+a b c", analyzers, Options("or", "2"));
+            UNIT_ASSERT(!EvaluateFulltextText(bothOptionals, TStringBuf("a b")));
+            UNIT_ASSERT(EvaluateFulltextText(bothOptionals, TStringBuf("a b c")));
+
+            auto expectError = [&](const TString& search, TFulltextQueryOptions options, const TString& message) {
+                const auto validation = CompileFulltextQuery(search, analyzers, options);
+                UNIT_ASSERT_C(!validation, search);
+                UNIT_ASSERT_STRING_CONTAINS(validation.Error, message);
+            };
+            expectError("a b", Options("and", "1"), "MinimumShouldMatch is not supported for AND default operator");
+            expectError("a b", Options("or", "0%"), "Should be positive");
+            expectError("a b", Options("or", "101%"), "Should be less than or equal to 100");
+            expectError("a b", Options("or", "-1%"), "Should be positive");
+            expectError("a b", Options("or", "non_numeric%"), "Invalid percentage");
+            expectError("a b", Options("or", "non_numeric"), "Should be a number");
+            expectError("a b", Options("some"), "Unsupported default operator");
+        }
+
+        Y_UNIT_TEST(CompiledQueryNullAndEmptyText) {
+            const auto standard = StandardAnalyzers();
+            const auto keyword = KeywordAnalyzers();
+            const auto standardQuery = MustCompile("hello", standard);
+            const auto keywordQuery = MustCompile("hello", keyword);
+
+            UNIT_ASSERT(!EvaluateFulltextText(standardQuery, std::nullopt));
+            UNIT_ASSERT(!EvaluateFulltextText(keywordQuery, std::nullopt));
+            UNIT_ASSERT(!EvaluateFulltextText(standardQuery, TStringBuf()));
+            UNIT_ASSERT(!EvaluateFulltextText(keywordQuery, TStringBuf()));
+
+            UNIT_ASSERT_VALUES_EQUAL(TokenizeFulltextDocument(standardQuery, ""), (TVector<TString>{}));
+            UNIT_ASSERT_VALUES_EQUAL(TokenizeFulltextDocument(keywordQuery, ""), (TVector<TString>{""}));
+            UNIT_ASSERT(!EvaluateFulltextMembership(keywordQuery, TokenSet(keywordQuery, "")));
+            UNIT_ASSERT(EvaluateFulltextMembership(keywordQuery, TokenSet(keywordQuery, "hello")));
+
+            const auto spaces = MustCompile("   ", keyword);
+            UNIT_ASSERT_VALUES_EQUAL(spaces.Terms, (TVector<TCompiledFulltextTerm>{{"   ", false}}));
+            UNIT_ASSERT(!EvaluateFulltextText(spaces, TStringBuf()));
+            UNIT_ASSERT(EvaluateFulltextText(spaces, TStringBuf("   ")));
+            const auto blank = CompileFulltextQuery("   ", standard);
+            UNIT_ASSERT(!blank);
+            UNIT_ASSERT_STRING_CONTAINS(blank.Error, "No search terms were extracted from the query");
+        }
+
+        Y_UNIT_TEST(CompiledQueryValidationErrors) {
+            const auto analyzers = StandardAnalyzers();
+            const auto empty = CompileFulltextQuery("", analyzers);
+            UNIT_ASSERT(!empty);
+            UNIT_ASSERT_VALUES_EQUAL(empty.Error, "Empty fulltext query");
+
+            auto withStopwords = analyzers;
+            withStopwords.set_use_filter_stopwords(true);
+            withStopwords.set_use_filter_lowercase(true);
+            const auto noTerms = CompileFulltextQuery("the a", withStopwords);
+            UNIT_ASSERT(!noTerms);
+            UNIT_ASSERT_VALUES_EQUAL(noTerms.Error, "No search terms were extracted from the query");
+
+            auto columnMode = Options();
+            columnMode.Mode = "Query";
+            const auto queryMode = CompileFulltextQuery("hello", analyzers, columnMode);
+            UNIT_ASSERT(!queryMode);
+            UNIT_ASSERT_STRING_CONTAINS(queryMode.Error, "Unsupported fulltext mode");
+
+            columnMode.Mode = "bogus";
+            const auto bogus = CompileFulltextQuery("hello", analyzers, columnMode);
+            UNIT_ASSERT(!bogus);
+            UNIT_ASSERT_STRING_CONTAINS(bogus.Error, "Unsupported fulltext mode");
+
+            columnMode.Mode.clear();
+            columnMode.ModeIsParameter = true;
+            const auto parameter = CompileFulltextQuery("hello", analyzers, columnMode);
+            UNIT_ASSERT(!parameter);
+            UNIT_ASSERT_VALUES_EQUAL(parameter.Error, "Parameterized fulltext mode is not supported");
+
+            columnMode = Options();
+            columnMode.Mode = "Wildcard";
+            const auto wildcard = CompileFulltextQuery("hello%", analyzers, columnMode);
+            UNIT_ASSERT(!wildcard);
+            UNIT_ASSERT_STRING_CONTAINS(wildcard.Error, "use_filter_ngram or use_filter_edge_ngram");
+
+            const auto ngram = NgramAnalyzers(3, 4);
+            for (const char* pattern : {"%", "%%%", "_", "ab%"}) {
+                const auto tooShort = CompileFulltextQuery(pattern, ngram, columnMode);
+                UNIT_ASSERT_C(!tooShort, pattern);
+                UNIT_ASSERT_STRING_CONTAINS(tooShort.Error, "No search terms were extracted from the query");
+            }
+
+            auto row = Options();
+            row.Checks = EFulltextQueryChecks::RowTable;
+            row.Mode = "Query";
+            const auto preserved = MustCompile("hello world", analyzers, row);
+            UNIT_ASSERT(preserved.Mode == EFulltextQueryMode::Keywords);
+            UNIT_ASSERT_VALUES_EQUAL(preserved.Terms, MustCompile("hello world", analyzers).Terms);
+
+            row.Mode = "Wildcard";
+            const auto rowWildcard = MustCompile("hello%", analyzers, row);
+            UNIT_ASSERT(rowWildcard.Mode == EFulltextQueryMode::Wildcard);
+            UNIT_ASSERT_VALUES_EQUAL(rowWildcard.WildcardPattern, "hello%");
+
+            const auto keywords = MustCompile("Hello", analyzers, Options({}, {}, "KeYwOrDs"));
+            UNIT_ASSERT(keywords.Mode == EFulltextQueryMode::Keywords);
+            UNIT_ASSERT_VALUES_EQUAL(keywords.AnalyzerIdentity, MustCompile("other", analyzers).AnalyzerIdentity);
+            auto lower = analyzers;
+            lower.set_use_filter_lowercase(true);
+            UNIT_ASSERT_VALUES_UNEQUAL(keywords.AnalyzerIdentity, MustCompile("Hello", lower).AnalyzerIdentity);
+            UNIT_ASSERT_VALUES_UNEQUAL(keywords.AnalyzerRevision, MustCompile("Hello", lower).AnalyzerRevision);
+            UNIT_ASSERT_VALUES_EQUAL(keywords.AnalyzerRevision, CityHash64(keywords.AnalyzerIdentity));
+        }
+
+        Y_UNIT_TEST(CompiledQueryWildcardResidual) {
+            auto options = Options();
+            options.Mode = "wildcard";
+            const auto ngram = NgramAnalyzers(3, 4);
+            const auto wildcard = MustCompile("abc%", ngram, options);
+            UNIT_ASSERT(wildcard.Mode == EFulltextQueryMode::Wildcard);
+            UNIT_ASSERT_VALUES_EQUAL(wildcard.WildcardPattern, "abc%");
+            UNIT_ASSERT_VALUES_EQUAL(wildcard.Terms, (TVector<TCompiledFulltextTerm>{{"abc", false}}));
+
+            UNIT_ASSERT(EvaluateFulltextText(wildcard, TStringBuf("abcd")));
+            UNIT_ASSERT(EvaluateFulltextText(wildcard, TStringBuf("abc")));
+            UNIT_ASSERT(!EvaluateFulltextText(wildcard, TStringBuf("zzabc")));
+            UNIT_ASSERT(!EvaluateFulltextText(wildcard, TStringBuf("ABCD")));
+            UNIT_ASSERT(EvaluateFulltextMembership(wildcard, TokenSet(wildcard, "zzabc")));
+            UNIT_ASSERT(!MatchFulltextWildcardResidual(wildcard, "zzabc"));
+            UNIT_ASSERT(MatchFulltextWildcardResidual(wildcard, "ABCD"));
+            UNIT_ASSERT(!EvaluateFulltextText(wildcard, std::nullopt));
+
+            const auto keywords = MustCompile("abc%", ngram, Options({}, {}, "keywords"));
+            UNIT_ASSERT(keywords.WildcardPattern.empty());
+            UNIT_ASSERT(!MatchFulltextWildcardResidual(keywords, "abcd"));
+            UNIT_ASSERT(EvaluateFulltextText(keywords, TStringBuf("zzabc")));
+            UNIT_ASSERT(!EvaluateFulltextText(wildcard, TStringBuf("zzabc")));
+
+            const auto like = MustCompile("a_c", NgramAnalyzers(1, 1), options);
+            UNIT_ASSERT(EvaluateFulltextText(like, TStringBuf("abc")));
+            UNIT_ASSERT(EvaluateFulltextText(like, TStringBuf("axc")));
+            UNIT_ASSERT(EvaluateFulltextMembership(like, TokenSet(like, "abbc")));
+            UNIT_ASSERT(!MatchFulltextWildcardResidual(like, "abbc"));
+            UNIT_ASSERT(!EvaluateFulltextText(like, TStringBuf("abbc")));
+            UNIT_ASSERT(!EvaluateFulltextText(like, TStringBuf("ac")));
+
+            const auto both = MustCompile("abc%def", ngram, options);
+            UNIT_ASSERT(EvaluateFulltextText(both, TStringBuf("abcdef")));
+            UNIT_ASSERT(EvaluateFulltextMembership(both, TokenSet(both, "defabc")));
+            UNIT_ASSERT(!EvaluateFulltextText(both, TStringBuf("defabc")));
+
+            auto lowerAnalyzers = ngram;
+            lowerAnalyzers.set_use_filter_lowercase(true);
+            const auto lower = MustCompile("ABC%", lowerAnalyzers, options);
+            UNIT_ASSERT(EvaluateFulltextText(lower, TStringBuf("abcd")));
+            UNIT_ASSERT(EvaluateFulltextText(lower, TStringBuf("ABCD")));
         }
 
         Y_UNIT_TEST(WordBreakTest) {

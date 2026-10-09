@@ -1,5 +1,7 @@
 #include "predicate_collector.h"
 
+#include <ydb/core/kqp/expr_nodes/kqp_expr_nodes.h>
+
 #include <yql/essentials/core/sql_types/yql_atom_enums.h>
 #include <yql/essentials/core/yql_opt_utils.h>
 #include <yql/essentials/core/yql_expr_optimize.h>
@@ -507,6 +509,9 @@ void CollectPredicates(const TExprBase& predicate, TOLAPPredicateNode& predicate
     } else if (const auto maybeJsonExists = predicate.Maybe<TCoJsonExists>()) {
         predicateTree.CanBePushed = JsonExistsCanBePushed(maybeJsonExists.Cast(), lambdaArg);
         predicateTree.CanBePushedApply = predicateTree.CanBePushed;
+    } else if (predicate.Maybe<TKqpOlapFulltextMatch>()) {
+        predicateTree.CanBePushed = true;
+        predicateTree.CanBePushedApply = true;
     }
 
     if (options.AllowOlapApply && !predicateTree.CanBePushedApply){

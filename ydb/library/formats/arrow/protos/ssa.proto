@@ -116,6 +116,22 @@ message TProgram {
             repeated TColumn Arguments = 2;
         }
 
+        // Boolean FulltextMatch pushed into a column-table scan.
+        // AnalyzerSettings is the canonical normalized analyzer proto.
+        message TFulltextMatch {
+            optional uint32 IndexId = 1;
+            optional uint32 ColumnId = 2;
+            optional bytes AnalyzerSettings = 3;
+            optional uint64 AnalyzerRevision = 4;
+            optional string DefaultOperator = 5;
+            optional string MinimumShouldMatch = 6;
+            optional string Mode = 7;
+            oneof query {
+                bytes QueryText = 8;
+                string QueryParameter = 9;
+            }
+        }
+
         optional TColumn Column = 1;
         oneof expression {
             TFunction Function = 2;
@@ -123,6 +139,7 @@ message TProgram {
             TConstant Constant = 4;
             bool Null = 5;
             TParameter Parameter = 6;
+            TFulltextMatch FulltextMatch = 7;
         }
     }
 

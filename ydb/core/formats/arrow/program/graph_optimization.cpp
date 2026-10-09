@@ -420,6 +420,21 @@ TConclusion<bool> TGraph::OptimizeForFetchDictionaryOnly(TGraphNode* node, const
     }
 
     const ui32 columnId = *requiredDataColumnIds.begin();
+    for (const auto& [_, candidate] : Nodes) {
+        if (!candidate->Is(EProcessorType::Calculation)) {
+            continue;
+        }
+        const auto calculation = candidate->GetProcessorAs<TCalculationProcessor>();
+        const auto& kernel = calculation->GetKernelLogic();
+        if (!kernel || !kernel->RequiresSourceRows()) {
+            continue;
+        }
+        for (const auto& input : calculation->GetInput()) {
+            if (input.GetColumnId() == columnId) {
+                return false;
+            }
+        }
+    }
 
     if (node->Is(EProcessorType::DistinctMarker)) {
         const auto distinctMarker = node->GetProcessorAs<TDistinctMarkerProcessor>();

@@ -26,9 +26,9 @@ protected:
     virtual std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>> DoBuildIndexImpl(
         TChunkedBatchReader& reader, const ui32 recordsCount) const = 0;
 
-    virtual TConclusion<std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>>> DoBuildIndexOptional(
+    virtual TConclusion<TIndexBuildOutcome> DoBuildIndexOptional(
         const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data, const ui32 recordsCount,
-        const TIndexInfo& indexInfo) const override final;
+        const TIndexInfo& indexInfo, const TIndexBuildContext& context) const override final;
     virtual bool DoDeserializeFromProto(const NKikimrSchemeOp::TOlapIndexDescription& proto) override;
 
     TConclusionStatus CheckSameColumnsForModification(const IIndexMeta& newMeta) const;

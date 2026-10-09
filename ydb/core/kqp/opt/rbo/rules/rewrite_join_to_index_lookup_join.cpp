@@ -15,6 +15,7 @@ bool IsValidIndex(const TIndexDescription& index) {
         && index.Type != TIndexDescription::EType::LocalMinMax
         && index.Type != TIndexDescription::EType::LocalBloomFilter
         && index.Type != TIndexDescription::EType::LocalBloomNgramFilter
+        && index.Type != TIndexDescription::EType::LocalFulltext
         && index.State == TIndexDescription::EIndexState::Ready;
 }
 

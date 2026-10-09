@@ -5,6 +5,7 @@
 #include <ydb/core/formats/arrow/arrow_helpers.h>
 #include <ydb/core/formats/arrow/program/execution.h>
 #include <ydb/core/formats/arrow/program/visitor.h>
+#include <ydb/core/tx/program/fulltext_source.h>
 #include <ydb/core/formats/arrow/reader/position.h>
 #include <ydb/core/tx/columnshard/blob.h>
 #include <ydb/core/tx/columnshard/blobs_action/abstract/action.h>
@@ -99,7 +100,7 @@ public:
     const std::shared_ptr<NArrow::NSSA::NGraph::NExecution::TExecutionVisitor>& GetExecutionVisitorVerified() const;
 };
 
-class IDataSource: public ICursorEntity, public NArrow::NSSA::IDataSource {
+class IDataSource: public ICursorEntity, public NArrow::NSSA::IDataSource, public NArrow::NSSA::IFulltextMatchSource {
 public:
     enum class EType {
         Undefined,
@@ -426,6 +427,19 @@ public:
     const TFetchedResult& GetStageResult() const;
 
     TFetchedResult& MutableStageResult();
+
+    TConclusion<NArrow::NSSA::TExecutionResult> ReserveFulltextMatch(
+        const NArrow::NSSA::TProcessorContext& context, const NArrow::NSSA::TFulltextMatchRequest& request) override;
+    TConclusion<NArrow::NSSA::TExecutionResult> FetchFulltextIndex(
+        const NArrow::NSSA::TProcessorContext& context, const NArrow::NSSA::TFulltextMatchRequest& request) override;
+    TConclusion<NArrow::NSSA::TExecutionResult> DecideFulltextMatch(
+        const NArrow::NSSA::TProcessorContext& context, const NArrow::NSSA::TFulltextMatchRequest& request) override;
+    TConclusion<NArrow::NSSA::TExecutionResult> ReserveFulltextText(
+        const NArrow::NSSA::TProcessorContext& context, const NArrow::NSSA::TFulltextMatchRequest& request) override;
+    TConclusion<NArrow::NSSA::TExecutionResult> FetchFulltextText(
+        const NArrow::NSSA::TProcessorContext& context, const NArrow::NSSA::TFulltextMatchRequest& request) override;
+    TConclusion<NArrow::NSSA::TExecutionResult> EmitFulltextMatch(
+        const NArrow::NSSA::TProcessorContext& context, const NArrow::NSSA::TFulltextMatchRequest& request, ui32 outputColumnId) override;
 
     virtual std::optional<ui64> GetPortionIdOptional() const = 0;
 

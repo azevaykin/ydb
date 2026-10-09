@@ -78,6 +78,7 @@ public:
         }
 
         const auto tablePath = TPath::Resolve(settings.source_path(), Self);
+        const bool columnParent = tablePath.IsResolved() && tablePath->IsColumnTable();
         {
             const auto checks = tablePath.Check();
             checks
@@ -85,13 +86,36 @@ public:
                 .IsResolved()
                 .NotDeleted()
                 .NotUnderDeleting()
-                .IsTable()
-                .NotAsyncReplicaTable()
                 .IsCommonSensePath()
                 .IsTheSameDomain(domainPath);
+            if (columnParent) {
+                checks.IsColumnTable();
+            } else {
+                checks
+                    .IsTable()
+                    .NotAsyncReplicaTable();
+            }
 
             if (!checks) {
                 return Reply(checks.GetStatus(), checks.GetError());
+            }
+        }
+        if (columnParent) {
+            if (!settings.has_index()
+                || (settings.index().type_case() != Ydb::Table::TableIndex::kGlobalFulltextPlainIndex
+                    && settings.index().type_case() != Ydb::Table::TableIndex::kGlobalFulltextRelevanceIndex))
+            {
+                return Reply(Ydb::StatusIds::BAD_REQUEST, NTableIndex::ColumnTableGlobalFulltextCompactOnly);
+            }
+            if (!Self->EnableColumnTableGlobalFulltextIndex) {
+                return Reply(Ydb::StatusIds::PRECONDITION_FAILED, NTableIndex::ColumnTableGlobalFulltextDisabled);
+            }
+            if (!Self->EnableCompactFulltextIndex) {
+                return Reply(Ydb::StatusIds::PRECONDITION_FAILED, NTableIndex::ColumnTableGlobalFulltextCompactOnly);
+            }
+            if (settings.is_rebuild()) {
+                return Reply(Ydb::StatusIds::PRECONDITION_FAILED,
+                    "REBUILD INDEX is not supported for column-table fulltext indexes");
             }
         }
 
@@ -162,8 +186,18 @@ public:
                 }
             }
 
-            auto tableInfo = Self->Tables.at(tablePath.Base()->PathId);
+            auto tableInfo = columnParent ? TTableInfo::TPtr{} : Self->Tables.at(tablePath.Base()->PathId);
             auto domainInfo = tablePath.DomainInfo();
+            NKikimrSchemeOp::TTableDescription columnBaseDesc;
+            if (columnParent) {
+                const auto columnTable = Self->ColumnTables.GetVerified(tablePath.Base()->PathId);
+                TOlapStoreInfo::TPtr store;
+                if (!columnTable->IsStandalone() && columnTable->Description.GetSchema().ColumnsSize() == 0) {
+                    store = Self->OlapStores.at(columnTable->GetOlapStorePathIdVerified());
+                }
+                columnBaseDesc = NTableIndex::ColumnSchemaToTableDescription(
+                    NTableIndex::ReadColumnTableSchema(*columnTable, store.get()));
+            }
 
             if (!isRebuild) {
                 const ui64 aliveIndices = Self->GetAliveChildren(
@@ -187,7 +221,7 @@ public:
                 return makeReply(explain);
             }
 
-            if (tableInfo->IsTTLEnabled() && !DoesIndexSupportTTL(buildInfo->IndexType)) {
+            if (tableInfo && tableInfo->IsTTLEnabled() && !DoesIndexSupportTTL(buildInfo->IndexType)) {
                 return Reply(Ydb::StatusIds::PRECONDITION_FAILED,
                     TStringBuilder() << "Table with " << buildInfo->IndexType << " index doesn't support TTL");
             }
@@ -196,6 +230,25 @@ public:
             buildInfo->SerializeToProto(Self, &tmpConfig);
             auto& indexDesc = *tmpConfig.MutableIndex();
 
+            if (columnParent) {
+                NTableIndex::TColumnTypes columnTypes;
+                if (!NTableIndex::ExtractTypes(columnBaseDesc, columnTypes, explain)) {
+                    return Reply(Ydb::StatusIds::BAD_REQUEST, explain);
+                }
+                auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&buildInfo->SpecializedIndexDescription);
+                if (!fulltext) {
+                    return Reply(Ydb::StatusIds::BAD_REQUEST, "Column-table fulltext index is missing analyzer settings");
+                }
+                if (!NTableIndex::PrepareColumnTableFulltext(
+                        *fulltext, NTableIndex::ExtractInfo(columnBaseDesc), columnTypes, buildInfo->IndexColumns, explain))
+                {
+                    return Reply(Ydb::StatusIds::BAD_REQUEST, explain);
+                }
+                *indexDesc.MutableFulltextIndexDescription() = *fulltext;
+                if (!NTableIndex::CommonCheck(columnBaseDesc, indexDesc, domainInfo->GetSchemeLimits(), explain)) {
+                    return Reply(Ydb::StatusIds::BAD_REQUEST, explain);
+                }
+            } else {
             // Decide how a fulltext index on this table obtains its doc_id. For a custom (non single
             // integer) PK without the rowid infrastructure we auto-provision it: the build first spawns
             // child builds for the __ydb_row_id column and/or the unique index on it (under this build's
@@ -254,12 +307,15 @@ public:
                                           explain)) {
                 return Reply(Ydb::StatusIds::BAD_REQUEST, explain);
             }
+            }
 
             {
                 const auto checks = indexPath.Check();
 
                 // Tables are actually created in schemeshard__operation_create_build_index so limits are rechecked there too
-                auto counts = NTableIndex::GetIndexObjectCounts(indexDesc);
+                auto counts = columnParent
+                    ? NTableIndex::GetColumnTableFulltextObjectCounts(indexDesc)
+                    : NTableIndex::GetIndexObjectCounts(indexDesc);
                 if (counts.SequenceCount > 0 && domainInfo->GetSequenceShards().empty()) {
                     ++counts.IndexTableShards;
                 }
@@ -532,6 +588,9 @@ private:
             return false;
         case Ydb::Table::TableIndex::TypeCase::kLocalMinMaxIndex:
             explain = "Local min_max index is not supported by index build operation";
+            return false;
+        case Ydb::Table::TableIndex::TypeCase::kLocalFulltextIndex:
+            explain = "Local fulltext index is not supported by index build operation";
             return false;
         };
 

@@ -28,6 +28,10 @@ bool TOlapOptionsDescription::ApplyUpdate(const TOlapOptionsUpdate& schemaUpdate
     return true;
 }
 
+void TOlapOptionsDescription::RequestSchemeActualization() {
+    SchemeNeedActualization = true;
+}
+
 void TOlapOptionsDescription::Parse(const NKikimrSchemeOp::TColumnTableSchema& tableSchema) {
     SchemeNeedActualization = tableSchema.GetOptions().GetSchemeNeedActualization();
     if (tableSchema.GetOptions().HasScanReaderPolicyName()) {

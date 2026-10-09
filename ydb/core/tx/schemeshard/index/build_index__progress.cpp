@@ -340,6 +340,14 @@ std::shared_ptr<TIndexBuildInfo> CreateRowIdProvisioningChild(
     return child;
 }
 
+bool IsColumnTableFulltextBuild(TSchemeShard* ss, const TIndexBuildInfo& buildInfo) {
+    if (!NTableIndex::IsColumnTableCompactFulltext(buildInfo.IndexType)) {
+        return false;
+    }
+    const auto path = TPath::Init(buildInfo.TablePathId, ss);
+    return path.IsResolved() && path->IsColumnTable();
+}
+
 THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateIndexPropose(
     TSchemeShard* ss, TIndexBuildInfo& buildInfo)
 {
@@ -354,9 +362,14 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> CreateIndexPropose(
 
     if (buildInfo.IsBuildIndex()) {
         auto path = TPath::Init(buildInfo.TablePathId, ss);
-        const auto& tableInfo = ss->Tables.at(path->PathId);
-        // For TIndexBuildInfo::FillIndexPresharding()
-        buildInfo.IndexPartitions = tableInfo->GetPartitionStore().size();
+        if (path->IsColumnTable()) {
+            const auto columnTable = ss->ColumnTables.GetVerified(path->PathId);
+            buildInfo.IndexPartitions = NTableIndex::ColumnTableShardCount(*columnTable);
+        } else {
+            const auto& tableInfo = ss->Tables.at(path->PathId);
+            // For TIndexBuildInfo::FillIndexPresharding()
+            buildInfo.IndexPartitions = tableInfo->GetPartitionStore().size();
+        }
         modifyScheme.SetOperationType(NKikimrSchemeOp::ESchemeOpCreateIndexBuild);
         buildInfo.SerializeToProto(ss, modifyScheme.MutableInitiateIndexBuild());
     } else if (buildInfo.IsBuildColumns()) {
@@ -3153,7 +3166,80 @@ private:
         return done;
     }
 
+    bool InitiateColumnShards(NIceDb::TNiceDb& db, TIndexBuildInfo& buildInfo) {
+        YDB_LOG_DEBUG(LogPrefix << "InitiateColumnShards",
+            {"buildInfo", buildInfo.DebugString()},
+        );
+        Y_ENSURE(buildInfo.Shards.empty());
+        Y_ENSURE(buildInfo.ToUploadShards.empty());
+        Y_ENSURE(buildInfo.InProgressShards.empty());
+        Y_ENSURE(buildInfo.DoneShards.empty());
+
+        const auto columnTable = Self->ColumnTables.GetVerified(buildInfo.TablePathId);
+        std::vector<TShardIdx> shards;
+        if (columnTable->IsStandalone()) {
+            shards = columnTable->BuildOwnedColumnShardsVerified();
+        } else {
+            for (ui64 tabletId : columnTable->GetColumnShards()) {
+                shards.push_back(Self->MustGetShardIdx(TTabletId(tabletId)));
+            }
+        }
+        Y_ENSURE(!shards.empty());
+
+        // Record the fence snapshot for checkpointing. Column parents do not always
+        // register TablesWithSnapshots the way row tables do; InitiateTxId is still
+        // the schema fence id used by ReadyVersion publication.
+        buildInfo.SnapshotTxId = buildInfo.InitiateTxId;
+        if (Self->SnapshotsStepIds.contains(buildInfo.SnapshotTxId)) {
+            buildInfo.SnapshotStep = Self->SnapshotsStepIds.at(buildInfo.SnapshotTxId);
+        }
+
+        for (const auto& shardIdx : shards) {
+            // DONE: empty conditional seed for shards with no pre-fence rows.
+            // A later ColumnShard seed scanner will initialize keys that still
+            // lack forward state before Ready is published for non-empty tables.
+            TIndexBuildShardStatus status{TSerializedTableRange(), ""};
+            status.Status = NKikimrIndexBuilder::EBuildStatus::DONE;
+            auto [it, emplaced] = buildInfo.Shards.emplace(shardIdx, status);
+            Y_ENSURE(emplaced);
+            Self->PersistBuildIndexShardStatusInitiate(db, BuildId, shardIdx, it->second);
+        }
+        return true;
+    }
+
+    // Column-table compact fulltext: after the WriteOnly fence, initialize shards
+    // and publish Ready. Pre-existing rows that still lack forward state are seeded
+    // by the follow-up ColumnShard conditional scanner; empty tables become Ready
+    // immediately so post-fence C2 maintenance covers all subsequent writes.
+    bool FillColumnTableFulltext(TTransactionContext& txc, TIndexBuildInfo& buildInfo) {
+        YDB_LOG_DEBUG(LogPrefix << "FillColumnTableFulltext Start",
+            {"buildId", BuildId},
+        );
+        if (buildInfo.Shards.empty()) {
+            NIceDb::TNiceDb db(txc.DB);
+            if (!InitiateColumnShards(db, buildInfo)) {
+                return false;
+            }
+        }
+        if (NoShardsAdded(buildInfo)) {
+            AddAllShards(buildInfo);
+        }
+        const bool done = buildInfo.DoneShards.size() == buildInfo.Shards.size()
+            && buildInfo.InProgressShards.empty()
+            && buildInfo.ToUploadShards.empty();
+        if (done) {
+            YDB_LOG_DEBUG(LogPrefix << "FillColumnTableFulltext Done",
+                {"buildId", BuildId},
+                {"shards", buildInfo.Shards.size()},
+            );
+        }
+        return done;
+    }
+
     bool FillIndex(TTransactionContext& txc, TIndexBuildInfo& buildInfo) {
+        if (IsColumnTableFulltextBuild(Self, buildInfo)) {
+            return FillColumnTableFulltext(txc, buildInfo);
+        }
         // for now build index impl tables don't need snapshot,
         // because they're used only by build index
         if (!buildInfo.SnapshotTxId && GetShardsPath(Self, buildInfo)->PathId == buildInfo.TablePathId) {
@@ -3447,6 +3533,16 @@ public:
             } else if (!buildInfo.InitiateTxDone) {
                 Send(Self->SelfId(), MakeHolder<TEvSchemeShard::TEvNotifyTxCompletion>(ui64(buildInfo.InitiateTxId)));
             } else {
+                if (IsColumnTableFulltextBuild(Self, buildInfo)) {
+                    // Support tables and the WriteOnly fence are in place. Fill seeds
+                    // uninitialized forward state (empty tables complete immediately),
+                    // then Apply publishes Ready + ReadyVersion.
+                    ChangeState(BuildId, buildInfo.IsCancellationRequested()
+                        ? TIndexBuildInfo::EState::Cancellation_Applying
+                        : TIndexBuildInfo::EState::Filling);
+                    Progress(BuildId);
+                    break;
+                }
                 if (buildInfo.IsBuildFulltextCompactRowId() &&
                     buildInfo.SubState == TIndexBuildInfo::ESubState::None) {
                     // Run the row-id source prepass first: CreateBuild builds the rowid source table.

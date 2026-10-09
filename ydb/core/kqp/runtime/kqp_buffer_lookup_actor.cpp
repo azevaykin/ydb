@@ -3,13 +3,24 @@
 #include <ydb/core/kqp/tracing/kqp_query_rendering.h>
 #include <ydb/core/kqp/tracing/kqp_shard_rendering.h>
 #include <ydb/core/base/tablet_pipecache.h>
+#include <ydb/core/formats/arrow/arrow_batch_builder.h>
+#include <ydb/core/formats/arrow/arrow_helpers.h>
+#include <ydb/core/formats/arrow/converter.h>
 #include <ydb/core/kqp/common/kqp_locks_tli_helpers.h>
+#include <ydb/core/kqp/compute_actor/kqp_compute_events.h>
 #include <ydb/core/kqp/gateway/kqp_gateway.h>
+#include <ydb/core/kqp/runtime/kqp_arrow_memory_pool.h>
 #include <ydb/core/kqp/runtime/kqp_read_iterator_common.h>
 #include <ydb/core/kqp/runtime/kqp_stream_lookup_worker.h>
 #include <ydb/core/protos/kqp_stats.pb.h>
+#include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tx/scheme_cache/scheme_cache.h>
+#include <ydb/core/tx/schemeshard/olap/schema/schema.h>
+#include <ydb/core/tx/sharding/sharding.h>
 #include <ydb/library/actors/core/actor_bootstrapped.h>
+#include <ydb/library/actors/core/interconnect.h>
+#include <ydb/library/formats/arrow/arrow_helpers.h>
+#include <ydb/library/formats/arrow/validation/validation.h>
 #include <ydb/library/wilson_ids/wilson.h>
 #include <ydb/library/yql/dq/actors/compute/dq_compute_actor_log.h>
 #include <ydb/library/yql/dq/actors/protos/dq_stats.pb.h>
@@ -912,9 +923,555 @@ private:
     NWilson::TSpan LookupActorSpan;
 };
 
+// Full-primary-key ColumnShard read used as the old-image input for index maintenance.
+// The read carries the transaction snapshot (when the caller has one) and the same
+// lock id/mode the write uses, and the acquired locks are registered on the transaction manager.
+class TKqpBufferOlapLookupActor : public NActors::TActorBootstrapped<TKqpBufferOlapLookupActor>, public IKqpBufferTableLookup {
+    struct TRequest {
+        TVector<NKikimrKqp::TKqpColumnMetadataProto> KeyColumns;
+        TVector<NKikimrKqp::TKqpColumnMetadataProto> LookupColumns;
+        std::optional<NKikimrDataEvents::TMvccSnapshot> MvccSnapshot;
+        std::vector<TOwnedCellVec> Keys;
+        TOwnedCellVecBatch Rows;
+        ui64 Inflight = 0;
+        bool Started = false;
+        bool Extracted = false;
+        ui32 LookupColumnsCount = 0;
+    };
+
+    struct TScan {
+        ui64 Cookie = 0;
+        ui64 ShardId = 0;
+        ui32 Generation = 1;
+        TActorId ScanActor;
+        bool Finished = false;
+    };
+
+public:
+    explicit TKqpBufferOlapLookupActor(TKqpBufferTableLookupSettings&& settings)
+        : Settings(std::move(settings))
+        , LogPrefix(TStringBuilder() << "Table: `" << Settings.TablePath << "` (" << Settings.TableId << "), "
+            << "SessionActorId: " << Settings.SessionActorId)
+    {
+        AFL_ENSURE(Settings.IsOlap);
+    }
+
+    void Bootstrap() {
+        Become(&TKqpBufferOlapLookupActor::StateFunc);
+    }
+
+    static constexpr char ActorName[] = "KQP_BUFFER_OLAP_LOOKUP_ACTOR";
+
+    void SetLookupSettings(
+            ui64 cookie,
+            size_t lookupKeyPrefix,
+            TConstArrayRef<NKikimrKqp::TKqpColumnMetadataProto> keyColumns,
+            TConstArrayRef<NKikimrKqp::TKqpColumnMetadataProto> lookupColumns,
+            const std::optional<NKikimrDataEvents::TMvccSnapshot>& mvccSnapshot,
+            const NWilson::TTraceId& traceId) override {
+        Y_UNUSED(lookupKeyPrefix);
+        Y_UNUSED(traceId);
+        AFL_ENSURE(!Failed);
+        auto& request = Requests[cookie];
+        AFL_ENSURE(!request.Started);
+        request.KeyColumns.assign(keyColumns.begin(), keyColumns.end());
+        request.LookupColumns.assign(lookupColumns.begin(), lookupColumns.end());
+        request.MvccSnapshot = mvccSnapshot;
+        request.LookupColumnsCount = request.LookupColumns.size();
+        if (KeyColumnTypes.empty()) {
+            for (const auto& column : request.KeyColumns) {
+                KeyColumnTypes.push_back(NScheme::TypeInfoFromProto(column.GetTypeId(), column.GetTypeInfo()));
+            }
+        }
+        AFL_ENSURE(KeyColumnTypes.size() == request.KeyColumns.size());
+    }
+
+    void AddLookupTask(ui64 cookie, const std::vector<TConstArrayRef<TCell>>& keys) override {
+        AFL_ENSURE(!Failed);
+        auto& request = Requests.at(cookie);
+        AFL_ENSURE(!request.Started);
+        request.Started = true;
+        request.Keys.reserve(keys.size());
+        for (const auto& key : keys) {
+            AFL_ENSURE(key.size() == request.KeyColumns.size());
+            request.Keys.emplace_back(TOwnedCellVec::Make(key));
+        }
+        if (request.Keys.empty()) {
+            return;
+        }
+        if (!Sharding) {
+            PendingCookies.push_back(cookie);
+            if (!ResolveInProgress) {
+                ResolveTable();
+            }
+            return;
+        }
+        StartScans(cookie);
+    }
+
+    void AddUniqueCheckTask(ui64, const std::vector<TConstArrayRef<TCell>>&, bool) override {
+        RuntimeError(
+            NYql::NDqProto::StatusIds::INTERNAL_ERROR,
+            NYql::TIssuesIds::KIKIMR_INTERNAL_ERROR,
+            "Unique-index checks are DataShard reads; a column base lookup is a full-primary-key read.");
+    }
+
+    bool IsRequestReady(const TRequest& request, ui64 cookie) const {
+        if (!request.Started || request.Inflight != 0) {
+            return false;
+        }
+        for (const ui64 pending : PendingCookies) {
+            if (pending == cookie) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool HasResult(ui64 cookie) override {
+        if (Failed) {
+            return false;
+        }
+        const auto& request = Requests.at(cookie);
+        return IsRequestReady(request, cookie) && !request.Extracted && !request.Rows.Empty();
+    }
+
+    bool IsEmpty(ui64 cookie) override {
+        if (Failed) {
+            return true;
+        }
+        const auto& request = Requests.at(cookie);
+        return IsRequestReady(request, cookie) && (request.Extracted || request.Rows.Empty());
+    }
+
+    void ExtractResult(ui64 cookie, std::function<void(TConstArrayRef<TCell>)>&& callback) override {
+        AFL_ENSURE(HasResult(cookie) || IsEmpty(cookie));
+        auto& request = Requests.at(cookie);
+        for (const auto& row : request.Rows) {
+            callback(row);
+            ++ReadRowsCount;
+        }
+        request.Rows = TOwnedCellVecBatch();
+        request.Extracted = true;
+    }
+
+    TTableId GetTableId() const override {
+        return Settings.TableId;
+    }
+
+    const TVector<NScheme::TTypeInfo>& GetKeyColumnTypes() const override {
+        return KeyColumnTypes;
+    }
+
+    ui32 LookupColumnsCount(ui64 cookie) const override {
+        return Requests.at(cookie).LookupColumnsCount;
+    }
+
+    void FillStats(NYql::NDqProto::TDqTaskStats* stats) override {
+        auto* tableStats = stats->AddTables();
+        tableStats->SetTablePath(Settings.TablePath);
+        tableStats->SetReadRows(ReadRowsCount);
+        ReadRowsCount = 0;
+    }
+
+    void Terminate() override {
+        PassAway();
+    }
+
+    void Unlink() override {
+        Send(PipeCacheId, new TEvPipeCache::TEvUnlink(0));
+    }
+
+private:
+    STFUNC(StateFunc) {
+        try {
+            switch (ev->GetTypeRewrite()) {
+                hFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, Handle);
+                hFunc(TEvKqpCompute::TEvScanInitActor, Handle);
+                hFunc(TEvKqpCompute::TEvScanData, Handle);
+                hFunc(TEvKqpCompute::TEvScanError, Handle);
+                hFunc(TEvPipeCache::TEvDeliveryProblem, Handle);
+                IgnoreFunc(TEvKqpCompute::TEvScanPing);
+                IgnoreFunc(TEvInterconnect::TEvNodeConnected);
+                IgnoreFunc(TEvInterconnect::TEvNodeDisconnected);
+                hFunc(TEvents::TEvUndelivered, Handle);
+            default:
+                RuntimeError(
+                    NYql::NDqProto::StatusIds::INTERNAL_ERROR,
+                    NYql::TIssuesIds::KIKIMR_INTERNAL_ERROR,
+                    TStringBuilder() << "Unexpected event in column lookup: " << ev->GetTypeRewrite());
+            }
+        } catch (...) {
+            RuntimeError(
+                NYql::NDqProto::StatusIds::INTERNAL_ERROR,
+                NYql::TIssuesIds::KIKIMR_INTERNAL_ERROR,
+                CurrentExceptionMessage());
+        }
+    }
+
+    void ResolveTable() {
+        ResolveInProgress = true;
+        TAutoPtr<NSchemeCache::TSchemeCacheNavigate> request(new NSchemeCache::TSchemeCacheNavigate());
+        request->DatabaseName = Settings.Database;
+        NSchemeCache::TSchemeCacheNavigate::TEntry entry;
+        entry.TableId = Settings.TableId;
+        entry.RequestType = NSchemeCache::TSchemeCacheNavigate::TEntry::ERequestType::ByTableId;
+        entry.Operation = NSchemeCache::TSchemeCacheNavigate::OpTable;
+        entry.SyncVersion = false;
+        entry.ShowPrivatePath = true;
+        request->ResultSet.emplace_back(entry);
+        Send(MakeSchemeCacheID(), new TEvTxProxySchemeCache::TEvNavigateKeySet(request));
+    }
+
+    void Handle(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
+        if (Failed) {
+            return;
+        }
+        auto* response = ev->Get()->Request.Get();
+        if (response->ErrorCount > 0 || response->ResultSet.size() != 1) {
+            RuntimeError(
+                NYql::NDqProto::StatusIds::SCHEME_ERROR,
+                NYql::TIssuesIds::KIKIMR_SCHEME_ERROR,
+                TStringBuilder() << "Failed to resolve column table `" << Settings.TablePath << "`.");
+            return;
+        }
+        const auto& entry = response->ResultSet[0];
+        if (entry.Kind != NSchemeCache::TSchemeCacheNavigate::KindColumnTable || !entry.ColumnTableInfo) {
+            RuntimeError(
+                NYql::NDqProto::StatusIds::SCHEME_ERROR,
+                NYql::TIssuesIds::KIKIMR_SCHEME_ERROR,
+                TStringBuilder() << "Table `" << Settings.TablePath << "` is not a column table.");
+            return;
+        }
+        const auto& description = entry.ColumnTableInfo->Description;
+        if (!description.HasSchema() || !description.HasSharding()) {
+            RuntimeError(
+                NYql::NDqProto::StatusIds::SCHEME_ERROR,
+                NYql::TIssuesIds::KIKIMR_SCHEME_ERROR,
+                TStringBuilder() << "Column table `" << Settings.TablePath << "` has no sharding.");
+            return;
+        }
+        NSchemeShard::TOlapSchema olapSchema;
+        olapSchema.ParseFromLocalDB(description.GetSchema());
+        auto sharding = NSharding::IShardingBase::BuildFromProto(olapSchema, description.GetSharding());
+        if (sharding.IsFail()) {
+            RuntimeError(
+                NYql::NDqProto::StatusIds::SCHEME_ERROR,
+                NYql::TIssuesIds::KIKIMR_SCHEME_ERROR,
+                TStringBuilder() << "Failed to build column sharding for `" << Settings.TablePath << "`: "
+                    << sharding.GetErrorMessage());
+            return;
+        }
+        Sharding = sharding.DetachResult();
+        if (!Sharding) {
+            RuntimeError(
+                NYql::NDqProto::StatusIds::SCHEME_ERROR,
+                NYql::TIssuesIds::KIKIMR_SCHEME_ERROR,
+                TStringBuilder() << "Column table `" << Settings.TablePath << "` has empty sharding.");
+            return;
+        }
+        ResolveInProgress = false;
+        auto pending = std::move(PendingCookies);
+        for (const ui64 cookie : pending) {
+            StartScans(cookie);
+        }
+        if (!Failed) {
+            Settings.Callbacks->OnLookupTaskFinished();
+        }
+    }
+
+    void StartScans(ui64 cookie) {
+        if (Failed) {
+            return;
+        }
+        auto& request = Requests.at(cookie);
+        AFL_ENSURE(Sharding);
+        AFL_ENSURE(request.Inflight == 0);
+        if (request.Keys.empty()) {
+            Settings.Callbacks->OnLookupTaskFinished();
+            return;
+        }
+
+        std::vector<std::pair<TString, NScheme::TTypeInfo>> keySchema;
+        std::set<std::string> notNull;
+        keySchema.reserve(request.KeyColumns.size());
+        for (const auto& column : request.KeyColumns) {
+            keySchema.emplace_back(column.GetName(), NScheme::TypeInfoFromProto(column.GetTypeId(), column.GetTypeInfo()));
+            notNull.insert(column.GetName());
+        }
+
+        NArrow::TArrowBatchBuilder builder(arrow::Compression::UNCOMPRESSED, notNull, arrow::default_memory_pool());
+        TString error;
+        if (!builder.Start(keySchema, 0, 0, error)) {
+            RuntimeError(NYql::NDqProto::StatusIds::INTERNAL_ERROR, NYql::TIssuesIds::KIKIMR_INTERNAL_ERROR, error);
+            return;
+        }
+        for (const auto& key : request.Keys) {
+            builder.AddRow(TConstArrayRef<TCell>(key));
+        }
+        auto keyBatch = builder.FlushBatch(true, true);
+        auto shards = Sharding->MakeSharding(keyBatch);
+        std::vector<bool> assigned(request.Keys.size(), false);
+        for (const auto& [shardId, indexes] : shards) {
+            std::vector<TConstArrayRef<TCell>> shardKeys;
+            shardKeys.reserve(indexes.size());
+            for (const ui32 index : indexes) {
+                if (index >= request.Keys.size() || assigned[index]) {
+                    RuntimeError(
+                        NYql::NDqProto::StatusIds::INTERNAL_ERROR,
+                        NYql::TIssuesIds::KIKIMR_INTERNAL_ERROR,
+                        "Column sharding returned an unexpected key.");
+                    return;
+                }
+                assigned[index] = true;
+                shardKeys.emplace_back(request.Keys[index]);
+            }
+            if (!shardKeys.empty()) {
+                SendScan(cookie, shardId, shardKeys);
+            }
+        }
+        for (const bool seen : assigned) {
+            if (!seen) {
+                RuntimeError(
+                    NYql::NDqProto::StatusIds::INTERNAL_ERROR,
+                    NYql::TIssuesIds::KIKIMR_INTERNAL_ERROR,
+                    TStringBuilder() << "Column sharding did not cover a primary key of `" << Settings.TablePath << "`.");
+                return;
+            }
+        }
+        AFL_ENSURE(request.Inflight > 0);
+    }
+
+    void SendScan(ui64 cookie, ui64 shardId, const std::vector<TConstArrayRef<TCell>>& keys) {
+        auto& request = Requests.at(cookie);
+        const ui64 scanId = ++NextScanId;
+        auto ev = std::make_unique<TEvDataShard::TEvKqpScan>();
+        ev->Record.SetLocalPathId(Settings.TableId.PathId.LocalPathId);
+        ev->Record.SetTablePath(Settings.TablePath);
+        ev->Record.SetSchemaVersion(Settings.TableId.SchemaVersion);
+        ev->Record.SetScanId(scanId);
+        ev->Record.SetGeneration(1);
+        ev->Record.SetTxId(Settings.LockTxId);
+        AFL_ENSURE(Settings.LockTxId && Settings.LockNodeId);
+        ev->Record.SetLockTxId(Settings.LockTxId);
+        ev->Record.SetLockNodeId(Settings.LockNodeId);
+        ev->Record.SetLockMode(Settings.LockMode);
+        if (request.MvccSnapshot) {
+            ev->Record.MutableSnapshot()->SetStep(request.MvccSnapshot->GetStep());
+            ev->Record.MutableSnapshot()->SetTxId(request.MvccSnapshot->GetTxId());
+        }
+        ev->Record.SetDataFormat(NKikimrDataEvents::FORMAT_ARROW);
+
+        auto addColumn = [&](const NKikimrKqp::TKqpColumnMetadataProto& column) {
+            ev->Record.AddColumnTags(column.GetId());
+            ev->Record.AddColumnTypes(column.GetTypeId());
+            if (column.HasTypeInfo()) {
+                *ev->Record.AddColumnTypeInfos() = column.GetTypeInfo();
+            } else {
+                *ev->Record.AddColumnTypeInfos() = NKikimrProto::TTypeInfo();
+            }
+        };
+        for (const auto& column : request.KeyColumns) {
+            addColumn(column);
+        }
+        for (const auto& column : request.LookupColumns) {
+            addColumn(column);
+        }
+
+        auto* ranges = ev->Record.MutableRanges();
+        for (const auto& key : keys) {
+            TSerializedTableRange range(key, true, key, true);
+            range.Point = true;
+            range.Serialize(*ranges->Add());
+        }
+
+        Settings.TxManager->AddShard(shardId, true, Settings.TablePath);
+        Settings.TxManager->AddAction(shardId, IKqpTransactionManager::EAction::READ, Settings.QuerySpanId);
+
+        Scans.emplace(scanId, TScan{.Cookie = cookie, .ShardId = shardId});
+        ++request.Inflight;
+        Send(PipeCacheId, new TEvPipeCache::TEvForward(ev.release(), shardId, true), IEventHandle::FlagTrackDelivery, scanId);
+    }
+
+    void Handle(TEvKqpCompute::TEvScanInitActor::TPtr& ev) {
+        if (Failed) {
+            return;
+        }
+        auto scanIt = Scans.find(ev->Get()->Record.GetScanId());
+        if (scanIt == Scans.end() || scanIt->second.Finished) {
+            return;
+        }
+        scanIt->second.Generation = ev->Get()->Record.GetGeneration();
+        scanIt->second.ScanActor = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
+        Send(scanIt->second.ScanActor, new TEvKqpCompute::TEvScanDataAck(1ull << 30, scanIt->second.Generation));
+    }
+
+    void Handle(TEvKqpCompute::TEvScanData::TPtr& ev) {
+        if (Failed) {
+            return;
+        }
+        auto scanIt = Scans.find(ev->Get()->ScanId);
+        if (scanIt == Scans.end() || scanIt->second.Finished) {
+            return;
+        }
+        auto& scan = scanIt->second;
+        if (scan.ScanActor != TActorId() && ev->Get()->Generation != scan.Generation) {
+            return;
+        }
+        auto& request = Requests.at(scan.Cookie);
+        try {
+            ConsumeScanRows(request, *ev->Get());
+            ConsumeScanLocks(scan.ShardId, *ev->Get());
+        } catch (const std::exception& ex) {
+            RuntimeError(NYql::NDqProto::StatusIds::INTERNAL_ERROR, NYql::TIssuesIds::KIKIMR_INTERNAL_ERROR, ex.what());
+            return;
+        }
+        if (!ev->Get()->Finished) {
+            Send(ev->Sender, new TEvKqpCompute::TEvScanDataAck(1ull << 30, ev->Get()->Generation));
+            return;
+        }
+        FinishScan(scanIt);
+    }
+
+    void Handle(TEvKqpCompute::TEvScanError::TPtr& ev) {
+        if (Failed) {
+            return;
+        }
+        NYql::TIssues issues;
+        NYql::IssuesFromMessage(ev->Get()->Record.GetIssues(), issues);
+        RuntimeError(
+            NYql::NDqProto::StatusIds::ABORTED,
+            NYql::TIssuesIds::KIKIMR_OPERATION_ABORTED,
+            TStringBuilder() << "ColumnShard read failed for `" << Settings.TablePath << "`.",
+            issues);
+    }
+
+    void Handle(TEvPipeCache::TEvDeliveryProblem::TPtr& ev) {
+        if (Failed) {
+            return;
+        }
+        RuntimeError(
+            NYql::NDqProto::StatusIds::UNAVAILABLE,
+            NYql::TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE,
+            TStringBuilder() << "ColumnShard " << ev->Get()->TabletId << " is unavailable for `" << Settings.TablePath << "`.");
+    }
+
+    void Handle(TEvents::TEvUndelivered::TPtr& ev) {
+        if (Failed) {
+            return;
+        }
+        RuntimeError(
+            NYql::NDqProto::StatusIds::UNAVAILABLE,
+            NYql::TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE,
+            TStringBuilder() << "ColumnShard read was not delivered, reason " << ev->Get()->Reason << ".");
+    }
+
+    void ConsumeScanRows(TRequest& request, TEvKqpCompute::TEvScanData& data) {
+        if (!data.Rows.empty()) {
+            for (const auto& row : data.Rows) {
+                AFL_ENSURE(row.size() == request.KeyColumns.size() + request.LookupColumns.size());
+                request.Rows.Append(row);
+            }
+            return;
+        }
+        if (!data.ArrowBatch || data.ArrowBatch->num_rows() == 0) {
+            return;
+        }
+        std::vector<std::pair<TString, NScheme::TTypeInfo>> schema;
+        auto add = [&](const NKikimrKqp::TKqpColumnMetadataProto& column) {
+            schema.emplace_back(column.GetName(), NScheme::TypeInfoFromProto(column.GetTypeId(), column.GetTypeInfo()));
+        };
+        for (const auto& column : request.KeyColumns) {
+            add(column);
+        }
+        for (const auto& column : request.LookupColumns) {
+            add(column);
+        }
+        auto fields = NArrow::TStatusValidator::GetValid(NArrow::MakeArrowFields(schema, {}));
+        auto renamedSchema = std::make_shared<arrow::Schema>(std::move(fields));
+        for (const auto& batch : NArrow::SliceToRecordBatches(data.ArrowBatch)) {
+            AFL_ENSURE(static_cast<size_t>(batch->num_columns()) == schema.size());
+            auto renamed = arrow::RecordBatch::Make(renamedSchema, batch->num_rows(), batch->columns());
+            AFL_ENSURE(renamed);
+            struct TCopyRows : NArrow::IRowWriter {
+                TOwnedCellVecBatch& Out;
+                void AddRow(const TConstArrayRef<TCell>& cells) override {
+                    Out.Append(cells);
+                }
+            } writer{request.Rows};
+            NArrow::TArrowToYdbConverter converter(schema, writer, false, false);
+            TString error;
+            if (!converter.Process(*renamed, error)) {
+                ythrow yexception() << "Cannot read column batch: " << error;
+            }
+        }
+    }
+
+    void ConsumeScanLocks(ui64 shardId, const TEvKqpCompute::TEvScanData& data) {
+        Settings.TxManager->AddShard(shardId, true, Settings.TablePath);
+        auto accept = [&](const NKikimrDataEvents::TLock& lock) {
+            if (!Settings.TxManager->AddLock(shardId, lock, Settings.QuerySpanId)) {
+                ythrow yexception() << "ColumnShard lock was invalidated for `" << Settings.TablePath << "`.";
+            }
+        };
+        for (const auto& lock : data.LocksInfo.Locks) {
+            accept(lock);
+        }
+        for (const auto& lock : data.LocksInfo.BrokenLocks) {
+            accept(lock);
+        }
+    }
+
+    void FinishScan(THashMap<ui64, TScan>::iterator scanIt) {
+        scanIt->second.Finished = true;
+        auto& request = Requests.at(scanIt->second.Cookie);
+        AFL_ENSURE(request.Inflight > 0);
+        --request.Inflight;
+        Scans.erase(scanIt);
+        if (request.Inflight == 0) {
+            Settings.Callbacks->OnLookupTaskFinished();
+        }
+    }
+
+    void RuntimeError(
+            NYql::NDqProto::StatusIds::StatusCode statusCode,
+            NYql::EYqlIssueCode id,
+            const TString& message,
+            const NYql::TIssues& subIssues = {}) {
+        if (Failed) {
+            return;
+        }
+        Failed = true;
+        Settings.Callbacks->OnLookupError(statusCode, id, message, subIssues);
+    }
+
+    void PassAway() override {
+        Scans.clear();
+        Unlink();
+        TActorBootstrapped<TKqpBufferOlapLookupActor>::PassAway();
+    }
+
+    TKqpBufferTableLookupSettings Settings;
+    const TString LogPrefix;
+    const TActorId PipeCacheId = MakePipePerNodeCacheID(false);
+    TVector<NScheme::TTypeInfo> KeyColumnTypes;
+    std::unique_ptr<NSharding::IShardingBase> Sharding;
+    bool ResolveInProgress = false;
+    bool Failed = false;
+    std::vector<ui64> PendingCookies;
+    THashMap<ui64, TRequest> Requests;
+    THashMap<ui64, TScan> Scans;
+    ui64 NextScanId = 0;
+    ui64 ReadRowsCount = 0;
+};
+
 }
 
 std::pair<IKqpBufferTableLookup*, NActors::IActor*> CreateKqpBufferTableLookup(TKqpBufferTableLookupSettings&& settings) {
+    if (settings.IsOlap) {
+        auto* ptr = new TKqpBufferOlapLookupActor(std::move(settings));
+        return {ptr, ptr};
+    }
     auto* ptr = new TKqpBufferLookupActor(std::move(settings));
     return {ptr, ptr};
 }

@@ -580,6 +580,12 @@ private:
 
         for (const auto& index : entry.Indexes) {
             const auto indexType = index.GetType();
+            if (TableKind == NSchemeCache::TSchemeCacheNavigate::KindColumnTable
+                    && NTableIndex::IsColumnTableCompactFulltext(indexType))
+            {
+                // Reject before any base mutation. The native BulkUpsert adapter is C6.
+                return TConclusionStatus::Fail(TString(NTableIndex::ColumnTableGlobalFulltextBulkUpsertRejected));
+            }
             if ((indexType == NKikimrSchemeOp::EIndexTypeGlobalFulltextPlain
                     || indexType == NKikimrSchemeOp::EIndexTypeGlobalFulltextRelevance
                     || indexType == NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact

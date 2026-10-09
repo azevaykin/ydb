@@ -5,6 +5,7 @@ SRCS(
     program.cpp
     builder.cpp
     resolver.cpp
+    fulltext_match.cpp
 )
 
 PEERDIR(

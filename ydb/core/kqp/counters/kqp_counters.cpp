@@ -906,6 +906,20 @@ TKqpCounters::TKqpCounters(const ::NMonitoring::TDynamicCounterPtr& counters, co
     ForwardActorWritesLatencyHistogram =
         KqpGroup->GetHistogram("SinkWrites/ForwardActorWritesLatencyUs", NMonitoring::ExponentialHistogram(28, 2, 1));
 
+    ColumnFulltextStateBytes = KqpGroup->GetCounter("ColumnFulltext/StateBytes", true);
+    ColumnFulltextPostingBytes = KqpGroup->GetCounter("ColumnFulltext/PostingBytes", true);
+    ColumnFulltextBatchMemory = KqpGroup->GetCounter("ColumnFulltext/BatchMemory", true);
+    ColumnFulltextRetries = KqpGroup->GetCounter("ColumnFulltext/Retries", true);
+    ColumnFulltextCompactionInputBytes = KqpGroup->GetCounter("ColumnFulltext/CompactionInputBytes", true);
+    ColumnFulltextCompactionOutputBytes = KqpGroup->GetCounter("ColumnFulltext/CompactionOutputBytes", true);
+    ColumnFulltextCandidates = KqpGroup->GetCounter("ColumnFulltext/Candidates", true);
+    ColumnFulltextBm25BufferedBytes = KqpGroup->GetCounter("ColumnFulltext/Bm25BufferedBytes", true);
+    ColumnFulltextFetchBatches = KqpGroup->GetCounter("ColumnFulltext/FetchBatches", true);
+    ColumnFulltextFetchBytes = KqpGroup->GetCounter("ColumnFulltext/FetchBytes", true);
+    ColumnFulltextBypassRejections = KqpGroup->GetCounter("ColumnFulltext/BypassRejections", true);
+    ColumnFulltextBuildRowsInitialized = KqpGroup->GetCounter("ColumnFulltext/BuildRowsInitialized", true);
+    ColumnFulltextBuildRowsSkipped = KqpGroup->GetCounter("ColumnFulltext/BuildRowsSkipped", true);
+
     /* sequencers */
 
     SequencerActorsCount = KqpGroup->GetCounter("Sequencer/ActorCount", false);

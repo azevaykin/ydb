@@ -47,6 +47,16 @@ public:
         return Program ? Program->DebugString() : "NO_PROGRAM";
     }
 
+    bool HasFulltextMatch() const {
+        for (const auto& cmd : ProgramProto.GetCommand()) {
+            if (cmd.GetLineCase() == NKikimrSSA::TProgram::TCommand::kAssign &&
+                cmd.GetAssign().GetExpressionCase() == NKikimrSSA::TProgram::TAssignment::kFulltextMatch) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool HasDistinctCommand() const {
         for (const auto& cmd : ProgramProto.GetCommand()) {
             if (cmd.GetLineCase() == NKikimrSSA::TProgram::TCommand::kDistinct) {

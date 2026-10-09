@@ -1,5 +1,6 @@
 #pragma once
 #include <ydb/core/tx/columnshard/counters/engine_logs.h>
+#include <ydb/core/tx/columnshard/engines/storage/indexes/fulltext/counters.h>
 #include <ydb/core/tx/columnshard/engines/storage/optimizer/abstract/optimizer.h>
 #include <ydb/core/tx/columnshard/splitter/settings.h>
 
@@ -97,10 +98,13 @@ class TSchemeCounters {
 public:
     const std::shared_ptr<NColumnShard::TValueAggregationClient> QueueSizeInternalWrite;
     const std::shared_ptr<NColumnShard::TValueAggregationClient> QueueSizeExternalWrite;
+    const std::shared_ptr<NColumnShard::TValueAggregationClient> OutstandingEligibleFulltextPortions;
 
     TSchemeCounters()
         : QueueSizeInternalWrite(TSchemeGlobalCounters::BuildQueueSizeInternalWrite())
         , QueueSizeExternalWrite(TSchemeGlobalCounters::BuildQueueSizeExternalWrite())
+        , OutstandingEligibleFulltextPortions(
+              NKikimr::NOlap::NIndexes::NFulltext::TFulltextBuildCounters::BuildOutstandingEligiblePortions())
     {
     }
 };

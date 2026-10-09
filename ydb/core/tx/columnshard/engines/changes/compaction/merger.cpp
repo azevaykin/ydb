@@ -353,6 +353,9 @@ std::vector<TWritePortionInfoWithBlobsResult> TMerger::Execute(const std::shared
         ui32 recordIdx = 0;
         for (auto&& i : packs) {
             TGeneralSerializedSlice slicePrimary(std::move(i));
+            // Fulltext postings are rebuilt from these merged output rows. Splits and removed
+            // versions are handled by that rebuild. Later posting reuse has to follow the source
+            // portion/row map on the remapper batches above (portion id and portion record index).
             auto dataWithSecondary = resultFiltered->GetIndexInfo()
                                          .AppendIndexes(slicePrimary.GetPortionChunksToHash(), SaverContext.GetStoragesManager(),
                                              slicePrimary.GetRecordsCount(), IStoragesManager::DefaultStorageId)

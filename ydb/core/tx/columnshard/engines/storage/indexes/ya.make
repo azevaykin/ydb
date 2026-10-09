@@ -9,6 +9,7 @@ PEERDIR(
     ydb/core/tx/columnshard/engines/storage/indexes/bloom_ngramm
     ydb/core/tx/columnshard/engines/storage/indexes/max
     ydb/core/tx/columnshard/engines/storage/indexes/min_max
+    ydb/core/tx/columnshard/engines/storage/indexes/fulltext
     ydb/core/tx/columnshard/engines/storage/indexes/count_min_sketch
     ydb/core/tx/columnshard/engines/storage/indexes/helper
 )
@@ -17,6 +18,7 @@ END()
 
 RECURSE_FOR_TESTS(
     bits_storage
+    fulltext
     helper
     portions
 )

@@ -5910,6 +5910,7 @@ void TSchemeShard::OnActivateExecutor(const TActorContext &ctx) {
     EnableOnlineAddUniqueIndex = appData->FeatureFlags.GetEnableOnlineAddUniqueIndex();
     EnableFulltextIndex = appData->FeatureFlags.GetEnableFulltextIndex();
     EnableCompactFulltextIndex = appData->FeatureFlags.GetEnableCompactFulltextIndex();
+    EnableColumnTableGlobalFulltextIndex = appData->FeatureFlags.GetEnableColumnTableGlobalFulltextIndex();
     EnableJsonIndex = appData->FeatureFlags.GetEnableJsonIndex();
     EnableResourcePoolsOnServerless = appData->FeatureFlags.GetEnableResourcePoolsOnServerless();
     EnableExternalDataSourcesOnServerless = appData->FeatureFlags.GetEnableExternalDataSourcesOnServerless();
@@ -9005,6 +9006,7 @@ void TSchemeShard::ApplyConsoleConfigs(const NKikimrConfig::TFeatureFlags& featu
     EnableAddUniqueIndex = featureFlags.GetEnableAddUniqueIndex();
     EnableFulltextIndex = featureFlags.GetEnableFulltextIndex();
     EnableCompactFulltextIndex = featureFlags.GetEnableCompactFulltextIndex();
+    EnableColumnTableGlobalFulltextIndex = featureFlags.GetEnableColumnTableGlobalFulltextIndex();
     EnableJsonIndex = featureFlags.GetEnableJsonIndex();
     EnableExternalDataSourcesOnServerless = featureFlags.GetEnableExternalDataSourcesOnServerless();
     EnableShred = featureFlags.GetEnableDataErasure();

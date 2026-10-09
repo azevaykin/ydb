@@ -9,6 +9,7 @@ SRCS(
     fetch_steps.cpp
     fetched_data.cpp
     fetching.cpp
+    fulltext_read.cpp
     iterator.cpp
     source.cpp
 )
@@ -21,6 +22,8 @@ PEERDIR(
     ydb/core/tx/columnshard/engines/reader/tracing
     ydb/core/tx/columnshard/engines/scheme
     ydb/core/tx/columnshard/engines/storage/indexes/skip_index
+    ydb/core/tx/columnshard/engines/storage/indexes/fulltext
+    ydb/core/tx/program
     ydb/core/tx/columnshard/engines/reader/common
     ydb/core/tx/limiter/grouped_memory/usage
     ydb/core/util/evlog

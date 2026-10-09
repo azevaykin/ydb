@@ -302,9 +302,13 @@ public:
                 .NotEmpty()
                 .IsResolved()
                 .NotDeleted()
-                .IsTable()
                 .IsUnderOperation()
                 .IsUnderTheSameOperation(OperationId.GetTxId()); // allowed only as part of consistent operations
+            if (parentTable->IsColumnTable()) {
+                checks.IsColumnTable();
+            } else {
+                checks.IsTable();
+            }
 
             if (!checks) {
                 result->SetError(checks.GetStatus(), checks.GetError());

@@ -19,6 +19,7 @@ private:
     class TFindActualizationInfo {
     private:
         TRWAddress RWAddress;
+        bool FulltextEligible = false;
 
     public:
         const TRWAddress& GetRWAddress() const {
@@ -29,9 +30,20 @@ private:
             : RWAddress(std::move(rwAddress))
         {
         }
+
+        void SetFulltextEligible(const bool value) {
+            FulltextEligible = value;
+        }
+
+        bool GetFulltextEligible() const {
+            return FulltextEligible;
+        }
     };
 
     THashMap<ui64, TFindActualizationInfo> PortionsInfo;
+    ui64 OutstandingEligibleFulltext = 0;
+
+    void PublishOutstandingEligible();
 
     class TFullActualizationInfo {
     private:

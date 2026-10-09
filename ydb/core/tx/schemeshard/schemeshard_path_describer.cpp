@@ -219,6 +219,8 @@ TPathElement::EPathSubType TPathDescriber::CalcPathSubType(const TPath& path) {
                     return TPathElement::EPathSubType::EPathSubTypeLocalMinMaxIndex;
                 case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
                     return TPathElement::EPathSubType::EPathSubTypeLocalCountMinSketchIndex;
+                case NKikimrSchemeOp::EIndexTypeLocalFulltext:
+                    return TPathElement::EPathSubType::EPathSubTypeLocalFulltextIndex;
                 case NKikimrSchemeOp::EIndexTypeInvalid:
                 case NKikimrSchemeOp::EIndexTypeGlobal:
                 case NKikimrSchemeOp::EIndexTypeGlobalAsync:
@@ -638,7 +640,6 @@ void TPathDescriber::DescribeOlapStore(TPathId pathId, TPathElement::TPtr pathEl
 
 void TPathDescriber::DescribeColumnTable(TPathId pathId, TPathElement::TPtr pathEl) {
     const auto tableInfo = Self->ColumnTables.GetVerified(pathId);
-    Y_UNUSED(pathEl);
 
     auto* pathDescription = Result->Record.MutablePathDescription();
     auto description = pathDescription->MutableColumnTableDescription();
@@ -667,8 +668,21 @@ void TPathDescriber::DescribeColumnTable(TPathId pathId, TPathElement::TPtr path
     }
 
     description->SetIsRestore(tableInfo->IsRestore);
+    description->ClearTableIndexes();
+    const auto tablePath = TPath::Init(pathId, Self);
+    for (const auto& [childName, childPathId] : pathEl->GetChildren()) {
+        const auto* child = Self->PathsById.FindPtr(childPathId);
+        if (!child || !(*child)->IsTableIndex() || (*child)->Dropped() || !(*child)->IsCreateFinished()) {
+            continue;
+        }
+        const auto* indexInfo = Self->Indexes.FindPtr(childPathId);
+        if (!indexInfo || !*indexInfo || TTableIndexInfo::IsLocalIndex((*indexInfo)->Type)) {
+            continue;
+        }
+        Self->DescribeTableIndex(childPathId, childName, true, false, *description->AddTableIndexes());
+    }
 
-    DescribeChildren(TPath::Init(pathId, Self));
+    DescribeChildren(tablePath);
 }
 
 void TPathDescriber::DescribePersQueueGroup(TPathId pathId, TPathElement::TPtr pathEl) {
@@ -1624,6 +1638,7 @@ void TSchemeShard::DescribeTableIndex(const TPathId& pathId, const TString& name
         dataSize += tableStats.DataSize + tableStats.IndexSize;
 
         auto* tableDescription = entry.AddIndexImplTableDescriptions();
+        tableDescription->SetName(indexImplTablePathId.first);
         if (fillConfig) {
             FillPartitionConfig(tableInfo.PartitionConfig(), *tableDescription->MutablePartitionConfig());
         }
@@ -1669,6 +1684,9 @@ void TSchemeShard::DescribeTableIndex(const TPathId& pathId, const TString& name
             break;
         case NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter:
             *entry.MutableBloomNGrammFilterDescription() = std::get<NKikimrSchemeOp::TBloomNGrammFilter>(indexInfo->SpecializedIndexDescription);
+            break;
+        case NKikimrSchemeOp::EIndexTypeLocalFulltext:
+            *entry.MutableFulltextIndexDescription() = std::get<NKikimrSchemeOp::TFulltextIndexDescription>(indexInfo->SpecializedIndexDescription);
             break;
         case NKikimrSchemeOp::EIndexTypeInvalid:
             break;

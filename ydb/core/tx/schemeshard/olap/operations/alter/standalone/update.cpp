@@ -1,4 +1,6 @@
 #include "update.h"
+#include <ydb/core/base/table_index.h>
+#include <ydb/core/tx/schemeshard/index/index_utils.h>
 #include <ydb/core/tx/schemeshard/olap/operations/alter/abstract/converter.h>
 #include <ydb/core/tx/schemeshard/olap/common/common.h>
 
@@ -82,6 +84,12 @@ NKikimr::TConclusionStatus TStandaloneSchemaUpdate::DoInitializeImpl(const TUpda
     }
     if (!targetSchema.ValidateTtlSettings(ttl.GetData(), *context.GetSSOperationContext(), collector)) {
         return TConclusionStatus::Fail("ttl update error: " + collector->GetErrorMessage() + ". in alter constructor STANDALONE_UPDATE");
+    }
+    if (AlterTTL && ttl.GetData().HasEnabled()
+            && NTableIndex::ColumnTableHasCompactFulltextIndex(
+                context.GetSSOperationContext()->SS, context.GetOriginalEntity().GetPathId()))
+    {
+        return TConclusionStatus::Fail(TString(NTableIndex::ColumnTableGlobalFulltextTtlRejected));
     }
     auto saSharding = originalTable.GetTableInfoVerified().GetStandaloneShardingVerified();
 

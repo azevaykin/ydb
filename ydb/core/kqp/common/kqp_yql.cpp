@@ -176,6 +176,9 @@ TKqpReadTableSettings ParseInternal(const TCoNameValueTupleList& node) {
         } else if (name == TKqpReadTableSettings::PointPrefixLenSettingName) {
             YQL_ENSURE(tuple.Ref().ChildrenSize() == 2);
             settings.PointPrefixLen = FromString<ui64>(tuple.Value().Cast<TCoAtom>().Value());
+        } else if (name == TKqpReadTableSettings::LocalFulltextIndexSettingName) {
+            YQL_ENSURE(tuple.Value().Maybe<TCoAtom>());
+            settings.LocalFulltextIndex = TString(tuple.Value().Cast<TCoAtom>().Value());
         } else if (name == TKqpReadTableSettings::IndexSelectionDebugInfoSettingName) {
             YQL_ENSURE(tuple.Ref().ChildrenSize() == 2);
             auto lv = tuple.Value().Cast<TCoNameValueTupleList>();
@@ -394,6 +397,16 @@ NNodes::TCoNameValueTupleList TKqpReadTableSettings::BuildNode(TExprContext& ctx
             Build<TCoNameValueTuple>(ctx, pos)
                 .Name()
                     .Build(ForcePrimaryName)
+                .Done());
+    }
+
+    if (LocalFulltextIndex) {
+        settings.emplace_back(
+            Build<TCoNameValueTuple>(ctx, pos)
+                .Name()
+                    .Build(LocalFulltextIndexSettingName)
+                .Value<TCoAtom>()
+                    .Build(LocalFulltextIndex)
                 .Done());
     }
 

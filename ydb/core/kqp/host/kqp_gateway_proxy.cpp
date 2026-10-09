@@ -1,5 +1,6 @@
 #include "kqp_host_impl.h"
 
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/formats/arrow/accessor/common/const.h>
 #include <ydb/core/tablet_flat/bloom_filter_defaults.h>
 #include <ydb/core/formats/arrow/serializer/parsing.h>
@@ -684,6 +685,61 @@ static bool FillCreateLocalIndexDesc(NKikimrSchemeOp::TColumnTableDescription& t
 
                 break;
             }
+            case TIndexDescription::EType::LocalFulltext: {
+                if (!AppData()->FeatureFlags.GetEnableLocalFulltextIndex()) {
+                    code = Ydb::StatusIds::UNSUPPORTED;
+                    error = TString(NKikimr::NFulltext::LocalFulltextIndexDisabled);
+                    return false;
+                }
+                if (index.KeyColumns.size() != 1 || !index.DataColumns.empty()) {
+                    code = Ydb::StatusIds::BAD_REQUEST;
+                    error = index.DataColumns.empty()
+                        ? TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn)
+                        : TString(NKikimr::NFulltext::LocalFulltextIndexNoDataColumns);
+                    return false;
+                }
+                const NKikimrSchemeOp::TOlapColumnDescription* columnDesc = nullptr;
+                for (const auto& column : tableDesc.GetSchema().GetColumns()) {
+                    if (column.GetName() == index.KeyColumns.front()) {
+                        columnDesc = &column;
+                        break;
+                    }
+                }
+                if (!columnDesc || (columnDesc->GetType() != "String" && columnDesc->GetType() != "Utf8")) {
+                    code = Ydb::StatusIds::BAD_REQUEST;
+                    error = TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn);
+                    return false;
+                }
+                const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&index.SpecializedIndexDescription);
+                if (!fulltext) {
+                    code = Ydb::StatusIds::BAD_REQUEST;
+                    error = "Local fulltext index is missing analyzer settings";
+                    return false;
+                }
+                Ydb::Table::FulltextIndexSettings settings = fulltext->GetSettings();
+                TString validationError;
+                if (!NKikimr::NFulltext::ValidateSettings(settings, validationError)) {
+                    code = Ydb::StatusIds::BAD_REQUEST;
+                    error = validationError;
+                    return false;
+                }
+                NKikimr::NFulltext::NormalizeFulltextSettings(settings);
+                auto columnIdIt = columnIdsByName.find(index.KeyColumns.front());
+                if (columnIdIt == columnIdsByName.end()) {
+                    code = Ydb::StatusIds::BAD_REQUEST;
+                    error = TStringBuilder() << "Unknown index column '" << index.KeyColumns.front() << "'";
+                    return false;
+                }
+                auto* upsert = tableDesc.MutableSchema()->AddIndexes();
+                upsert->SetId(nextEntityId++);
+                upsert->SetName(index.Name);
+                upsert->SetClassName(TString(NKikimr::NFulltext::LocalFulltextClassName));
+                upsert->SetInheritPortionStorage(true);
+                auto* section = upsert->MutableColumnFulltextIndex();
+                section->SetColumnId(columnIdIt->second);
+                *section->MutableAnalyzers() = settings.columns(0).analyzers();
+                break;
+            }
             case TIndexDescription::EType::LocalMinMax: {
                 if (index.KeyColumns.size() != 1) {
                     code = Ydb::StatusIds::BAD_REQUEST;
@@ -723,7 +779,9 @@ static bool FillCreateLocalIndexDesc(NKikimrSchemeOp::TColumnTableDescription& t
                 break;
             }
             default:
-                break;
+                code = Ydb::StatusIds::BAD_REQUEST;
+                error = TStringBuilder() << "Unsupported index type for column table: " << static_cast<int>(index.Type);
+                return false;
         }
     }
 
@@ -1178,6 +1236,11 @@ public:
                                 tablePromise.SetValue(ResultFromError<TGenericResult>(NKikimr::NOlap::NIndexes::NMinMax::DisabledForRowTablesErrorMessage));
                                 return;
                             }
+                        }
+
+                        if (index.Type == TIndexDescription::EType::LocalFulltext) {
+                            tablePromise.SetValue(ResultFromError<TGenericResult>(TString(NKikimr::NFulltext::LocalFulltextIndexColumnTableOnly)));
+                            return;
                         }
 
                         auto indexDesc = schemeTx.MutableCreateIndexedTable()->AddIndexDescription();

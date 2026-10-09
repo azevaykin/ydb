@@ -13,6 +13,7 @@ SRCS(
 )
 
 PEERDIR(
+    ydb/core/base
     ydb/core/protos
     ydb/core/formats/arrow
 

@@ -364,7 +364,24 @@ bool HasUncommittedChangesRead(THashSet<NKikimr::TTableId>& modifiedTables, cons
                         return true;
                     }
                 } else if (source.GetTypeCase() == NKqpProto::TKqpSource::kFullTextSource) {
-                    if (modifiedTables.contains(getTable(source.GetFullTextSource().GetTable()))) {
+                    const auto& fullText = source.GetFullTextSource();
+                    if (modifiedTables.contains(getTable(fullText.GetTable()))) {
+                        return true;
+                    }
+                    for (const auto& indexTable : fullText.GetIndexTables()) {
+                        if (modifiedTables.contains(getTable(indexTable.GetTable()))) {
+                            return true;
+                        }
+                    }
+                    if (fullText.HasUniqueIndexImplTable()
+                        && modifiedTables.contains(getTable(fullText.GetUniqueIndexImplTable().GetTable())))
+                    {
+                        return true;
+                    }
+                    if (fullText.HasStateTable() && modifiedTables.contains(getTable(fullText.GetStateTable().GetTable()))) {
+                        return true;
+                    }
+                    if (fullText.HasDocIdMapTable() && modifiedTables.contains(getTable(fullText.GetDocIdMapTable().GetTable()))) {
                         return true;
                     }
                 } else {
@@ -375,8 +392,28 @@ bool HasUncommittedChangesRead(THashSet<NKikimr::TTableId>& modifiedTables, cons
             auto processSinkSettings = [&](NKikimrKqp::TKqpTableSinkSettings& settings) {
                 const bool tableModifiedBefore = modifiedTables.contains(getTable(settings.GetTable()));
                 modifiedTables.insert(getTable(settings.GetTable()));
+                auto rememberIndexTable = [&](const NKqpProto::TKqpPhyTableId& table) {
+                    if (table.GetOwnerId() != 0 || table.GetTableId() != 0) {
+                        modifiedTables.insert(getTable(table));
+                    }
+                };
                 for (const auto& index : settings.GetIndexes()) {
-                    modifiedTables.insert(getTable(index.GetTable()));
+                    rememberIndexTable(index.GetTable());
+                    if (index.HasDocsTable()) {
+                        rememberIndexTable(index.GetDocsTable());
+                    }
+                    if (index.HasDictTable()) {
+                        rememberIndexTable(index.GetDictTable());
+                    }
+                    if (index.HasStatsTable()) {
+                        rememberIndexTable(index.GetStatsTable());
+                    }
+                    if (index.HasStateTable()) {
+                        rememberIndexTable(index.GetStateTable());
+                    }
+                    if (index.HasDocIdMapTable()) {
+                        rememberIndexTable(index.GetDocIdMapTable());
+                    }
                 }
 
                 if (settings.GetNeedLookup() && tableModifiedBefore) {

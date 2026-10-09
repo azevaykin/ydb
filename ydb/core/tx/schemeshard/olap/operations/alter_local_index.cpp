@@ -1,3 +1,4 @@
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/tx/schemeshard/schemeshard__operation_common.h>
 #include <ydb/core/tx/schemeshard/schemeshard__operation_part.h>
 #include <ydb/core/tx/schemeshard/schemeshard_impl.h>
@@ -215,6 +216,11 @@ public:
                         return TStringBuilder() << what << " SpecializedIndexDescription is not empty for index type LocalCountMinSketch";
                     }
                     return std::nullopt;
+                case NKikimrSchemeOp::EIndexTypeLocalFulltext:
+                    if (!std::holds_alternative<NKikimrSchemeOp::TFulltextIndexDescription>(info.SpecializedIndexDescription)) {
+                        return TStringBuilder() << what << " SpecializedIndexDescription does not hold TFulltextIndexDescription for index type LocalFulltext";
+                    }
+                    return std::nullopt;
                 default:
                     return TStringBuilder() << "Unexpected index type " << static_cast<int>(info.Type)
                         << " in TAlterLocalIndex::Propose. Only local bloom filter and min_max types are supported.";
@@ -232,6 +238,22 @@ public:
         if (auto err = checkLocalIndex(*newIndexData->AlterData, "requested")) {
             result->SetError(NKikimrScheme::StatusSchemeError, *err);
             return result;
+        }
+
+        if (indexIt->second->Type == NKikimrSchemeOp::EIndexTypeLocalFulltext) {
+            const auto* existing = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexIt->second->SpecializedIndexDescription);
+            const auto* requested = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&newIndexData->AlterData->SpecializedIndexDescription);
+            const bool sameAnalyzers = existing && requested
+                && NKikimr::NFulltext::FulltextAnalyzerIdentity(NKikimr::NFulltext::NormalizeAnalyzers(
+                    existing->GetSettings().columns().empty() ? Ydb::Table::FulltextIndexSettings::Analyzers() : existing->GetSettings().columns(0).analyzers()))
+                == NKikimr::NFulltext::FulltextAnalyzerIdentity(NKikimr::NFulltext::NormalizeAnalyzers(
+                    requested->GetSettings().columns().empty() ? Ydb::Table::FulltextIndexSettings::Analyzers() : requested->GetSettings().columns(0).analyzers()));
+            const bool sameColumns = newIndexData->AlterData->IndexKeys.empty()
+                || newIndexData->AlterData->IndexKeys == indexIt->second->IndexKeys;
+            if (!sameAnalyzers || !sameColumns) {
+                result->SetError(NKikimrScheme::StatusInvalidParameter, TString(NKikimr::NFulltext::LocalFulltextIndexAlterRejected));
+                return result;
+            }
         }
 
         auto guard = context.DbGuard();

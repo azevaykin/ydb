@@ -124,6 +124,7 @@ public:
         GlobalFulltextCompact = 10,
         GlobalFulltextCompactRelevance = 11,
         GlobalJsonCompact = 12,
+        LocalFulltext = 13,
     };
 
     // Index states here must be in sync with NKikimrSchemeOp::EIndexState protobuf
@@ -222,6 +223,9 @@ public:
                     SpecializedIndexDescription = TLocalBloomNgramFilterDescription{};
                 }
                 break;
+            case EType::LocalFulltext:
+                SpecializedIndexDescription = index.GetFulltextIndexDescription();
+                break;
             default:
                 YQL_ENSURE(false, << InvalidIndexType(Type));
         }
@@ -277,6 +281,9 @@ public:
                     SpecializedIndexDescription = TLocalBloomNgramFilterDescription{};
                 }
                 break;
+            case EType::LocalFulltext:
+                SpecializedIndexDescription = message->GetFulltextIndexDescription();
+                break;
             default:
                 YQL_ENSURE(false, << InvalidIndexType(Type));
         }
@@ -310,6 +317,8 @@ public:
                 return TIndexDescription::EType::GlobalFulltextCompactRelevance;
             case NKikimrSchemeOp::EIndexType::EIndexTypeGlobalJsonCompact:
                 return TIndexDescription::EType::GlobalJsonCompact;
+            case NKikimrSchemeOp::EIndexType::EIndexTypeLocalFulltext:
+                return TIndexDescription::EType::LocalFulltext;
             default:
                 YQL_ENSURE(false, << NKikimr::NTableIndex::InvalidIndexType(indexType));
         }
@@ -343,6 +352,8 @@ public:
                 return NKikimrSchemeOp::EIndexType::EIndexTypeLocalBloomNgramFilter;
             case NYql::TIndexDescription::EType::LocalMinMax:
                 return NKikimrSchemeOp::EIndexType::EIndexTypeLocalMinMax;
+            case NYql::TIndexDescription::EType::LocalFulltext:
+                return NKikimrSchemeOp::EIndexType::EIndexTypeLocalFulltext;
             default:
                 YQL_ENSURE(false, << InvalidIndexType(indexType));
         }
@@ -400,6 +411,9 @@ public:
             case EType::LocalBloomNgramFilter:
                 Y_ASSERT(std::holds_alternative<TLocalBloomNgramFilterDescription>(SpecializedIndexDescription));
                 break;
+            case EType::LocalFulltext:
+                *message->MutableFulltextIndexDescription() = std::get<NKikimrSchemeOp::TFulltextIndexDescription>(SpecializedIndexDescription);
+                break;
         }
     }
 
@@ -434,6 +448,7 @@ public:
             case EType::LocalBloomFilter:
             case EType::LocalBloomNgramFilter:
             case EType::LocalMinMax:
+            case EType::LocalFulltext:
                 return false;
         }
     }
@@ -455,6 +470,12 @@ public:
     }
 
     std::span<const std::string_view> GetImplTables() const {
+        if (const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&SpecializedIndexDescription)) {
+            if (fulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED) {
+                return NKikimr::NTableIndex::GetColumnTableFulltextImplTables(
+                    NYql::TIndexDescription::ConvertIndexType(Type), fulltext->GetDocIdPolicy());
+            }
+        }
         switch (Type) {
             case EType::GlobalSync:
             case EType::GlobalSyncUnique:
@@ -470,6 +491,7 @@ public:
             case EType::LocalBloomFilter:
             case EType::LocalBloomNgramFilter:
             case EType::LocalMinMax:
+            case EType::LocalFulltext:
                 return {};
         }
         return {};

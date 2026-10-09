@@ -799,8 +799,11 @@ bool TColumnEngineForLogs::StartActualization(const THashMap<TInternalPathId, TT
     if (ActualizationStarted) {
         return false;
     }
+    // Portions can already be loaded when this first runs: tablet restart, or a critical
+    // schema that was not the newest version while schemas were being read.
     for (auto&& i : GranulesStorage->GetTables()) {
         i.second->StartActualizationIndex();
+        i.second->RefreshScheme();
     }
     for (auto&& i : specialPathEviction) {
         auto g = GetGranuleOptional(i.first);

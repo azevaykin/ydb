@@ -812,6 +812,11 @@ TExprNode::TPtr ReplaceJsonValuesWithExternalArgs(const TExprNode::TPtr& predica
 }
 
 TFilterOpsLevels PredicatePushdown(const TExprBase& predicate, const TExprNode& argument, TExprContext& ctx, TPositionHandle pos, const TPushdownOptions& pushdownOptions) {
+    if (const auto fulltext = predicate.Maybe<TKqpOlapFulltextMatch>()) {
+        Y_UNUSED(argument);
+        return TFilterOpsLevels(fulltext.Cast());
+    }
+
     if (const auto maybeCoalesce = predicate.Maybe<TCoCoalesce>()) {
         auto coalescePred = CoalescePushdown(maybeCoalesce.Cast(), argument, ctx, pushdownOptions);
         return TFilterOpsLevels(coalescePred);

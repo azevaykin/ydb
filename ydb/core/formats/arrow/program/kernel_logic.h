@@ -56,6 +56,11 @@ public:
         return std::nullopt;
     }
 
+    // The calculation reads every source row. Dictionary-only fetch drops that alignment.
+    virtual bool RequiresSourceRows() const {
+        return false;
+    }
+
     TConclusion<bool> Execute(
         const std::vector<TColumnChainInfo>& input, const std::vector<TColumnChainInfo>& output, TAccessorsCollection& resources) const {
         return DoExecute(input, output, resources);

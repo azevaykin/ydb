@@ -17,6 +17,9 @@
 #include <contrib/libs/apache/arrow/cpp/src/arrow/array/array_base.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/table.h>
 
+#include <optional>
+#include <vector>
+
 namespace NKikimr::NOlap::NReader::NCommon {
 
 class IKernelFetchLogic;
@@ -35,6 +38,31 @@ private:
     THashSet<ui32> DictionaryOnlyFetchColumns;
 
 public:
+    // Portion-local fulltext decision for the one FulltextMatch in this scan.
+    struct TFulltextMatchState {
+        bool IndexCollected = false;
+        bool NeedText = false;
+        bool HasTokenMask = false;
+        std::vector<ui8> PortionMask;
+        TString FallbackReason;
+    };
+
+    TFulltextMatchState& MutableFulltextMatchState() {
+        if (!FulltextMatchStateStorage) {
+            FulltextMatchStateStorage.emplace();
+        }
+        return *FulltextMatchStateStorage;
+    }
+
+    const TFulltextMatchState* GetFulltextMatchStateOptional() const {
+        return FulltextMatchStateStorage ? &*FulltextMatchStateStorage : nullptr;
+    }
+
+private:
+    std::optional<TFulltextMatchState> FulltextMatchStateStorage;
+
+public:
+
     bool HasTable() const {
         return !!Table;
     }

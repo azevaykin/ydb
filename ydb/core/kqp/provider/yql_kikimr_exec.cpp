@@ -1,6 +1,8 @@
 #include "yql_kikimr_provider_impl.h"
 
 #include <ydb/core/base/fulltext.h>
+#include <ydb/core/base/table_index.h>
+#include <ydb/core/ydb_convert/table_description.h>
 #include <ydb/core/base/kmeans_clusters.h>
 #include <ydb/core/docapi/traits.h>
 #include <ydb/core/kqp/gateway/utils/scheme_helpers.h>
@@ -1933,6 +1935,28 @@ public:
 
             NThreading::TFuture<IKikimrGateway::TGenericResult> future;
             bool isColumn = (table.Metadata->StoreType == EStoreType::Column);
+            if (isColumn) {
+                for (const auto& index : table.Metadata->Indexes) {
+                    if (index.Type != NYql::TIndexDescription::EType::GlobalFulltextPlain
+                        && index.Type != NYql::TIndexDescription::EType::GlobalFulltextRelevance
+                        && index.Type != NYql::TIndexDescription::EType::GlobalFulltextCompact
+                        && index.Type != NYql::TIndexDescription::EType::GlobalFulltextCompactRelevance)
+                    {
+                        continue;
+                    }
+                    TStringBuf message = NKikimr::NTableIndex::ColumnTableGlobalFulltextInlineCreate;
+                    if (!SessionCtx->Config().FeatureFlags.GetEnableColumnTableGlobalFulltextIndex()) {
+                        message = NKikimr::NTableIndex::ColumnTableGlobalFulltextDisabled;
+                    } else if (!SessionCtx->Config().FeatureFlags.GetEnableCompactFulltextIndex()
+                        || index.Type == NYql::TIndexDescription::EType::GlobalFulltextPlain
+                        || index.Type == NYql::TIndexDescription::EType::GlobalFulltextRelevance)
+                    {
+                        message = NKikimr::NTableIndex::ColumnTableGlobalFulltextCompactOnly;
+                    }
+                    ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TString(message)));
+                    return SyncError();
+                }
+            }
             bool existingOk = (maybeCreate.ExistingOk().Cast().Value() == "1");
             bool replaceIfExists = (maybeCreate.ReplaceIfExists().Cast().Value() == "1");
             switch (tableTypeItem) {
@@ -2635,6 +2659,13 @@ public:
                                     return SyncError();
                                 }
                                 add_index->mutable_local_min_max_index();
+                            } else if (type == "localFulltext") {
+                                if (!SessionCtx->Config().FeatureFlags.GetEnableLocalFulltextIndex()) {
+                                    ctx.AddError(TIssue(ctx.GetPosition(columnTuple.Item(1).Cast<TCoAtom>().Pos()),
+                                        TString(NKikimr::NFulltext::LocalFulltextIndexDisabled)));
+                                    return SyncError();
+                                }
+                                add_index->mutable_local_fulltext_index();
                             } else {
                                 ctx.AddError(TIssue(ctx.GetPosition(columnTuple.Item(1).Cast<TCoAtom>().Pos()),
                                     TStringBuilder() << "Unknown index type: " << type));
@@ -2675,6 +2706,10 @@ public:
                             } else if (add_index->type_case() == Ydb::Table::TableIndex::kGlobalFulltextRelevanceIndex) {
                                 // fulltext index has per-column analyzers settings, single value for now
                                 add_index->mutable_global_fulltext_relevance_index()->mutable_fulltext_settings()->add_columns()->set_column(
+                                    add_index->index_columns().empty() ? "<none>" : *add_index->index_columns().rbegin()
+                                );
+                            } else if (add_index->type_case() == Ydb::Table::TableIndex::kLocalFulltextIndex) {
+                                add_index->mutable_local_fulltext_index()->mutable_fulltext_settings()->add_columns()->set_column(
                                     add_index->index_columns().empty() ? "<none>" : *add_index->index_columns().rbegin()
                                 );
                             }
@@ -2731,6 +2766,12 @@ public:
                                             ctx.AddError(TIssue(ctx.GetPosition(nameNode.Pos()), TStringBuilder()
                                                 << "min_max index does not support setting: " << name));
                                             return SyncError();
+                                        }
+                                        case Ydb::Table::TableIndex::kLocalFulltextIndex: {
+                                            NKikimr::NFulltext::FillSetting(
+                                                *add_index->mutable_local_fulltext_index()->mutable_fulltext_settings(),
+                                                name, value.StringValue(), error);
+                                            break;
                                         }
                                         default:
                                             ctx.AddError(TIssue(ctx.GetPosition(nameNode.Pos()), TStringBuilder()
@@ -2856,6 +2897,38 @@ public:
 
                             break;
                         }
+                        case Ydb::Table::TableIndex::kLocalFulltextIndex: {
+                            if (table.Metadata->StoreType != EStoreType::Column) {
+                                ctx.AddError(TIssue(ctx.GetPosition(action.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexColumnTableOnly)));
+                                return SyncError();
+                            }
+                            if (!add_index->data_columns().empty()) {
+                                ctx.AddError(TIssue(ctx.GetPosition(action.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexNoDataColumns)));
+                                return SyncError();
+                            }
+                            if (add_index->index_columns_size() != 1) {
+                                ctx.AddError(TIssue(ctx.GetPosition(action.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn)));
+                                return SyncError();
+                            }
+                            const auto columnIt = table.Metadata->Columns.find(add_index->index_columns(0));
+                            if (columnIt == table.Metadata->Columns.end()
+                                || (columnIt->second.Type != "String" && columnIt->second.Type != "Utf8"))
+                            {
+                                ctx.AddError(TIssue(ctx.GetPosition(action.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn)));
+                                return SyncError();
+                            }
+                            auto* settings = add_index->mutable_local_fulltext_index()->mutable_fulltext_settings();
+                            if (settings->columns().empty()) {
+                                settings->add_columns()->set_column(add_index->index_columns(0));
+                            }
+                            TString error;
+                            if (!NKikimr::NFulltext::ValidateSettings(*settings, error)) {
+                                ctx.AddError(TIssue(ctx.GetPosition(action.Pos()), error));
+                                return SyncError();
+                            }
+                            NKikimr::NFulltext::NormalizeFulltextSettings(*settings);
+                            break;
+                        }
                         case Ydb::Table::TableIndex::TYPE_NOT_SET: {
                             ctx.AddError(TIssue(ctx.GetPosition(action.Pos()), "Index type should be set"));
                             return SyncError();
@@ -2927,6 +3000,11 @@ public:
                             allIndexes << "]";
                             ctx.AddError(TIssue(ctx.GetPosition(action.Name().Pos()),
                                 TStringBuilder() << "Index " << alterIndexName << " does not exist in table " << table.Metadata->Name << ". Only these " << table.Metadata->Indexes.size() << " do exist: " << allIndexes));
+                            return SyncError();
+                        }
+
+                        if (indexIter->Type == NYql::TIndexDescription::EType::LocalFulltext) {
+                            ctx.AddError(TIssue(ctx.GetPosition(action.Name().Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexAlterRejected)));
                             return SyncError();
                         }
 
@@ -3477,6 +3555,38 @@ public:
             NThreading::TFuture<IKikimrGateway::TGenericResult> future;
             bool isTableStore = (table.Metadata->TableType == ETableType::TableStore);  // Doesn't set, so always false
             bool isColumn = (table.Metadata->StoreType == EStoreType::Column);
+            bool routeColumnGlobalFulltext = false;
+            if (isColumn) {
+                const auto ops = NKikimr::GetAlterOperationKinds(&alterTableRequest);
+                const bool addGlobalFulltext = ops.size() == 1 && *ops.begin() == NKikimr::EAlterOperationKind::AddIndex
+                    && alterTableRequest.add_indexes_size() == 1
+                    && (alterTableRequest.add_indexes(0).type_case() == Ydb::Table::TableIndex::kGlobalFulltextPlainIndex
+                        || alterTableRequest.add_indexes(0).type_case() == Ydb::Table::TableIndex::kGlobalFulltextRelevanceIndex);
+                if (addGlobalFulltext) {
+                    if (!SessionCtx->Config().FeatureFlags.GetEnableColumnTableGlobalFulltextIndex()
+                        || !SessionCtx->Config().FeatureFlags.GetEnableCompactFulltextIndex())
+                    {
+                        ctx.AddError(TIssue(ctx.GetPosition(input->Pos()), TString(
+                            SessionCtx->Config().FeatureFlags.GetEnableColumnTableGlobalFulltextIndex()
+                                ? NKikimr::NTableIndex::ColumnTableGlobalFulltextCompactOnly
+                                : NKikimr::NTableIndex::ColumnTableGlobalFulltextDisabled)));
+                        return SyncError();
+                    }
+                    routeColumnGlobalFulltext = true;
+                } else if (ops.size() == 1 && *ops.begin() == NKikimr::EAlterOperationKind::DropIndex
+                    && alterTableRequest.drop_indexes_size() == 1)
+                {
+                    const auto& droppedName = alterTableRequest.drop_indexes(0);
+                    const auto indexIt = std::find_if(table.Metadata->Indexes.begin(), table.Metadata->Indexes.end(),
+                        [&](const auto& index) { return index.Name == droppedName; });
+                    if (indexIt != table.Metadata->Indexes.end()
+                        && (indexIt->Type == NYql::TIndexDescription::EType::GlobalFulltextCompact
+                            || indexIt->Type == NYql::TIndexDescription::EType::GlobalFulltextCompactRelevance))
+                    {
+                        routeColumnGlobalFulltext = true;
+                    }
+                }
+            }
 
             if (isTableStore) {
                 AFL_VERIFY(false);
@@ -3486,7 +3596,7 @@ public:
                     return SyncError();
                 }
                 future = Gateway->AlterTableStore(cluster, ParseAlterTableStoreSettings(maybeAlter.Cast()));
-            } else if (isColumn) {
+            } else if (isColumn && !routeColumnGlobalFulltext) {
                 future = Gateway->AlterColumnTable(cluster, std::move(alterTableRequest));
             } else {
                 TMaybe<TString> requestType;

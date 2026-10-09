@@ -374,6 +374,8 @@ TConclusion<TWritePortionInfoWithBlobsResult> ISnapshotSchema::PrepareForWrite(c
     const ui64 totalBlobBytes = slice.GetPackedSize();
     THashMap<ui32, std::shared_ptr<IPortionDataChunk>> inplaceChunks;
     std::vector<TSplittedBlob> blobs;
+    // Local fulltext follows this policy. BuildIndexesEnabled defaults to unset, so an
+    // insert leaves postings absent until compaction, scheme actualization, or an explicit enable.
     const bool buildIndexes =
         GetIndexInfo().GetInsertOptions().ShouldBuildIndexesOnInsert(mType, totalBlobBytes) && GetIndexInfo().GetIndexes().size();
     if (buildIndexes) {

@@ -13,6 +13,7 @@ ENDIF()
 
 SRCS(
     indexes_ut.cpp
+    kqp_olap_fulltext_ut.cpp
 )
 
 PEERDIR(

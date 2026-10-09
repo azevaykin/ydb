@@ -18,6 +18,10 @@ private:
     YDB_READONLY_DEF(NOlap::NDataAccessorControl::TMetadataManagerConstructorContainer, MetadataManagerConstructor);
 public:
     bool ApplyUpdate(const TOlapOptionsUpdate& schemaUpdate, IErrorCollector& errors);
+    // Puts this schema version on the scheme-actualizer queue. ADD INDEX of a local
+    // fulltext index uses it so pre-existing portions are rewritten; the new schema
+    // itself is already readable through text evaluation.
+    void RequestSchemeActualization();
 
     void Parse(const NKikimrSchemeOp::TColumnTableSchema& tableSchema);
     void Serialize(NKikimrSchemeOp::TColumnTableSchema& tableSchema) const;

@@ -52,6 +52,87 @@ ISubOperation::TPtr CreateBuildColumn(TOperationId opId, const TTxTransaction& t
     }
 }
 
+void AppendColumnTableFulltextSupport(
+    TVector<ISubOperation::TPtr>& result,
+    TOperationId opId,
+    const TTxTransaction& tx,
+    const TPath& index,
+    const NKikimrSchemeOp::TIndexCreationConfig& indexDesc,
+    const NKikimrSchemeOp::TTableDescription& baseTableDesc,
+    const TString& ttlColumn,
+    ui32 minPartitions)
+{
+    auto createImplTable = [&](NKikimrSchemeOp::TTableDescription&& implTableDesc, const THashSet<TString>& localSequences = {}) {
+        if (!implTableDesc.GetPartitionConfig().GetPartitioningPolicy().HasMinPartitionsCount()
+            || implTableDesc.GetPartitionConfig().GetPartitioningPolicy().GetMinPartitionsCount() < minPartitions)
+        {
+            implTableDesc.MutablePartitionConfig()->MutablePartitioningPolicy()->SetMinPartitionsCount(minPartitions);
+        }
+        auto outTx = TransactionTemplate(index.PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpInitiateBuildIndexImplTable);
+        *outTx.MutableCreateTable() = std::move(implTableDesc);
+        outTx.SetInternal(tx.GetInternal());
+        return CreateInitializeBuildIndexImplTable(NextPartId(opId, result), outTx, localSequences);
+    };
+    auto createSequence = [&](const TString& tableName, const TString& sequenceName, bool documentIds) {
+        auto outTx = TransactionTemplate(index.PathString() + "/" + tableName, NKikimrSchemeOp::EOperationType::ESchemeOpCreateSequence);
+        outTx.SetInternal(tx.GetInternal());
+        auto* sequence = outTx.MutableSequence();
+        sequence->SetName(sequenceName);
+        if (documentIds) {
+            // seq is in [0, 2^48). Overflow is an error. Ids are never recycled.
+            sequence->SetMinValue(0);
+            sequence->SetStartValue(0);
+            sequence->SetIncrement(1);
+            sequence->SetMaxValue(NTableIndex::NFulltext::SyntheticDocIdSeqMaxInclusive);
+            sequence->SetCycle(false);
+        } else {
+            sequence->SetStartValue(static_cast<i64>(Max<NTableIndex::NFulltext::TGen>() - 1));
+            sequence->SetIncrement(-1);
+            sequence->SetMaxValue(static_cast<i64>(Max<NTableIndex::NFulltext::TGen>() - 1));
+        }
+        result.push_back(CreateNewSequence(NextPartId(opId, result), outTx));
+    };
+
+    const auto indexType = GetIndexType(indexDesc);
+    const bool relevance = indexType == NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance;
+    const bool synthetic = indexDesc.GetFulltextIndexDescription().GetDocIdPolicy()
+        == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+    auto prefixColumns = NTableIndex::GetFulltextPrefixColumns(indexDesc.GetKeyColumnNames());
+    const NKikimrSchemeOp::TPartitionConfig noRowPartitionConfig;
+    NKikimrSchemeOp::TTableDescription indexTableDesc;
+    NKikimrSchemeOp::TTableDescription docsTableDesc;
+    NKikimrSchemeOp::TTableDescription statsTableDesc;
+    if (relevance && indexDesc.IndexImplTableDescriptionsSize() >= 3) {
+        docsTableDesc = indexDesc.GetIndexImplTableDescriptions(0);
+        statsTableDesc = indexDesc.GetIndexImplTableDescriptions(1);
+        indexTableDesc = indexDesc.GetIndexImplTableDescriptions(2);
+    } else if (!relevance && indexDesc.IndexImplTableDescriptionsSize() >= 1) {
+        indexTableDesc = indexDesc.GetIndexImplTableDescriptions(0);
+    }
+
+    result.push_back(createImplTable(CalcFulltextCompactImplTableDesc(
+        baseTableDesc, noRowPartitionConfig, indexTableDesc, &indexDesc.GetFulltextIndexDescription(),
+        indexType, prefixColumns, false), THashSet<TString>{NTableIndex::NFulltext::GenSequence}));
+    createSequence(NTableIndex::ImplTable, NTableIndex::NFulltext::GenSequence, false);
+
+    if (relevance) {
+        const THashSet<TString> indexDataColumns{indexDesc.GetDataColumnNames().begin(), indexDesc.GetDataColumnNames().end()};
+        result.push_back(createImplTable(CalcFulltextDocsImplTableDesc(
+            baseTableDesc, noRowPartitionConfig, indexDataColumns, docsTableDesc, indexDesc.GetFulltextIndexDescription())));
+        result.push_back(createImplTable(CalcFulltextStatsImplTableDesc(
+            baseTableDesc, noRowPartitionConfig, statsTableDesc, prefixColumns)));
+    }
+
+    result.push_back(createImplTable(CalcColumnTableFulltextStateTableDesc(
+        baseTableDesc, noRowPartitionConfig, {}, indexDesc.GetFulltextIndexDescription(), relevance,
+        prefixColumns, THashSet<TString>{indexDesc.GetDataColumnNames().begin(), indexDesc.GetDataColumnNames().end()},
+        ttlColumn)));
+    if (synthetic) {
+        result.push_back(createImplTable(CalcColumnTableFulltextDocIdMapTableDesc(baseTableDesc, noRowPartitionConfig, {})));
+        createSequence(NTableIndex::NFulltext::DocIdMapTable, NTableIndex::NFulltext::DocIdSequence, true);
+    }
+}
+
 TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransaction& tx, TOperationContext& context) {
     Y_ABORT_UNLESS(tx.GetOperationType() == NKikimrSchemeOp::EOperationType::ESchemeOpCreateIndexBuild);
 
@@ -100,11 +181,53 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
     auto counts = GetIndexObjectCounts(indexDesc);
 
     const auto table = TPath::Resolve(op.GetTable(), context.SS);
-    if (!table.IsResolved() || !table->IsTable()) {
+    const bool columnParent = table.IsResolved() && table->IsColumnTable();
+    if (!table.IsResolved() || (!columnParent && !table->IsTable())) {
         return {CreateReject(opId, NKikimrScheme::StatusInvalidParameter, "Index parent must be a table")};
     }
+    if (columnParent) {
+        if (!context.SS->EnableColumnTableGlobalFulltextIndex) {
+            return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed, ColumnTableGlobalFulltextDisabled)};
+        }
+        if (!IsColumnTableCompactFulltext(GetIndexType(indexDesc))) {
+            return {CreateReject(opId, NKikimrScheme::StatusInvalidParameter, ColumnTableGlobalFulltextCompactOnly)};
+        }
+        if (op.GetIsRebuild()) {
+            return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed,
+                "REBUILD INDEX is not supported for column-table fulltext indexes")};
+        }
+    }
 
-    auto tableInfo = context.SS->Tables.at(table.Base()->PathId);
+    auto tableInfo = columnParent ? TTableInfo::TPtr{} : context.SS->Tables.at(table.Base()->PathId);
+    NKikimrSchemeOp::TTableDescription columnBaseDesc;
+    TString columnTtlColumn;
+    ui32 columnShards = 1;
+    if (columnParent) {
+        const auto columnTable = context.SS->ColumnTables.GetVerified(table.Base()->PathId);
+        TOlapStoreInfo::TPtr store;
+        if (!columnTable->IsStandalone() && columnTable->Description.GetSchema().ColumnsSize() == 0) {
+            store = context.SS->OlapStores.at(columnTable->GetOlapStorePathIdVerified());
+        }
+        columnBaseDesc = ColumnSchemaToTableDescription(ReadColumnTableSchema(*columnTable, store.get()));
+        columnTtlColumn = ColumnTableTtlColumn(*columnTable);
+        // Deletion TTL must not run beside an unadapted C index. Reject until C6's TTL adapter lands.
+        if (!columnTtlColumn.empty()) {
+            return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed,
+                ColumnTableGlobalFulltextTtlRejected)};
+        }
+        columnShards = ColumnTableShardCount(*columnTable);
+        const auto baseColumns = ExtractInfo(columnBaseDesc);
+        TColumnTypes columnTypes;
+        TString typeError;
+        if (!ExtractTypes(columnBaseDesc, columnTypes, typeError)) {
+            return {CreateReject(opId, NKikimrScheme::StatusInvalidParameter, typeError)};
+        }
+        const TVector<TString> indexKeys(indexDesc.GetKeyColumnNames().begin(), indexDesc.GetKeyColumnNames().end());
+        if (!PrepareColumnTableFulltext(*indexDesc.MutableFulltextIndexDescription(), baseColumns, columnTypes, indexKeys, typeError)) {
+            return {CreateReject(opId, NKikimrScheme::StatusInvalidParameter, typeError)};
+        }
+        counts = GetColumnTableFulltextObjectCounts(indexDesc);
+    }
     const bool forReplication = op.GetForReplication();
     if (forReplication && (!tx.GetInternal() || !table.IsAsyncReplicaTable()
         || GetIndexType(indexDesc) != NKikimrSchemeOp::EIndexTypeGlobal || op.GetIsRebuild()))
@@ -194,7 +317,7 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
     }
 
     TString errStr;
-    if (!isRebuild) {
+    if (!isRebuild && !columnParent) {
         if (!NTableIndex::MaybeEnableFulltextRowIdMode(tableInfo, table.Base()->GetChildren(), context.SS->Indexes.AsMap(), indexDesc, errStr)) {
             return {CreateReject(opId, NKikimrScheme::EStatus::StatusInvalidParameter, errStr)};
         }
@@ -202,7 +325,10 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
 
     NTableIndex::TTableColumns implTableColumns;
     NKikimrScheme::EStatus status;
-    if (!NTableIndex::CommonCheck(tableInfo, indexDesc, domainInfo->GetSchemeLimits(), false, implTableColumns, status, errStr)) {
+    const bool columnsOk = columnParent
+        ? NTableIndex::CommonCheck(columnBaseDesc, indexDesc, domainInfo->GetSchemeLimits(), false, implTableColumns, status, errStr)
+        : NTableIndex::CommonCheck(tableInfo, indexDesc, domainInfo->GetSchemeLimits(), false, implTableColumns, status, errStr);
+    if (!columnsOk) {
         return {CreateReject(opId, status, errStr)};
     }
 
@@ -236,7 +362,7 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
         result.push_back(CreateNewTableIndex(NextPartId(opId, result), outTx));
     }
 
-    {
+    if (!columnParent) {
         auto outTx = TransactionTemplate(table.Parent().PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpInitiateBuildIndexMainTable);
         *outTx.MutableLockGuard() = tx.GetLockGuard();
         outTx.SetInternal(tx.GetInternal());
@@ -328,6 +454,15 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
         case NKikimrSchemeOp::EIndexTypeGlobalJsonCompact:
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance: {
+            if (columnParent) {
+                const ui32 maxShardsInPath = domainInfo->GetSchemeLimits().MaxShardsInPath;
+                ui32 fulltextShards = columnShards;
+                if (fulltextShards > maxShardsInPath) {
+                    fulltextShards = maxShardsInPath;
+                }
+                AppendColumnTableFulltextSupport(result, opId, tx, index, indexDesc, columnBaseDesc, columnTtlColumn, fulltextShards);
+                break;
+            }
             NKikimrSchemeOp::TTableDescription indexTableDesc, docsTableDesc, dictTableDesc, statsTableDesc;
             if (indexType == NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance) {
                 if (indexDesc.IndexImplTableDescriptionsSize() == 4) {

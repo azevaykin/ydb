@@ -948,6 +948,26 @@ message TKqpTableSinkIndexSettings {
     optional NKqpProto.TKqpPhyTableId StatsTable = 17;
     repeated TKqpColumnMetadataProto StatsColumns = 18;
     optional uint32 DataColumnCount = 19;
+
+    // Column-table compact fulltext support tables and identity. Unset for row-table indexes.
+    optional NKqpProto.TKqpPhyTableId StateTable = 20;
+    repeated TKqpColumnMetadataProto StateColumns = 21;
+    optional NKqpProto.TKqpPhyTableId DocIdMapTable = 22;
+    repeated TKqpColumnMetadataProto DocIdMapColumns = 23;
+    optional NKikimrSchemeOp.TFulltextIndexDescription.EDocIdPolicy DocIdPolicy = 24;
+    optional uint64 BuildGeneration = 25;
+    optional uint64 AnalyzerRevision = 26;
+    optional bytes AnalyzerIdentity = 27;
+    // index/<map-or-posting-table>/<sequence>
+    optional string DocIdSequencePath = 28;
+    optional string GenerationSequencePath = 29;
+
+    // Column-table maintenance. Unset IndexState means a row-table index.
+    optional NKikimrSchemeOp.EIndexState IndexState = 30;
+    optional string TextColumn = 31;
+    repeated string PrefixColumns = 32;
+    repeated string CoveredColumns = 33;
+    optional string TtlColumn = 34;
 }
 
 enum EInputRowFormat {
@@ -1098,6 +1118,17 @@ message TKqpFullTextSourceSettings {
     optional uint32 LockNodeId = 21;
     optional NKikimrDataEvents.ELockMode LockMode = 22;
     optional uint64 QuerySpanId = 23;
+
+    // Column-table compact fulltext. Unset for row-table indexes.
+    // Every prefix column must be equality-bound before a search uses this source.
+    optional TIndexTable StateTable = 24;
+    optional TIndexTable DocIdMapTable = 25;
+    optional NKikimrSchemeOp.TFulltextIndexDescription.EDocIdPolicy DocIdPolicy = 26;
+    optional uint64 BuildGeneration = 27;
+    optional uint64 AnalyzerRevision = 28;
+    optional bytes AnalyzerIdentity = 29;
+    optional NKikimrSchemeOp.TFulltextIndexDescription.TReadyVersion ReadyVersion = 30;
+    optional NKikimrSchemeOp.EIndexState IndexState = 31;
 };
 
 message TKqpSysViewSourceSettings {

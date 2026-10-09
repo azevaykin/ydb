@@ -7,6 +7,7 @@
 #include <ydb/library/json_index/json_index.h>
 #include <ydb/core/engine/mkql_keys.h>
 #include <ydb/core/formats/arrow/arrow_batch_builder.h>
+#include <ydb/core/formats/arrow/converter.h>
 #include <ydb/core/kqp/runtime/kqp_arrow_memory_pool.h>
 #include <ydb/core/kqp/common/kqp_row_builder.h>
 #include <ydb/core/tx/data_events/events.h>
@@ -25,6 +26,12 @@ namespace {
 constexpr i64 DataShardMaxOperationBytes = 8_MB;
 
 constexpr size_t InitialBatchPoolSize = 64_KB;
+
+// Online segments stay inside these bounds. A later flush uses another generation,
+// so a repeated (token, max id) cannot overwrite a segment from an earlier flush.
+constexpr i64 FulltextTokenBatchMemoryLimit = 8_MB;
+constexpr ui32 FulltextSegmentDocLimit = 10000;
+constexpr ui32 FulltextSegmentByteLimit = 256 * 1024;
 
 class TOffloadedPoolAllocator : public IAllocator {
 public:
@@ -167,9 +174,13 @@ public:
         return true;
     }
 
-    explicit TColumnBatch(const TRecordBatchPtr& data, std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc = nullptr)
+    explicit TColumnBatch(
+            const TRecordBatchPtr& data,
+            std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc = nullptr,
+            std::vector<std::pair<TString, NScheme::TTypeInfo>> schema = {})
         : Alloc(alloc)
         , Data(data)
+        , Schema(std::move(schema))
         , SerializedMemory(NArrow::GetBatchDataSize(Data))
         , Memory(NArrow::GetBatchMemorySize(Data)) {
     }
@@ -183,9 +194,37 @@ public:
         return Data;
     }
 
+    // Typed cells for index maintenance. The Arrow batch itself stays in place
+    // for the ColumnShard write. Cell storage is owned here and outlives GetRows().
+    const TOwnedCellVecBatch& EnsureRowView() const {
+        if (!RowViewReady) {
+            TNullableAllocGuard guard(Alloc.get());
+            AFL_ENSURE(!Extracted);
+            AFL_ENSURE(!Schema.empty() || !Data || Data->num_rows() == 0);
+            if (Data && Data->num_rows() > 0) {
+                struct TCopyRows : NArrow::IRowWriter {
+                    TOwnedCellVecBatch& Rows;
+                    void AddRow(const TConstArrayRef<TCell>& cells) override {
+                        Rows.Append(cells);
+                    }
+                } writer{RowView};
+                NArrow::TArrowToYdbConverter converter(Schema, writer, false, false);
+                TString error;
+                if (!converter.Process(*Data, error)) {
+                    ythrow yexception() << "Cannot build a row view of a column batch: " << error;
+                }
+            }
+            RowViewReady = true;
+        }
+        return RowView;
+    }
+
 private:
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc = nullptr;
     TRecordBatchPtr Data;
+    std::vector<std::pair<TString, NScheme::TTypeInfo>> Schema;
+    mutable TOwnedCellVecBatch RowView;
+    mutable bool RowViewReady = false;
     i64 SerializedMemory = 0;
     i64 Memory = 0;
 
@@ -386,13 +425,14 @@ public:
             : Columns(BuildColumns(inputColumns))
             , WriteIndex(std::move(writeIndex))
             , ReadIndex(std::move(readIndex))
+            , Schema(BuildBatchBuilderColumns(WriteIndex, inputColumns))
             , BatchBuilder(std::make_unique<NArrow::TArrowBatchBuilder>(
                 arrow::Compression::UNCOMPRESSED,
                 BuildNotNullColumns(inputColumns),
                 alloc ? NKikimr::NMiniKQL::GetArrowMemoryPool() : arrow::default_memory_pool()))
             , Alloc(std::move(alloc)) {
         TString err;
-        if (!BatchBuilder->Start(BuildBatchBuilderColumns(WriteIndex, inputColumns), 0, 0, err)) {
+        if (!BatchBuilder->Start(Schema, 0, 0, err)) {
             yexception() << "Failed to start batch builder: " + err;
         }
     }
@@ -425,13 +465,14 @@ public:
     IDataBatchPtr Build() override {
         TNullableAllocGuard guard(Alloc.get());
         auto batch = BatchBuilder->FlushBatch(true);
-        return MakeIntrusive<TColumnBatch>(std::move(batch), Alloc);
+        return MakeIntrusive<TColumnBatch>(std::move(batch), Alloc, Schema);
     }
 
 private:
     const TVector<TSysTables::TTableColumnInfo> Columns;
     const std::vector<ui32> WriteIndex;
     const std::vector<ui32> ReadIndex;
+    const std::vector<std::pair<TString, NScheme::TTypeInfo>> Schema;
     std::unique_ptr<NArrow::TArrowBatchBuilder> BatchBuilder;
 
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc;
@@ -1186,16 +1227,25 @@ public:
                     YQL_ENSURE(false, "Invalid FulltextAnalyzeActor input column type: " << TextTypeId);
             }
         }
-        auto& prefix = PrefixBuffers[TSerializedCellVec::Serialize(prefixCells)];
-        ui32 docLength = 0;
-        for (auto& token: tokens) {
-            prefix.Tokens[token][docId]++;
-            docLength++;
+        THashMap<TString, ui32> freq;
+        for (const auto& token : tokens) {
+            auto& count = freq[token];
+            YQL_ENSURE(count < std::numeric_limits<ui32>::max());
+            ++count;
         }
-        prefix.DocCount++;
-        prefix.TotalDocLength += docLength;
+        TVector<TFulltextAnalyzedToken> analyzed;
+        analyzed.reserve(freq.size());
+        for (const auto& [token, count] : freq) {
+            analyzed.push_back(TFulltextAnalyzedToken{token, count});
+        }
+        RememberTokens(prefixCells, docId, analyzed);
         if (WithFreq) {
-            // indexImplDocsTable columns: document ID, __ydb_length, data columns
+            ui32 docLength = 0;
+            for (const auto& token : analyzed) {
+                docLength += token.Freq;
+            }
+            // indexImplDocsTable columns: document ID, __ydb_length, data columns.
+            // The historical row-table writer stores the document id with ui64 width.
             TVector<TCell> docsCells(Added ? 2 + DataColumnCount : 1);
             docsCells[0] = TCell::Make(docId);
             if (Added) {
@@ -1206,6 +1256,49 @@ public:
             }
             DocsBatcher.AddRow(docsCells);
         }
+    }
+
+    void AddAnalyzedDocument(
+            TConstArrayRef<TCell> prefix,
+            ui64 docId,
+            TConstArrayRef<TFulltextAnalyzedToken> tokens,
+            TConstArrayRef<TCell> dataColumns) override {
+        i64 extra = 0;
+        for (const auto& token : tokens) {
+            extra += static_cast<i64>(token.Token.size()) + 24;
+        }
+        if (TokenBytes + extra > FulltextTokenBatchMemoryLimit) {
+            TokenBytesExceeded = true;
+            return;
+        }
+        TVector<TCell> prefixCells(prefix.begin(), prefix.end());
+        RememberTokens(prefixCells, docId, tokens);
+        if (!WithFreq) {
+            return;
+        }
+        ui32 docLength = 0;
+        for (const auto& token : tokens) {
+            docLength += token.Freq;
+        }
+        const TDocId typedId = static_cast<TDocId>(docId);
+        TVector<TCell> docsCells(Added ? 2 + DataColumnCount : 1);
+        docsCells[0] = TCell::Make(typedId);
+        if (Added) {
+            AFL_ENSURE(dataColumns.size() == DataColumnCount);
+            docsCells[1] = TCell::Make(docLength);
+            for (ui32 i = 0; i < DataColumnCount; i++) {
+                docsCells[2 + i] = dataColumns[i];
+            }
+        }
+        DocsBatcher.AddRow(docsCells);
+    }
+
+    i64 TokenMemory() const override {
+        return TokenBytes;
+    }
+
+    bool TokenMemoryExceeded() const override {
+        return TokenBytesExceeded;
     }
 
     IDataBatchPtr Flush() override {
@@ -1245,21 +1338,40 @@ public:
             std::sort(docIds.begin(), docIds.end(), [](ui64 a, ui64 b) {
                 return (TDocId)a < TDocId(b);
             });
-            wr.Reset(WithFreq, std::is_signed<TDocId>::value);
-            if (WithFreq) {
-                for (const auto& docId: docIds) {
-                    wr.Add(docId, docFreqs.at(docId));
+            // Split one token into several segments. Each piece has its own max id, so the
+            // posting key does not collide with another piece of this flush.
+            AFL_ENSURE(Gen != std::numeric_limits<NTableIndex::NFulltext::TGen>::max());
+            size_t begin = 0;
+            TDocId previousMaxId = 0;
+            bool hasPreviousMaxId = false;
+            while (begin < docIds.size()) {
+                wr.Reset(WithFreq, std::is_signed<TDocId>::value);
+                size_t end = begin;
+                while (end < docIds.size()) {
+                    if (wr.GetCount() > 0 && (wr.GetCount() >= FulltextSegmentDocLimit
+                            || wr.GetBuf().size() >= FulltextSegmentByteLimit)) {
+                        break;
+                    }
+                    const ui64 docId = docIds[end];
+                    wr.Add(docId, WithFreq ? docFreqs.at(docId) : 1);
+                    ++end;
                 }
-            } else {
-                for (const auto& docId: docIds) {
-                    wr.Add(docId, 1);
+                AFL_ENSURE(end > begin);
+                const TDocId maxId = static_cast<TDocId>(wr.GetMaxId());
+                if (hasPreviousMaxId) {
+                    AFL_ENSURE(maxId != previousMaxId);
                 }
+                previousMaxId = maxId;
+                hasPreviousMaxId = true;
+                cells[PrefixSize + 0] = TCell(token);
+                cells[PrefixSize + 1] = TCell::Make(Gen);
+                cells[PrefixSize + 2] = TCell::Make(maxId);
+                const auto buf = wr.GetBuf();
+                cells[PrefixSize + 4] = TCell(TConstArrayRef<const char>(reinterpret_cast<const char*>(buf.data()), buf.size()));
+                RowBatcher.AddRow(cells);
+                EmittedSegment = true;
+                begin = end;
             }
-            cells[PrefixSize + 0] = TCell(token);
-            cells[PrefixSize + 1] = TCell::Make(Gen);
-            cells[PrefixSize + 2] = TCell::Make((TDocId)wr.GetMaxId());
-            cells[PrefixSize + 4] = TCell(TConstArrayRef<const char>((const char*)wr.GetBuf().data(), wr.GetBuf().size()));
-            RowBatcher.AddRow(cells);
             if (WithFreq) {
                 dictCells[0] = TCell(token);
                 dictCells[1] = TCell::Make(Added ? totalFreq : -totalFreq);
@@ -1302,11 +1414,35 @@ public:
     }
 
     void SetGen(NTableIndex::NFulltext::TGen gen) override {
+        AFL_ENSURE(gen != std::numeric_limits<NTableIndex::NFulltext::TGen>::max());
+        if (EmittedSegment) {
+            AFL_ENSURE(gen != Gen);
+        }
         Gen = gen;
     }
 
 private:
+    void RememberTokens(
+            const TVector<TCell>& prefixCells,
+            ui64 docId,
+            TConstArrayRef<TFulltextAnalyzedToken> tokens) {
+        auto& prefix = PrefixBuffers[TSerializedCellVec::Serialize(prefixCells)];
+        TokenBytes += 32;
+        ui32 docLength = 0;
+        for (const auto& token : tokens) {
+            YQL_ENSURE(token.Freq > 0);
+            prefix.Tokens[TString(token.Token)][docId] += token.Freq;
+            docLength += token.Freq;
+            TokenBytes += static_cast<i64>(token.Token.size()) + 24;
+        }
+        prefix.DocCount++;
+        prefix.TotalDocLength += docLength;
+    }
+
     NTableIndex::NFulltext::TGen Gen = 0;
+    bool EmittedSegment = false;
+    i64 TokenBytes = 0;
+    bool TokenBytesExceeded = false;
     ui32 DataColumnCount = 0;
     ui32 PrefixSize = 0;
     NScheme::TTypeId TextTypeId = 0;
@@ -1431,11 +1567,53 @@ IDataBatchProjectionPtr CreateFulltextTokenizeProjection(
     AFL_ENSURE(false)("Unsupported primary key type", columnTypes[prefixSize + 1].GetTypeId());
 }
 
+bool IsColumnBatch(const IDataBatchPtr& batch) {
+    return dynamic_cast<TColumnBatch*>(batch.Get()) != nullptr;
+}
+
 std::vector<TConstArrayRef<TCell>> GetRows(const NKikimr::NKqp::IDataBatchPtr& batch, const size_t offset) {
-    auto* data = dynamic_cast<TRowBatch*>(batch.Get());
-    AFL_ENSURE(data);
-    const auto& batchRows = data->GetRows();
+    if (auto* data = dynamic_cast<TRowBatch*>(batch.Get())) {
+        const auto& batchRows = data->GetRows();
+        return std::vector<TConstArrayRef<TCell>>(batchRows.begin() + offset, batchRows.end());
+    }
+    auto* column = dynamic_cast<TColumnBatch*>(batch.Get());
+    AFL_ENSURE(column);
+    const auto& batchRows = column->EnsureRowView();
     return std::vector<TConstArrayRef<TCell>>(batchRows.begin() + offset, batchRows.end());
+}
+
+IDataBatchPtr CreateColumnBatchFromCells(
+        const std::vector<std::pair<TString, NScheme::TTypeInfo>>& columns,
+        const std::vector<TConstArrayRef<TCell>>& rows,
+        std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc) {
+    struct TAllocGuard {
+        NKikimr::NMiniKQL::TScopedAlloc* Alloc = nullptr;
+        explicit TAllocGuard(NKikimr::NMiniKQL::TScopedAlloc* alloc)
+            : Alloc(alloc) {
+            if (Alloc) {
+                Alloc->Acquire();
+            }
+        }
+        ~TAllocGuard() {
+            if (Alloc) {
+                Alloc->Release();
+            }
+        }
+    } guard(alloc.get());
+
+    auto* pool = alloc ? NKikimr::NMiniKQL::GetArrowMemoryPool() : arrow::default_memory_pool();
+    NArrow::TArrowBatchBuilder builder(arrow::Compression::UNCOMPRESSED, {}, pool);
+    TString error;
+    if (!builder.Start(columns, 0, 0, error)) {
+        ythrow yexception() << "Failed to start column batch builder: " << error;
+    }
+    for (const auto& row : rows) {
+        AFL_ENSURE(row.size() == columns.size());
+        builder.AddRow(row);
+    }
+    auto batch = builder.FlushBatch(true, /* flushEmpty */ true);
+    AFL_ENSURE(batch);
+    return MakeIntrusive<TColumnBatch>(std::move(batch), std::move(alloc), columns);
 }
 
 std::vector<TConstArrayRef<TCell>> CutColumns(

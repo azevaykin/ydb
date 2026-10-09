@@ -12,10 +12,11 @@ Fulltext indexes in {{ ydb-short-name }} are built by tokenizing text and creati
 * relevance ranking ([BM25](https://en.wikipedia.org/wiki/Okapi_BM25)) with [FulltextScore](../yql/reference/builtins/fulltext.md#fulltext-score) when using [fulltext_relevance](#relevance)
 * case normalization, lemmatization, and n-gram matching via index filters
 
-The current implementation supports two indexes:
+The current implementation supports these index surfaces:
 
-* [fulltext_plain](#basic) — basic fulltext index
+* [fulltext_plain](#basic) — basic fulltext index on row tables (and, behind a feature flag, as a compact global index on column tables)
 * [fulltext_relevance](#relevance) — fulltext index with [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) statistics for relevance scoring
+* [LOCAL USING fulltext](#column-local) — boolean-only portion-local postings on column tables (feature-flagged; text fallback when postings are missing)
 
 Additionally, a fulltext index can be **covering** (via `COVER`), meaning it includes a copy of extra columns from the base table.
 
@@ -217,10 +218,30 @@ Fulltext indexes are maintained automatically on data modifications. Tables with
 ALTER TABLE articles DROP INDEX ft_index;
 ```
 
+## Column-table local fulltext (`LOCAL USING fulltext`) {#column-local}
+
+Column tables can define a boolean-only local fulltext index. New DDL is gated by `EnableLocalFulltextIndex` (default off). The index stores optional portion-local postings; when a portion has no compatible postings, the scan evaluates `FulltextMatch` over text. Missing postings never become zero matches. `FulltextScore` is not supported on this surface.
+
+```yql
+ALTER TABLE logs
+  ADD INDEX message_idx LOCAL USING fulltext ON (message)
+  WITH (tokenizer = standard, use_filter_lowercase = true);
+
+SELECT timestamp
+FROM logs VIEW message_idx
+WHERE FulltextMatch(message, $q)
+  AND timestamp >= Timestamp("2026-01-01T00:00:00Z");
+```
+
+## Column-table global compact fulltext {#column-global}
+
+Column tables may also use compact `GLOBAL USING fulltext_plain` / `fulltext_relevance` behind `EnableColumnTableGlobalFulltextIndex` (default off). Index maintenance is transactional. Until the native BulkUpsert and deletion-TTL adapters are enabled, those APIs reject the table before any base mutation. Import/restore into a live indexed column table is unsupported: restore the base table first, then build the index.
+
 ## Limitations {#limitations}
 
-* Tables with a non-integer or composite primary key get an auto-managed `__ydb_row_id` column and `__ydb_unique_row_id` unique index (see [Primary key types](#primary-key)).
-* `BulkUpsert` isn't supported for tables with fulltext indexes.
+* Tables with a non-integer or composite primary key get an auto-managed `__ydb_row_id` column and `__ydb_unique_row_id` unique index (see [Primary key types](#primary-key)). On column-table global fulltext, non-integer PKs use an index-private synthetic document id and reverse map instead of adding `__ydb_row_id` to every portion.
+* `BulkUpsert` isn't supported for tables with fulltext indexes (row tables today; column-table global fulltext rejects until its BulkUpsert adapter is enabled).
+* Deletion TTL is rejected for column tables that already have a global fulltext index until the TTL adapter is enabled.
 * Fulltext index access must be specified explicitly using `VIEW IndexName`.
 * Only one text column can be indexed (per fulltext index). Use `COVER` for additional columns.
 * `FulltextMatch` / `FulltextScore` can't be used with `OR` or `NOT`. Combining them with other predicates via `AND` is supported.
@@ -228,3 +249,4 @@ ALTER TABLE articles DROP INDEX ft_index;
 * For relevance access, you must include `FulltextScore(...) > 0` in `WHERE` (otherwise the query fails).
 * [Filtered fulltext indexes](#filtered): every filter column needs an equality predicate in `WHERE`.
 * [Filtered fulltext indexes](#filtered): filter columns can include part, but not all, of the primary key.
+* Feature flags for new column-table DDL stay default off. Disabling new DDL does not stop reads or maintenance for indexes that already exist.

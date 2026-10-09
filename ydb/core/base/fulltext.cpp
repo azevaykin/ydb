@@ -1,11 +1,14 @@
 #include "fulltext.h"
 #include "fulltext_query.h"
+#include "appdata.h"
+#include "counters.h"
 #include "superlemmer.h"
 
 #include <contrib/libs/snowball/include/libstemmer.h>
 
 #include <util/charset/unidata.h>
 #include <util/charset/utf8.h>
+#include <util/digest/city.h>
 #include <util/generic/hash_set.h>
 #include <util/generic/xrange.h>
 #include <util/string/join.h>
@@ -260,7 +263,64 @@ namespace {
         return !IsAlphabetic(c) && !IsDecdigit(c);
     }
 
-    void Tokenize(const TStringBuf text, TVector<TString>& tokens, auto isDelimiter) {
+    struct TAnalyzeAccounting {
+        const TAnalyzeBudget* Budget = nullptr;
+        ui64 Generated = 0;
+        ui64 Retained = 0;
+        EAnalyzeBudgetStatus Status = EAnalyzeBudgetStatus::Ok;
+
+        bool AcceptNew(ui64 bytes) {
+            if (Status != EAnalyzeBudgetStatus::Ok) {
+                return false;
+            }
+            if (Budget && Generated >= Budget->MaxGeneratedTokens) {
+                Status = EAnalyzeBudgetStatus::GeneratedTokensExceeded;
+                return false;
+            }
+            if (Budget && (bytes > Budget->MaxRetainedBytes || Retained > Budget->MaxRetainedBytes - bytes)) {
+                Status = EAnalyzeBudgetStatus::RetainedBytesExceeded;
+                return false;
+            }
+            ++Generated;
+            Retained += bytes;
+            return true;
+        }
+
+        bool AcceptResize(ui64 oldBytes, ui64 newBytes) {
+            if (Status != EAnalyzeBudgetStatus::Ok) {
+                return false;
+            }
+            if (oldBytes > Retained) {
+                oldBytes = Retained;
+            }
+            const ui64 base = Retained - oldBytes;
+            if (Budget && newBytes > Budget->MaxRetainedBytes - base) {
+                Status = EAnalyzeBudgetStatus::RetainedBytesExceeded;
+                return false;
+            }
+            Retained = base + newBytes;
+            return true;
+        }
+
+        void Release(ui64 bytes) {
+            if (bytes > Retained) {
+                Retained = 0;
+            } else {
+                Retained -= bytes;
+            }
+        }
+    };
+
+    bool PushToken(TVector<TString>& tokens, const char* data, size_t size, TAnalyzeAccounting& accounting) {
+        if (!accounting.AcceptNew(size)) {
+            tokens.clear();
+            return false;
+        }
+        tokens.emplace_back(data, size);
+        return true;
+    }
+
+    void Tokenize(const TStringBuf text, TVector<TString>& tokens, auto isDelimiter, TAnalyzeAccounting& accounting) {
         const unsigned char* ptr = (const unsigned char*)text.data();
         const unsigned char* end = ptr + text.size();
 
@@ -293,7 +353,9 @@ namespace {
                 }
                 ptr += symbolBytes;
             }
-            tokens.emplace_back((const char*)tokenPtr, ptr - tokenPtr);
+            if (!PushToken(tokens, (const char*)tokenPtr, static_cast<size_t>(ptr - tokenPtr), accounting)) {
+                return;
+            }
         }
     }
 
@@ -408,7 +470,7 @@ namespace {
     //   KATAKANA (sequences), HANGUL (sequences), IDEOGRAPHIC (single),
     //   HIRAGANA (single), SOUTHEAST_ASIAN (sequences).
     // Emoji sequences are not tokenized (skipped).
-    void TokenizeStandard(const TStringBuf text, TVector<TString>& tokens, const std::unordered_set<wchar32>& ignoredDelimiter) {
+    void TokenizeStandard(const TStringBuf text, TVector<TString>& tokens, const std::unordered_set<wchar32>& ignoredDelimiter, TAnalyzeAccounting& accounting) {
         const ui8* p = (const ui8*)text.data();
         const ui8* end = p + text.size();
 
@@ -417,6 +479,10 @@ namespace {
                 return false;
             }
             return SafeReadUTF8Char(c, n, at, end) == RECODE_OK;
+        };
+
+        auto push = [&](const ui8* begin, const ui8* tokenEnd) -> bool {
+            return PushToken(tokens, reinterpret_cast<const char*>(begin), static_cast<size_t>(tokenEnd - begin), accounting);
         };
 
         auto isLetter = [&](wchar32 c) {
@@ -433,7 +499,7 @@ namespace {
                 while (tryRead(p, c, n) && IsExtendOrFormat(c)) {
                     p += n;
                 }
-                tokens.emplace_back((const char*)s, p - s);
+                push(s, p);
                 return true;
             }
             return false;
@@ -446,10 +512,14 @@ namespace {
                 while (tryRead(p, c, n) && (check(c) || IsExtendOrFormat(c))) {
                     p += n;
                 }
-                tokens.emplace_back((const char*)s, p - s);
+                push(s, p);
                 return true;
             }
             return false;
+        };
+
+        auto budgetStopped = [&]() {
+            return accounting.Status != EAnalyzeBudgetStatus::Ok;
         };
 
         while (p < end) {
@@ -555,8 +625,8 @@ namespace {
                     joined = false;
                 }
 
-                if (hasContent) {
-                    tokens.emplace_back((const char*)s, safeEnd - s);
+                if (hasContent && !push(s, safeEnd)) {
+                    return;
                 }
                 p = safeEnd;
                 continue;
@@ -564,9 +634,15 @@ namespace {
 
             // Single-character token types
             if (trySingleChar(IsIdeographic)) {
+                if (budgetStopped()) {
+                    return;
+                }
                 continue;
             }
             if (trySingleChar(IsHiragana)) {
+                if (budgetStopped()) {
+                    return;
+                }
                 continue;
             }
 
@@ -577,13 +653,21 @@ namespace {
                 while (tryRead(p, c, n) && (IsKatakanaOrSymbol(c) || IsExtendOrFormat(c) || IsExtendNumLet(c))) {
                     p += n;
                 }
-                tokens.emplace_back((const char*)s, p - s);
+                if (!push(s, p)) {
+                    return;
+                }
                 continue;
             }
             if (tryMultiChar(IsHangulScript)) {
+                if (budgetStopped()) {
+                    return;
+                }
                 continue;
             }
             if (tryMultiChar(IsSouthEastAsian)) {
+                if (budgetStopped()) {
+                    return;
+                }
                 continue;
             }
 
@@ -592,35 +676,37 @@ namespace {
         }
     }
 
-    TVector<TString> Tokenize(const TStringBuf text, const Ydb::Table::FulltextIndexSettings::Tokenizer& tokenizer, const std::unordered_set<wchar32> ignoredDelimiter) {
-        TVector<TString> tokens;
+    bool Tokenize(const TStringBuf text, const Ydb::Table::FulltextIndexSettings::Tokenizer& tokenizer, const std::unordered_set<wchar32> ignoredDelimiter,
+        TVector<TString>& tokens, TAnalyzeAccounting& accounting) {
         switch (tokenizer) {
             case Ydb::Table::FulltextIndexSettings::WHITESPACE:
                 Tokenize(text, tokens, [&ignoredDelimiter](const wchar32 c) {
                     return !ignoredDelimiter.empty() && ignoredDelimiter.contains(c)
                         ? false
                         : IsWhitespace(c);
-                });
+                }, accounting);
                 break;
             case Ydb::Table::FulltextIndexSettings::ALPHANUMERIC:
                 Tokenize(text, tokens, [&ignoredDelimiter](const wchar32 c) {
                     return !ignoredDelimiter.empty() && ignoredDelimiter.contains(c)
                         ? false
                         : IsNonStandard(c);
-                });
+                }, accounting);
                 break;
             case Ydb::Table::FulltextIndexSettings::STANDARD:
-                TokenizeStandard(text, tokens, ignoredDelimiter);
+                TokenizeStandard(text, tokens, ignoredDelimiter, accounting);
                 break;
             case Ydb::Table::FulltextIndexSettings::KEYWORD:
                 if (UTF8Detect(text) != NotUTF8) {
-                    tokens.push_back(TString(text));
+                    if (!PushToken(tokens, text.data(), text.size(), accounting)) {
+                        return false;
+                    }
                 }
                 break;
             default:
                 Y_ENSURE(false, TStringBuilder() << "Invalid tokenizer: " << static_cast<int>(tokenizer));
         }
-        return tokens;
+        return accounting.Status == EAnalyzeBudgetStatus::Ok;
     }
 
     size_t GetLengthUTF8(const TString& token) {
@@ -783,7 +869,10 @@ namespace {
     }
 }
 
-void BuildNgrams(const TString& token, size_t lengthMin, size_t lengthMax, bool edge, TVector<TString>& ngrams) {
+namespace {
+
+template <typename TAccept>
+bool CollectNgrams(const TString& token, size_t lengthMin, size_t lengthMax, bool edge, TAccept accept) {
     const unsigned char* ngram_begin_ptr = (const unsigned char*)token.data();
     const unsigned char* end = ngram_begin_ptr + token.size();
     wchar32 symbol;
@@ -795,12 +884,14 @@ void BuildNgrams(const TString& token, size_t lengthMin, size_t lengthMax, bool 
         while (ngram_end_ptr < end) {
             if (SafeReadUTF8Char(symbol, symbolBytes, ngram_end_ptr, end) != RECODE_OK) {
                 Y_ASSERT(false); // should already be validated during tokenization
-                return;
+                return true;
             }
             ngram_length++;
             ngram_end_ptr += symbolBytes;
             if (lengthMin <= ngram_length && ngram_length <= lengthMax) {
-                ngrams.emplace_back((const char*)ngram_begin_ptr, ngram_end_ptr - ngram_begin_ptr);
+                if (!accept(reinterpret_cast<const char*>(ngram_begin_ptr), static_cast<size_t>(ngram_end_ptr - ngram_begin_ptr))) {
+                    return false;
+                }
             }
         }
         if (edge) {
@@ -808,10 +899,20 @@ void BuildNgrams(const TString& token, size_t lengthMin, size_t lengthMax, bool 
         }
         if (SafeReadUTF8Char(symbol, symbolBytes, ngram_begin_ptr, end) != RECODE_OK) {
             Y_ASSERT(false); // should already be validated during tokenization
-            return;
+            return true;
         }
         ngram_begin_ptr += symbolBytes;
     }
+    return true;
+}
+
+}
+
+void BuildNgrams(const TString& token, size_t lengthMin, size_t lengthMax, bool edge, TVector<TString>& ngrams) {
+    CollectNgrams(token, lengthMin, lengthMax, edge, [&](const char* data, size_t size) {
+        ngrams.emplace_back(data, size);
+        return true;
+    });
 }
 
 Ydb::Table::FulltextIndexSettings::Analyzers GetAnalyzersForQuery(Ydb::Table::FulltextIndexSettings::Analyzers analyzers) {
@@ -824,13 +925,37 @@ Ydb::Table::FulltextIndexSettings::Analyzers GetAnalyzersForQuery(Ydb::Table::Fu
     return analyzers;
 }
 
-TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexSettings::Analyzers& settings, const std::unordered_set<wchar32>& ignoredDelimiters) {
-    TVector<TString> tokens = Tokenize(text, settings.tokenizer(), ignoredDelimiters);
+TBoundedAnalyzeResult AnalyzeBounded(const TStringBuf text, const Ydb::Table::FulltextIndexSettings::Analyzers& settings, const TAnalyzeBudget& budget,
+    const std::unordered_set<wchar32>& ignoredDelimiters) {
+    TBoundedAnalyzeResult result;
+    if (text.size() > budget.MaxInputBytes) {
+        result.Status = EAnalyzeBudgetStatus::InputExceeded;
+        return result;
+    }
+
+    TAnalyzeAccounting accounting;
+    accounting.Budget = &budget;
+    TVector<TString> tokens;
+    if (!Tokenize(text, settings.tokenizer(), ignoredDelimiters, tokens, accounting)) {
+        result.Status = accounting.Status;
+        return result;
+    }
+
+    auto stop = [&]() {
+        result.Status = accounting.Status;
+        result.Tokens.clear();
+        return result;
+    };
+
     const auto languages = ParseLanguages(settings.language());
 
     if (settings.use_filter_lowercase()) {
-        for (auto i : xrange(tokens.size())) {
-            tokens[i] = ToLowerUTF8(tokens[i]);
+        for (auto& token : tokens) {
+            TString lower = ToLowerUTF8(token);
+            if (!accounting.AcceptResize(token.size(), lower.size())) {
+                return stop();
+            }
+            token = std::move(lower);
         }
     }
 
@@ -845,6 +970,7 @@ TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexS
                 const THashSet<TStringBuf>* stopwords = GetStopwords(language);
                 Y_ENSURE(stopwords);
                 if (stopwords->contains(lowerToken)) {
+                    accounting.Release(token.size());
                     return true;
                 }
             }
@@ -853,15 +979,14 @@ TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexS
     }
 
     if (settings.use_filter_length() && (settings.has_filter_length_min() || settings.has_filter_length_max())) {
-        tokens.erase(std::remove_if(tokens.begin(), tokens.end(), [&](const TString& token){
+        tokens.erase(std::remove_if(tokens.begin(), tokens.end(), [&](const TString& token) {
             auto length = GetLengthUTF8(token);
-            if (settings.has_filter_length_min() && length < static_cast<size_t>(settings.filter_length_min())) {
-                return true;
+            const bool drop = (settings.has_filter_length_min() && length < static_cast<size_t>(settings.filter_length_min()))
+                || (settings.has_filter_length_max() && length > static_cast<size_t>(settings.filter_length_max()));
+            if (drop) {
+                accounting.Release(token.size());
             }
-            if (settings.has_filter_length_max() && length > static_cast<size_t>(settings.filter_length_max())) {
-                return true;
-            }
-            return false;
+            return drop;
         }), tokens.end());
     }
 
@@ -870,7 +995,11 @@ TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexS
         if (languages.size() == 1) {
             auto& stemmer = GetSnowballStemmer(languages.front());
             for (auto& token : tokens) {
+                const ui64 oldBytes = token.size();
                 ApplySnowball(*stemmer.Stemmer, token);
+                if (!accounting.AcceptResize(oldBytes, token.size())) {
+                    return stop();
+                }
             }
         } else {
             TVector<TSnowballStemmer*> selectedStemmers;
@@ -888,7 +1017,11 @@ TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexS
                     return item->Scripts & ScriptBit(*script);
                 });
                 if (stemmer != selectedStemmers.end()) {
+                    const ui64 oldBytes = token.size();
                     ApplySnowball(*(*stemmer)->Stemmer, token);
+                    if (!accounting.AcceptResize(oldBytes, token.size())) {
+                        return stop();
+                    }
                 }
             }
         }
@@ -896,19 +1029,44 @@ TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexS
 
     if (settings.use_filter_superlemmer()) {
         for (auto& token : tokens) {
+            const ui64 oldBytes = token.size();
             ApplySuperLemmerInplace(settings.language(), token);
+            if (!accounting.AcceptResize(oldBytes, token.size())) {
+                return stop();
+            }
         }
     }
 
     if (settings.use_filter_ngram() || settings.use_filter_edge_ngram()) {
         TVector<TString> ngrams;
+        const bool edge = settings.use_filter_edge_ngram();
         for (const auto& token : tokens) {
-            BuildNgrams(token, settings.filter_ngram_min_length(), settings.filter_ngram_max_length(), settings.use_filter_edge_ngram(), ngrams);
+            const bool accepted = CollectNgrams(token, settings.filter_ngram_min_length(), settings.filter_ngram_max_length(), edge,
+                [&](const char* data, size_t size) {
+                    if (!accounting.AcceptNew(size)) {
+                        return false;
+                    }
+                    ngrams.emplace_back(data, size);
+                    return true;
+                });
+            if (!accepted) {
+                return stop();
+            }
+        }
+        for (const auto& token : tokens) {
+            accounting.Release(token.size());
         }
         tokens.swap(ngrams);
     }
 
-    return tokens;
+    result.Tokens = std::move(tokens);
+    return result;
+}
+
+TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexSettings::Analyzers& settings, const std::unordered_set<wchar32>& ignoredDelimiters) {
+    const TBoundedAnalyzeResult result = AnalyzeBounded(text, settings, TAnalyzeBudget{}, ignoredDelimiters);
+    Y_ENSURE(result.Ok(), "unlimited fulltext analysis exceeded a budget");
+    return result.Tokens;
 }
 
 TVector<TString> BuildSearchTerms(const TString& query, const Ydb::Table::FulltextIndexSettings::Analyzers& settings) {
@@ -1049,6 +1207,202 @@ bool ValidateSettings(const Ydb::Table::FulltextIndexSettings& settings, TString
 
     error = "";
     return true;
+}
+
+Ydb::Table::FulltextIndexSettings::Analyzers NormalizeAnalyzers(const Ydb::Table::FulltextIndexSettings::Analyzers& settings) {
+    Ydb::Table::FulltextIndexSettings::Analyzers out;
+    if (settings.has_tokenizer()) {
+        out.set_tokenizer(settings.tokenizer());
+    }
+    if (settings.has_language() && !settings.language().empty()) {
+        out.set_language(settings.language());
+    }
+    out.set_use_filter_lowercase(settings.use_filter_lowercase());
+    out.set_use_filter_stopwords(settings.use_filter_stopwords());
+    out.set_use_filter_ngram(settings.use_filter_ngram());
+    out.set_use_filter_edge_ngram(settings.use_filter_edge_ngram());
+    if (out.use_filter_ngram() || out.use_filter_edge_ngram()) {
+        if (settings.has_filter_ngram_min_length()) {
+            out.set_filter_ngram_min_length(settings.filter_ngram_min_length());
+        }
+        if (settings.has_filter_ngram_max_length()) {
+            out.set_filter_ngram_max_length(settings.filter_ngram_max_length());
+        }
+    }
+    out.set_use_filter_length(settings.use_filter_length());
+    if (out.use_filter_length()) {
+        if (settings.has_filter_length_min()) {
+            out.set_filter_length_min(settings.filter_length_min());
+        }
+        if (settings.has_filter_length_max()) {
+            out.set_filter_length_max(settings.filter_length_max());
+        }
+    }
+    out.set_use_filter_snowball(settings.use_filter_snowball());
+    out.set_use_filter_superlemmer(settings.use_filter_superlemmer());
+    return out;
+}
+
+void NormalizeFulltextSettings(Ydb::Table::FulltextIndexSettings& settings) {
+    for (auto& column : *settings.mutable_columns()) {
+        if (column.has_analyzers()) {
+            *column.mutable_analyzers() = NormalizeAnalyzers(column.analyzers());
+        }
+    }
+}
+
+TString FulltextAnalyzerIdentity(const Ydb::Table::FulltextIndexSettings::Analyzers& normalizedAnalyzers) {
+    return normalizedAnalyzers.SerializeAsString();
+}
+
+ui64 FulltextAnalyzerRevision(const Ydb::Table::FulltextIndexSettings::Analyzers& normalizedAnalyzers) {
+    const TString bytes = FulltextAnalyzerIdentity(normalizedAnalyzers);
+    return CityHash64(bytes.data(), bytes.size());
+}
+
+namespace {
+
+constexpr char DocumentStateMagic[4] = {'F', 'T', 'S', '1'};
+constexpr ui32 DocumentStateVersion = 1;
+constexpr ui32 MaxDocumentStateTokens = 1u << 20;
+constexpr ui32 MaxDocumentStateTokenBytes = 1u << 16;
+constexpr ui32 MaxDocumentStateBytes = 16u << 20;
+
+void AppendU32(TString& out, ui32 value) {
+    char buf[4];
+    buf[0] = static_cast<char>(value & 0xffu);
+    buf[1] = static_cast<char>((value >> 8) & 0xffu);
+    buf[2] = static_cast<char>((value >> 16) & 0xffu);
+    buf[3] = static_cast<char>((value >> 24) & 0xffu);
+    out.append(buf, 4);
+}
+
+bool ReadU32(TStringBuf& in, ui32& value, TString& error) {
+    if (in.size() < 4) {
+        error = "truncated fulltext document state";
+        return false;
+    }
+    const auto* bytes = reinterpret_cast<const unsigned char*>(in.data());
+    value = ui32(bytes[0]) | (ui32(bytes[1]) << 8) | (ui32(bytes[2]) << 16) | (ui32(bytes[3]) << 24);
+    in.Skip(4);
+    return true;
+}
+
+}
+
+bool EncodeDocumentState(TConstArrayRef<TDocumentStateToken> tokens, bool withFreq, TString& out, TString& error) {
+    if (tokens.size() > MaxDocumentStateTokens) {
+        error = "fulltext document state has too many tokens";
+        return false;
+    }
+    out.clear();
+    out.reserve(16 + tokens.size() * 8);
+    out.append(DocumentStateMagic, 4);
+    AppendU32(out, DocumentStateVersion);
+    AppendU32(out, static_cast<ui32>(tokens.size()));
+    TStringBuf previous;
+    bool hasPrevious = false;
+    for (const auto& token : tokens) {
+        if (token.Token.size() > MaxDocumentStateTokenBytes) {
+            error = "fulltext document state token is too long";
+            return false;
+        }
+        if (hasPrevious && !(previous < token.Token)) {
+            error = "fulltext document state tokens must be strictly increasing";
+            return false;
+        }
+        if (withFreq && token.Freq == 0) {
+            error = "fulltext document state frequency must be positive";
+            return false;
+        }
+        AppendU32(out, static_cast<ui32>(token.Token.size()));
+        out.append(token.Token);
+        if (withFreq) {
+            AppendU32(out, token.Freq);
+        }
+        if (out.size() > MaxDocumentStateBytes) {
+            error = "fulltext document state is too large";
+            return false;
+        }
+        previous = token.Token;
+        hasPrevious = true;
+    }
+    return true;
+}
+
+bool DecodeDocumentState(TStringBuf bytes, bool withFreq, TVector<TDocumentStateToken>& tokens, TString& error) {
+    tokens.clear();
+    if (bytes.size() < 12 || bytes.Head(4) != TStringBuf(DocumentStateMagic, 4)) {
+        error = "fulltext document state has a bad header";
+        return false;
+    }
+    bytes.Skip(4);
+    ui32 version = 0;
+    ui32 count = 0;
+    if (!ReadU32(bytes, version, error) || !ReadU32(bytes, count, error)) {
+        return false;
+    }
+    if (version != DocumentStateVersion) {
+        error = "unsupported fulltext document state format";
+        return false;
+    }
+    if (count > MaxDocumentStateTokens) {
+        error = "fulltext document state has too many tokens";
+        return false;
+    }
+    tokens.reserve(count);
+    for (ui32 i = 0; i < count; ++i) {
+        ui32 tokenLen = 0;
+        if (!ReadU32(bytes, tokenLen, error)) {
+            return false;
+        }
+        if (tokenLen > MaxDocumentStateTokenBytes || bytes.size() < tokenLen) {
+            error = "fulltext document state token is truncated or too long";
+            return false;
+        }
+        TDocumentStateToken token;
+        token.Token = TString(bytes.Head(tokenLen));
+        bytes.Skip(tokenLen);
+        if (i > 0 && !(tokens.back().Token < token.Token)) {
+            error = "fulltext document state tokens are not strictly increasing";
+            return false;
+        }
+        if (withFreq) {
+            if (!ReadU32(bytes, token.Freq, error)) {
+                return false;
+            }
+            if (token.Freq == 0) {
+                error = "fulltext document state frequency must be positive";
+                return false;
+            }
+        }
+        tokens.push_back(std::move(token));
+    }
+    if (!bytes.empty()) {
+        error = "fulltext document state has trailing bytes";
+        return false;
+    }
+    return true;
+}
+
+void AccountFulltextCompaction(ui64 inputBytes, ui64 outputBytes) {
+    if (inputBytes == 0 && outputBytes == 0) {
+        return;
+    }
+    auto* appData = AppData();
+    if (!appData || !appData->Counters) {
+        return;
+    }
+    auto group = GetServiceCounters(appData->Counters, "kqp");
+    if (!group) {
+        return;
+    }
+    if (inputBytes != 0) {
+        group->GetCounter("ColumnFulltext/CompactionInputBytes", true)->Add(inputBytes);
+    }
+    if (outputBytes != 0) {
+        group->GetCounter("ColumnFulltext/CompactionOutputBytes", true)->Add(outputBytes);
+    }
 }
 
 bool HasSuperLemmer(const Ydb::Table::FulltextIndexSettings& settings) {

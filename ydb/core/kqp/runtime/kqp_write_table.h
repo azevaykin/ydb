@@ -68,6 +68,13 @@ IDataBatcherPtr CreateColumnDataBatcher(
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc = nullptr,
     std::vector<ui32> readIndex = {});
 
+// Owned cell rows in `columns` order. Used when an OLAP base batch must be
+// rebuilt after a row-oriented lookup/filter without dropping the Arrow write.
+IDataBatchPtr CreateColumnBatchFromCells(
+    const std::vector<std::pair<TString, NScheme::TTypeInfo>>& columns,
+    const std::vector<TConstArrayRef<TCell>>& rows,
+    std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc);
+
 IDataBatcherPtr CreateStructOfRowsDataBatcher(
     const TConstArrayRef<NKikimrKqp::TKqpColumnMetadataProto> columns,
     const TConstArrayRef<NKikimrKqp::TKqpColumnMetadataProto> lookupColumns,
@@ -80,12 +87,31 @@ public:
     virtual IDataBatchPtr Flush() = 0;
 };
 
+// One analyzed token. Freq is the number of occurrences in the document.
+// Plain postings store membership; relevance stores Freq.
+struct TFulltextAnalyzedToken {
+    TStringBuf Token;
+    ui32 Freq = 1;
+};
+
 class IFulltextTokenizeProjection : public IDataBatchProjection {
 public:
     virtual IDataBatchPtr FlushDocs() = 0;
     virtual IDataBatchPtr FlushDict() = 0;
     virtual IDataBatchPtr FlushStats() = 0;
     virtual void SetGen(NTableIndex::NFulltext::TGen gen) = 0;
+
+    // Already-analyzed document. Prefix cells are the index prefix in key order.
+    // dataColumns are the relevance covered columns, used only when this projection records additions.
+    // Document ids inside a flushed segment are sorted by the codec's signedness, not by call order.
+    virtual void AddAnalyzedDocument(
+        TConstArrayRef<TCell> prefix,
+        ui64 docId,
+        TConstArrayRef<TFulltextAnalyzedToken> tokens,
+        TConstArrayRef<TCell> dataColumns) = 0;
+
+    virtual i64 TokenMemory() const = 0;
+    virtual bool TokenMemoryExceeded() const = 0;
 };
 
 using IDataBatchProjectionPtr = TIntrusivePtr<IDataBatchProjection>;
@@ -118,6 +144,8 @@ bool IsEqual(
 std::vector<TConstArrayRef<TCell>> GetRows(
     const NKikimr::NKqp::IDataBatchPtr& batch,
     const size_t offset = 0);
+
+bool IsColumnBatch(const IDataBatchPtr& batch);
 
 std::vector<TConstArrayRef<TCell>> CutColumns(
     const std::vector<TConstArrayRef<TCell>>& rows, const ui32 columnsCount);

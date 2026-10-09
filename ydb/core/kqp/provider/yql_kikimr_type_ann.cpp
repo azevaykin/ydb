@@ -1703,6 +1703,13 @@ private:
                 }
 
                 indexType = TIndexDescription::EType::LocalMinMax;
+            } else if (type == "localFulltext") {
+                if (!SessionCtx->Config().FeatureFlags.GetEnableLocalFulltextIndex()) {
+                    ctx.AddError(TIssue(ctx.GetPosition(index.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexDisabled)));
+                    return TStatus::Error;
+                }
+
+                indexType = TIndexDescription::EType::LocalFulltext;
             } else {
                 YQL_ENSURE(false, "Unknown index type: " << type);
             }
@@ -1718,6 +1725,12 @@ private:
                 meta->StoreType != EStoreType::Column) {
                 ctx.AddError(TIssue(ctx.GetPosition(index.Pos()),
                     NKikimr::NOlap::NIndexes::NMinMax::DisabledForRowTablesErrorMessage));
+                return TStatus::Error;
+            }
+
+            if (indexType == TIndexDescription::EType::LocalFulltext &&
+                meta->StoreType != EStoreType::Column) {
+                ctx.AddError(TIssue(ctx.GetPosition(index.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexColumnTableOnly)));
                 return TStatus::Error;
             }
 
@@ -1765,7 +1778,8 @@ private:
                     case TIndexDescription::EType::GlobalFulltextPlain:
                     case TIndexDescription::EType::GlobalFulltextRelevance:
                     case TIndexDescription::EType::GlobalFulltextCompact:
-                    case TIndexDescription::EType::GlobalFulltextCompactRelevance: {
+                    case TIndexDescription::EType::GlobalFulltextCompactRelevance:
+                    case TIndexDescription::EType::LocalFulltext: {
                         NKikimr::NFulltext::FillSetting(
                             *fulltextIndexDescription.MutableSettings(),
                             nameLower, value.StringValue(), error);
@@ -1888,6 +1902,31 @@ private:
                         return IGraphTransformer::TStatus::Error;
                     }
 
+                    break;
+                }
+                case TIndexDescription::EType::LocalFulltext: {
+                    if (!dataColumns.empty()) {
+                        ctx.AddError(TIssue(ctx.GetPosition(index.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexNoDataColumns)));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                    if (indexColumns.size() != 1) {
+                        ctx.AddError(TIssue(ctx.GetPosition(index.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn)));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                    const auto columnIt = meta->Columns.find(indexColumns.front());
+                    if (columnIt == meta->Columns.end()
+                        || (columnIt->second.Type != "String" && columnIt->second.Type != "Utf8"))
+                    {
+                        ctx.AddError(TIssue(ctx.GetPosition(index.Pos()), TString(NKikimr::NFulltext::LocalFulltextIndexOneColumn)));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                    TString error;
+                    if (!NKikimr::NFulltext::ValidateSettings(fulltextIndexDescription.GetSettings(), error)) {
+                        ctx.AddError(TIssue(ctx.GetPosition(index.IndexSettings().Pos()), error));
+                        return IGraphTransformer::TStatus::Error;
+                    }
+                    NKikimr::NFulltext::NormalizeFulltextSettings(*fulltextIndexDescription.MutableSettings());
+                    specializedIndexDescription = std::move(fulltextIndexDescription);
                     break;
                 }
             }

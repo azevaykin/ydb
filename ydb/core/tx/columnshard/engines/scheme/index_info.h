@@ -340,6 +340,10 @@ public:
         return Indexes.contains(indexId);
     }
 
+    // True when this schema has a local fulltext index id that `source` does not.
+    // Rename keeps the id. Drop/recreate allocates a new one.
+    bool NeedsFulltextBuildFrom(const TIndexInfo& source) const;
+
     bool HasIndexes(const std::set<ui32>& indexIds) const {
         for (auto&& i : indexIds) {
             if (!Indexes.contains(i)) {

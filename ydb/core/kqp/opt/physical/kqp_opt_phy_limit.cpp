@@ -1,7 +1,9 @@
 #include "kqp_opt_phy_rules.h"
 #include "kqp_opt_phy_impl.h"
 
+#include <ydb/core/base/table_index.h>
 #include <ydb/core/kqp/common/kqp_yql.h>
+#include <ydb/core/protos/flat_scheme_op.pb.h>
 #include <ydb/core/kqp/opt/kqp_opt.h>
 #include <ydb/core/kqp/opt/kqp_opt_impl.h>
 #include <ydb/public/api/protos/ydb_table.pb.h>
@@ -14,8 +16,29 @@ namespace NKikimr::NKqp::NOpt {
 using namespace NYql;
 using namespace NYql::NNodes;
 
+namespace {
+
+bool IsColumnTableGlobalFulltext(const TKqpOptimizeContext& kqpCtx, const TKqpTable& table, const TCoAtom& indexName) {
+    if (!kqpCtx.Tables) {
+        return false;
+    }
+    const auto& tableDesc = GetTableData(*kqpCtx.Tables, kqpCtx.Cluster, table.Path());
+    if (!tableDesc.Metadata) {
+        return false;
+    }
+    auto [implTable, indexDesc] = tableDesc.Metadata->GetIndex(TString(indexName.Value()));
+    Y_UNUSED(implTable);
+    if (!indexDesc) {
+        return false;
+    }
+    const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexDesc->SpecializedIndexDescription);
+    return fulltext
+        && fulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED;
+}
+
+}
+
 TExprBase KqpApplyLimitToFullTextIndex(TExprBase node, TExprContext& ctx, const TKqpOptimizeContext& kqpCtx) {
-    Y_UNUSED(kqpCtx);
 
     if (!node.Maybe<TCoTake>()) {
         return node;
@@ -35,7 +58,14 @@ TExprBase KqpApplyLimitToFullTextIndex(TExprBase node, TExprContext& ctx, const 
         return node;
     }
 
-    auto settings = TKqpReadTableFullTextIndexSettings::Parse(input.Cast<TKqpReadTableFullTextIndex>().Settings());
+    const auto& fullTextRead = input.Cast<TKqpReadTableFullTextIndex>();
+    // Residual predicates, including the example timestamp filter, run before LIMIT.
+    // A column-table source limit would change which rows reach that filter.
+    if (IsColumnTableGlobalFulltext(kqpCtx, fullTextRead.Table(), fullTextRead.Index())) {
+        return node;
+    }
+
+    auto settings = TKqpReadTableFullTextIndexSettings::Parse(fullTextRead.Settings());
 
     if (settings.ItemsLimit) {
         return node; // already set?

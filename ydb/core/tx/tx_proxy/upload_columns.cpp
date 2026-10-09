@@ -1,6 +1,7 @@
 #include "upload_rows.h"
 #include "upload_rows_common_impl.h"
 
+#include <ydb/core/base/table_index.h>
 #include <ydb/core/tx/tx_proxy/proxy.h>
 #include <ydb/library/aclib/user_context.h>
 
@@ -48,6 +49,16 @@ private:
         if (GetTableKind() != NSchemeCache::TSchemeCacheNavigate::KindColumnTable) {
             errorMessage = "Only the OLAP table is supported";
             return false;
+        }
+        // Column write boundary: reject even if an internal caller skipped the public entry check.
+        const auto* resolve = GetResolveNameResult();
+        if (resolve && !resolve->ResultSet.empty()) {
+            for (const auto& index : resolve->ResultSet.front().Indexes) {
+                if (NTableIndex::IsColumnTableCompactFulltext(index.GetType())) {
+                    errorMessage = TString(NTableIndex::ColumnTableGlobalFulltextBulkUpsertRejected);
+                    return false;
+                }
+            }
         }
         return true;
     }

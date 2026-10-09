@@ -2,6 +2,7 @@
 
 #include "actors/kqp_ic_gateway_actors.h"
 
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/base/path.h>
 #include <ydb/core/base/table_index.h>
 #include <ydb/core/external_sources/external_source_factory.h>
@@ -220,6 +221,20 @@ void OlapIndexProtoToMetadata(
                 if (index.GetMinMaxIndex().HasColumnId()) {
                     keyColumns = resolveColumns(std::initializer_list<ui32>{index.GetMinMaxIndex().GetColumnId()});
                 }
+                break;
+            }
+            case NKikimrSchemeOp::TOlapIndexDescription::kColumnFulltextIndex: {
+                type = NYql::TIndexDescription::EType::LocalFulltext;
+                const auto& fulltext = index.GetColumnFulltextIndex();
+                if (fulltext.HasColumnId()) {
+                    keyColumns = resolveColumns(std::initializer_list<ui32>{fulltext.GetColumnId()});
+                }
+                NKikimrSchemeOp::TFulltextIndexDescription description;
+                description.SetOlapIndexId(index.GetId());
+                auto* column = description.mutable_settings()->add_columns();
+                column->set_column(keyColumns.empty() ? TString() : keyColumns.front());
+                *column->mutable_analyzers() = NKikimr::NFulltext::NormalizeAnalyzers(fulltext.GetAnalyzers());
+                specialized = std::move(description);
                 break;
             }
             default:

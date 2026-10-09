@@ -4,6 +4,10 @@
 #include <ydb/core/tx/columnshard/engines/db_wrapper.h>
 #include <ydb/core/tx/columnshard/engines/scheme/index_info.h>
 
+#include <ydb/library/actors/core/log.h>
+
+#define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_COLUMNSHARD
+
 namespace NKikimr::NOlap {
 
 const TIndexInfo* TVersionedIndex::AddIndex(const TSnapshot& snapshot, TObjectCache<TSchemaVersionId, TIndexInfo>::TEntryGuard&& indexInfo) {
@@ -18,10 +22,17 @@ const TIndexInfo* TVersionedIndex::AddIndex(const TSnapshot& snapshot, TObjectCa
     auto itVersion =
         SnapshotByVersion.emplace(newVersion, TSchemaInfoByVersion(std::make_shared<TSnapshotSchema>(std::move(indexInfo), snapshot)));
     AFL_VERIFY(itVersion.second)("message", "duplication for registered version")("version", LastSchemaVersion);
+    // Older schema objects stay in SnapshotByVersion, so an in-flight scan keeps the
+    // index identity it started with. The scheme actualizer queues portions older than
+    // this version; an empty queue is not a promise that every portion has postings.
     if (needActualization) {
         if (!SchemeVersionForActualization || *SchemeVersionForActualization < newVersion) {
             SchemeVersionForActualization = newVersion;
             SchemeForActualization = itVersion.first->second.GetSchema();
+            YDB_LOG_INFO("",
+                {"event", "scheme_actualization_scheduled"},
+                {"version", newVersion},
+                {"snapshot", snapshot.DebugString()});
         }
     }
     auto itSnap = Snapshots.emplace(snapshot, itVersion.first->second.GetSchema());

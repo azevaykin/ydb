@@ -14,6 +14,11 @@
 
 namespace NKikimr {
 
+namespace NSchemeShard {
+struct TColumnTableInfo;
+struct TOlapStoreInfo;
+}
+
 namespace NTableIndex {
 
 struct TIndexObjectCounts {
@@ -175,6 +180,48 @@ NKikimrSchemeOp::TTableDescription CalcFulltextStatsImplTableDesc(
     const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
     const NKikimrSchemeOp::TTableDescription& indexTableDesc,
     const TVector<TString>& prefixColumns);
+
+// Column-table compact fulltext. Posting, docs, stats, and the generation sequence stay
+// compatible with the row-table readers. These two tables are additional.
+NKikimrSchemeOp::TTableDescription CalcColumnTableFulltextStateTableDesc(
+    const NKikimrSchemeOp::TTableDescription& baseTableDescr,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc,
+    const NKikimrSchemeOp::TFulltextIndexDescription& indexDesc,
+    bool withLength,
+    const TVector<TString>& prefixColumns,
+    const THashSet<TString>& coveredColumns,
+    const TString& ttlColumn);
+
+NKikimrSchemeOp::TTableDescription CalcColumnTableFulltextDocIdMapTableDesc(
+    const NKikimrSchemeOp::TTableDescription& baseTableDescr,
+    const NKikimrSchemeOp::TPartitionConfig& baseTablePartitionConfig,
+    const NKikimrSchemeOp::TTableDescription& indexTableDesc);
+
+NKikimrSchemeOp::TTableDescription ColumnSchemaToTableDescription(
+    const NKikimrSchemeOp::TColumnTableSchema& schema);
+
+// Standalone tables keep the schema on the table. Store tables take it from the preset.
+NKikimrSchemeOp::TColumnTableSchema ReadColumnTableSchema(
+    const NSchemeShard::TColumnTableInfo& table,
+    const NSchemeShard::TOlapStoreInfo* store);
+
+TString ColumnTableTtlColumn(const NSchemeShard::TColumnTableInfo& table);
+ui32 ColumnTableShardCount(const NSchemeShard::TColumnTableInfo& table);
+
+// True when the column table already owns a compact global fulltext index child.
+bool ColumnTableHasCompactFulltextIndex(const NSchemeShard::TSchemeShard* ss, const TPathId& tablePathId);
+
+// Chooses native vs synthetic document ids, normalizes analyzer settings, and records
+// analyzer identity plus the initial build generation. ReadyVersion stays unset.
+bool PrepareColumnTableFulltext(
+    NKikimrSchemeOp::TFulltextIndexDescription& description,
+    const TTableColumns& baseColumns,
+    const TColumnTypes& baseTypes,
+    const TVector<TString>& indexKeyColumns,
+    TString& error);
+
+TIndexObjectCounts GetColumnTableFulltextObjectCounts(const NKikimrSchemeOp::TIndexCreationConfig& indexDesc);
 
 TTableColumns ExtractInfo(const NSchemeShard::TTableInfo::TPtr& tableInfo);
 TTableColumns ExtractInfo(const NKikimrSchemeOp::TTableDescription& tableDesc);
@@ -363,7 +410,12 @@ bool CommonCheck(const TTableDesc& tableDesc, const NKikimrSchemeOp::TIndexCreat
 
         // __ydb_row_id opt-in: when MaybeEnableFulltextRowIdMode() has set the flag,
         // skip the single-integer-PK requirement (the doc_id is __ydb_row_id, not the PK).
-        if (!indexDesc.GetFulltextIndexDescription().GetUseRowIdAsDocId()) {
+        // Column-table synthetic mode also skips it. Every prefix column must still be
+        // equality-bound for a search.
+        const auto docIdPolicy = indexDesc.GetFulltextIndexDescription().GetDocIdPolicy();
+        if (docIdPolicy != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC
+            && !indexDesc.GetFulltextIndexDescription().GetUseRowIdAsDocId())
+        {
             if (!CheckSingleIntegerPrimaryKey(baseTableColumns, baseColumnTypes, typeName, error)) {
                 status = NKikimrScheme::EStatus::StatusInvalidParameter;
                 return false;

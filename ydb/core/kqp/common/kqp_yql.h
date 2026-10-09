@@ -186,6 +186,7 @@ public:
     static constexpr TStringBuf VectorTopKMetricSettingName = "VectorTopKMetric";
     static constexpr TStringBuf VectorTopKTargetSettingName = "VectorTopKTarget";
     static constexpr TStringBuf VectorTopKLimitSettingName = "VectorTopKLimit";
+    static constexpr TStringBuf LocalFulltextIndexSettingName = "LocalFulltextIndex";
 
     struct TSampling {
         double Rate = 1.0;
@@ -207,6 +208,8 @@ public:
     // Vector top-K pushdown settings for brute force vector search
     TString VectorTopKColumn;
     TString VectorTopKMetric;
+    // Set when a column-table VIEW names a local fulltext index. The logical rewrite consumes it.
+    TString LocalFulltextIndex;
     TExprNode::TPtr VectorTopKTarget;
     TExprNode::TPtr VectorTopKLimit;
 

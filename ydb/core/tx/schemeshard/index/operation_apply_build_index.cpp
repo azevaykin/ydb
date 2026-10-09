@@ -96,6 +96,56 @@ TVector<ISubOperation::TPtr> ApplyBuildIndex(TOperationId nextId, const TTxTrans
     TString indexName = config.GetIndexName();
 
     TPath table = TPath::Resolve(tablePath, context.SS);
+    if (table.IsResolved() && table->IsColumnTable()) {
+        if (indexName.empty()) {
+            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter,
+                "Column-table index publication requires an index name")};
+        }
+        TPath index = table.Child(indexName);
+        if (!index.IsResolved()) {
+            return {CreateReject(nextId, NKikimrScheme::StatusPathDoesNotExist,
+                "Column-table fulltext index does not exist")};
+        }
+        const auto* indexInfoPtr = context.SS->Indexes.FindPtr(index.Base()->PathId);
+        if (!indexInfoPtr || !NTableIndex::IsColumnTableCompactFulltext((*indexInfoPtr)->Type)) {
+            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter,
+                NTableIndex::ColumnTableGlobalFulltextCompactOnly)};
+        }
+        TVector<ISubOperation::TPtr> result;
+        auto tableIndexAltering = TransactionTemplate(table.PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpAlterTableIndex);
+        *tableIndexAltering.MutableLockGuard() = tx.GetLockGuard();
+        tableIndexAltering.SetInternal(tx.GetInternal());
+        auto* alterIndex = tableIndexAltering.MutableAlterTableIndex();
+        alterIndex->SetName(index.LeafName());
+        alterIndex->SetState(NKikimrSchemeOp::EIndexState::EIndexStateReady);
+        if (const auto* ft = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(
+                &(*indexInfoPtr)->SpecializedIndexDescription))
+        {
+            *alterIndex->MutableFulltextIndexDescription() = *ft;
+            // ReadyVersion is filled from the plan step in TAlterTableIndex.
+            alterIndex->MutableFulltextIndexDescription()->ClearReadyVersion();
+        }
+        result.push_back(CreateAlterTableIndex(NextPartId(nextId, result), tableIndexAltering));
+
+        Y_ABORT_UNLESS(index.Base()->GetChildren().size() >= 1);
+        for (auto& indexChildItems : index.Base()->GetChildren()) {
+            const auto& indexImplTableName = indexChildItems.first;
+            const auto partId = NextPartId(nextId, result);
+            if (NTableIndex::IsBuildImplTable(indexImplTableName)) {
+                bool rejected = false;
+                auto op = DropIndexImplTable(index, nextId, partId, indexImplTableName, indexChildItems.second,
+                    tx.GetLockGuard(), rejected, tx.GetInternal());
+                if (rejected) {
+                    return {std::move(op)};
+                }
+                result.push_back(std::move(op));
+            } else {
+                result.push_back(FinalizeIndexImplTable(context, index, partId, indexImplTableName,
+                    indexChildItems.second, tx.GetLockGuard()));
+            }
+        }
+        return result;
+    }
     {
         // To safely fill the TransactionTemplate below, we need to check if the table is valid.
         const auto checks = table.Check();
@@ -195,6 +245,31 @@ TVector<ISubOperation::TPtr> CancelBuildIndex(TOperationId nextId, const TTxTran
     TString indexName = config.GetIndexName();
 
     TPath table = TPath::Resolve(tablePath, context.SS);
+    if (table.IsResolved() && table->IsColumnTable()) {
+        if (indexName.empty()) {
+            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter, "Column-table index cancellation requires an index name")};
+        }
+        TPath index = table.Child(indexName);
+        if (!index.IsResolved()) {
+            return {CreateReject(nextId, NKikimrScheme::StatusPathDoesNotExist, "Column-table fulltext index does not exist")};
+        }
+        const auto* indexInfo = context.SS->Indexes.FindPtr(index.Base()->PathId);
+        if (!indexInfo || !NTableIndex::IsColumnTableCompactFulltext((*indexInfo)->Type)) {
+            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter, NTableIndex::ColumnTableGlobalFulltextCompactOnly)};
+        }
+        TVector<ISubOperation::TPtr> result;
+        auto mainTableIndexDropping = TransactionTemplate(table.Parent().PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpDropTableIndexAtMainTable);
+        *mainTableIndexDropping.MutableLockGuard() = tx.GetLockGuard();
+        mainTableIndexDropping.SetInternal(tx.GetInternal());
+        auto* operation = mainTableIndexDropping.MutableDropIndex();
+        operation->SetTableName(table.LeafName());
+        operation->SetIndexName(index.LeafName());
+        result.push_back(CreateDropTableIndexAtMainTable(NextPartId(nextId, result), mainTableIndexDropping));
+        if (auto reject = AddDropIndex(result, nextId, index)) {
+            return {std::move(reject)};
+        }
+        return result;
+    }
     {
         // To safely fill the TransactionTemplate below, we need to check if the table is valid.
         const auto checks = table.Check();

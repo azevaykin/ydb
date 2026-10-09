@@ -747,7 +747,7 @@ bool TSqlTranslation::CreateTableIndex(const TRule_table_index& node, TVector<TI
             } else {
                 Y_ABORT("Unreachable");
             }
-        } else if (subType == "BLOOM_FILTER" || subType == "BLOOM_NGRAM_FILTER" || subType == "MIN_MAX") {
+        } else if (subType == "BLOOM_FILTER" || subType == "BLOOM_NGRAM_FILTER" || subType == "MIN_MAX" || subType == "FULLTEXT") {
             if (!isLocalIndex) {
                 Ctx_.Error() << subType << " index can only be LOCAL";
                 return false;
@@ -759,6 +759,8 @@ bool TSqlTranslation::CreateTableIndex(const TRule_table_index& node, TVector<TI
                 indexes.back().Type = TIndexDescription::EType::LocalBloomNgramFilter;
             } else if (subType == "MIN_MAX") {
                 indexes.back().Type = TIndexDescription::EType::LocalMinMax;
+            } else if (subType == "FULLTEXT") {
+                indexes.back().Type = TIndexDescription::EType::LocalFulltext;
             } else {
                 YQL_ENSURE(false, "Unreachable");
             }
@@ -794,6 +796,11 @@ bool TSqlTranslation::CreateTableIndex(const TRule_table_index& node, TVector<TI
 
         if (indexes.back().Type == TIndexDescription::EType::LocalMinMax) {
             Ctx_.Error() << "COVER is not supported for local MIN_MAX index";
+            return false;
+        }
+
+        if (indexes.back().Type == TIndexDescription::EType::LocalFulltext) {
+            Ctx_.Error() << "COVER is not supported for local fulltext index";
             return false;
         }
 

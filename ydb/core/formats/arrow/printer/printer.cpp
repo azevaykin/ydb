@@ -72,6 +72,8 @@ TString ToString(const NKikimrSSA::TProgram::TAssignment& assignment) {
             return result << assignment.ShortDebugString();
         case NKikimrSSA::TProgram::TAssignment::ExpressionCase::kParameter:
             return result << ToString(assignment.GetParameter());
+        case NKikimrSSA::TProgram::TAssignment::ExpressionCase::kFulltextMatch:
+            return result << "FulltextMatch(" << assignment.GetFulltextMatch().ShortDebugString() << ")";
         case NKikimrSSA::TProgram::TAssignment::ExpressionCase::EXPRESSION_NOT_SET:
             return result;
     }

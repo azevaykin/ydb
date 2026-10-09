@@ -157,6 +157,7 @@ void TProgramStep::ReportTracing(IDataSource& source, const NArrow::NAccessor::T
             LWTRACK(ProgramConst, PROGRAM_PROBE_ARGS, PROGRAM_PROBE_RESERVED, PROGRAM_PROBE_TAIL);
             break;
         case NArrow::NSSA::EProcessorType::Calculation:
+        case NArrow::NSSA::EProcessorType::FulltextMatch:
             LWTRACK(ProgramCalculation, PROGRAM_PROBE_ARGS, PROGRAM_PROBE_RESERVED, PROGRAM_PROBE_TAIL);
             break;
         case NArrow::NSSA::EProcessorType::Projection:

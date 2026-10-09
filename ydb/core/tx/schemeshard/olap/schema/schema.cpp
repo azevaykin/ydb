@@ -1,7 +1,10 @@
 #include "schema.h"
 
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/tx/schemeshard/common/validation.h>
 #include <ydb/core/tx/schemeshard/olap/ttl/validator.h>
+
+#include <util/generic/hash_set.h>
 
 namespace NKikimr::NSchemeShard {
 
@@ -37,6 +40,13 @@ bool TOlapSchema::ValidateTtlSettings(
 }
 
 bool TOlapSchema::Update(const TOlapSchemaUpdate& schemaUpdate, IErrorCollector& errors) {
+    THashSet<ui32> fulltextIndexIdsBefore;
+    for (const auto& [indexId, index] : Indexes.GetIndexes()) {
+        if (index.GetIndexMeta().GetClassName() == TString(NKikimr::NFulltext::LocalFulltextClassName)) {
+            fulltextIndexIdsBefore.insert(indexId);
+        }
+    }
+
     if (!Columns.ApplyUpdate(schemaUpdate.GetColumns(), errors, NextColumnId)) {
         return false;
     }
@@ -47,6 +57,19 @@ bool TOlapSchema::Update(const TOlapSchemaUpdate& schemaUpdate, IErrorCollector&
 
     if (!Options.ApplyUpdate(schemaUpdate.GetOptions(), errors)) {
         return false;
+    }
+
+    // A new fulltext index id (ADD INDEX, or drop followed by recreate) commits with the
+    // schema and is searchable immediately. The flag schedules backfill of older portions.
+    // Rename keeps the id, so it does not. Analyzer changes are rejected before this point.
+    for (const auto& [indexId, index] : Indexes.GetIndexes()) {
+        if (fulltextIndexIdsBefore.contains(indexId)) {
+            continue;
+        }
+        if (index.GetIndexMeta().GetClassName() == TString(NKikimr::NFulltext::LocalFulltextClassName)) {
+            Options.RequestSchemeActualization();
+            break;
+        }
     }
 
     ++Version;

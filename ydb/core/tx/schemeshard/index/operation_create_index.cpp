@@ -1,6 +1,7 @@
 #include <ydb/core/tx/schemeshard/schemeshard__operation_common.h>
 #include <ydb/core/tx/schemeshard/schemeshard__operation_part.h>
 #include <ydb/core/tx/schemeshard/schemeshard_impl.h>
+#include <ydb/core/base/table_index.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::FLAT_TX_SCHEMESHARD
 
@@ -49,6 +50,10 @@ public:
 
         context.SS->ClearDescribePathCaches(path);
         context.OnComplete.PublishToSchemeBoard(OperationId, path->PathId);
+        if (auto parent = context.SS->PathsById.at(path->ParentPathId); parent->IsColumnTable()) {
+            context.SS->ClearDescribePathCaches(parent);
+            context.OnComplete.PublishToSchemeBoard(OperationId, parent->PathId);
+        }
 
         context.SS->ChangeTxState(db, OperationId, TTxState::Done);
         return true;
@@ -123,6 +128,8 @@ public:
         }
 
         NSchemeShard::TPath parentPath = NSchemeShard::TPath::Resolve(parentPathStr, context.SS);
+        const bool columnFulltextParent = parentPath.IsResolved() && parentPath->IsColumnTable()
+            && NTableIndex::IsColumnTableCompactFulltext(tableIndexCreation.GetType());
         {
             NSchemeShard::TPath::TChecker checks = parentPath.Check();
             checks
@@ -131,8 +138,12 @@ public:
                 .IsResolved()
                 .NotDeleted()
                 .NotUnderDeleting()
-                .IsCommonSensePath()
-                .IsTable();
+                .IsCommonSensePath();
+            if (columnFulltextParent) {
+                checks.IsColumnTable();
+            } else {
+                checks.IsTable();
+            }
 
             // A new replica can have an async index maintained locally from
             // its base table. Adding one later still requires an index build.

@@ -444,6 +444,7 @@ public:
     bool EnableOnlineAddUniqueIndex = false;
     bool EnableFulltextIndex = false;
     bool EnableCompactFulltextIndex = false;
+    bool EnableColumnTableGlobalFulltextIndex = false;
     bool EnableJsonIndex = false;
     bool EnableExternalDataSourcesOnServerless = false;
     bool EnableShred = false;

@@ -5,6 +5,7 @@ SRCS(
     kqp_buffer_lock_actor.cpp
     kqp_buffer_lookup_actor.cpp
     kqp_compute.cpp
+    kqp_column_fulltext_fetch.cpp
     kqp_full_text_source.cpp
     kqp_sys_view_source.cpp
     kqp_fulltext_analyze.cpp
@@ -35,6 +36,7 @@ SRCS(
     kqp_write_actor_settings.cpp
     kqp_write_actor.cpp
     kqp_write_table.cpp
+    kqp_column_fulltext_write.cpp
 
     scheduler/kqp_compute_scheduler_service.cpp
     scheduler/kqp_schedulable_work_factory.cpp

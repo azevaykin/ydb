@@ -43,6 +43,8 @@ public:
         , Config(config)
     {
 #define HNDL(name) "KqpLogical-"#name, Hndl(&TKqpLogicalOptTransformer::name)
+        AddHandler(0, &TCoFlatMap::Match, HNDL(RewriteColumnLocalFulltext));
+        AddHandler(0, &TKqlReadTableRanges::Match, HNDL(RewriteColumnLocalFulltext));
         AddHandler(0, &TCoTopBase::Match, HNDL(RewriteHybridRankTopSort));
         AddHandler(0, &TCoTop::Match, HNDL(TopSortSelectIndex));
         AddHandler(0, &TCoTopSort::Match, HNDL(TopSortSelectIndex));
@@ -130,6 +132,14 @@ protected:
     TMaybeNode<TExprBase> TopSortSelectIndex(TExprBase node, TExprContext& ctx) {
         TExprBase output = KqpTopSortSelectIndex(node, ctx, KqpCtx);
         DumpAppliedRule("KqpTopSortSelectIndex", node.Ptr(), output.Ptr(), ctx);
+        return output;
+    }
+
+    TMaybeNode<TExprBase> RewriteColumnLocalFulltext(TExprBase node, TExprContext& ctx, const TGetParents& getParents) {
+        auto output = KqpRewriteColumnLocalFulltext(node, ctx, KqpCtx, *getParents());
+        if (output && output.Cast().Raw() != node.Raw()) {
+            DumpAppliedRule("RewriteColumnLocalFulltext", node.Ptr(), output.Cast().Ptr(), ctx);
+        }
         return output;
     }
 
@@ -420,7 +430,7 @@ protected:
     }
 
     TMaybeNode<TExprBase> PushLimitOverFullText(TExprBase node, TExprContext& ctx) {
-        auto output = KqpPushLimitOverFullText(node, ctx);
+        auto output = KqpPushLimitOverFullText(node, ctx, KqpCtx);
         if (!output.IsValid()) {
             return {};
         }

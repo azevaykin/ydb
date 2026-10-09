@@ -12,6 +12,8 @@
 
 #include <library/cpp/object_factory/object_factory.h>
 
+#include <limits>
+
 namespace NYql::NNodes {
 class TExprBase;
 }
@@ -30,6 +32,64 @@ class TOlapSchema;
 }
 
 namespace NKikimr::NOlap::NIndexes {
+
+// Resolved by AppendIndex before an optional index builder runs.
+// Chunk byte limit is the target storage blob limit. The construction budget counts memory the
+// builder still holds after a chunk is closed.
+struct TIndexBuildContext {
+    i64 MaxChunkBytes = 0;
+    TString TargetTier;
+    ui64 ConstructionMemoryBudget = std::numeric_limits<ui64>::max();
+    ui64 AnalyzerMaxInputBytes = std::numeric_limits<ui64>::max();
+    ui64 AnalyzerMaxGeneratedTokens = std::numeric_limits<ui64>::max();
+    ui64 AnalyzerMaxRetainedBytes = std::numeric_limits<ui64>::max();
+};
+
+// Built carries chunks whose record counts cover the portion.
+// Skipped omits the index and keeps the portion. An empty chunk vector is not a skip:
+// callers still require Built chunks to cover every portion row.
+class TIndexBuildOutcome {
+public:
+    static TIndexBuildOutcome Built(std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>> chunks) {
+        TIndexBuildOutcome result;
+        result.Skipped_ = false;
+        result.Chunks = std::move(chunks);
+        return result;
+    }
+
+    static TIndexBuildOutcome Skipped(TString reason) {
+        TIndexBuildOutcome result;
+        result.Skipped_ = true;
+        result.Reason = std::move(reason);
+        return result;
+    }
+
+    bool IsSkipped() const {
+        return Skipped_;
+    }
+
+    bool IsBuilt() const {
+        return !Skipped_;
+    }
+
+    const TString& GetSkipReason() const {
+        return Reason;
+    }
+
+    const std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>>& GetChunks() const {
+        return Chunks;
+    }
+
+    std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>> DetachChunks() {
+        return std::move(Chunks);
+    }
+
+private:
+    bool Skipped_ = false;
+    std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>> Chunks;
+    TString Reason;
+};
+
 namespace NRequest {
 class TLikePart {
 public:
@@ -61,9 +121,9 @@ private:
     }
 
 protected:
-    virtual TConclusion<std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>>> DoBuildIndexOptional(
+    virtual TConclusion<TIndexBuildOutcome> DoBuildIndexOptional(
         const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data, const ui32 recordsCount,
-        const TIndexInfo& indexInfo) const = 0;
+        const TIndexInfo& indexInfo, const TIndexBuildContext& context) const = 0;
     virtual bool DoDeserializeFromProto(const NKikimrSchemeOp::TOlapIndexDescription& proto) = 0;
     virtual void DoSerializeToProto(NKikimrSchemeOp::TOlapIndexDescription& proto) const = 0;
     virtual TConclusionStatus DoCheckModificationCompatibility(const IIndexMeta& newMeta) const = 0;
@@ -127,8 +187,8 @@ public:
 
     virtual ~IIndexMeta() = default;
 
-    TConclusion<std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>>> BuildIndexOptional(
-        const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data, const ui32 recordsCount, const TIndexInfo& indexInfo) const;
+    TConclusion<TIndexBuildOutcome> BuildIndexOptional(const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data,
+        const ui32 recordsCount, const TIndexInfo& indexInfo, const TIndexBuildContext& context) const;
 
     bool DeserializeFromProto(const NKikimrSchemeOp::TOlapIndexDescription& proto);
     void SerializeToProto(NKikimrSchemeOp::TOlapIndexDescription& proto) const;

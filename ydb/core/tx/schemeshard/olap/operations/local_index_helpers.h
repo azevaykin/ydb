@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/min_max/misc/misc.h>
 #include <ydb/core/tx/schemeshard/schemeshard__operation_part.h>
 #include <ydb/core/tx/schemeshard/schemeshard__operation.h>
@@ -66,6 +67,22 @@ inline bool ConvertOlapIndexToCreationConfig(
             return false;
         }
         config.AddKeyColumnNames(it->second);
+        return true;
+    } else if (indexProto.HasColumnFulltextIndex()) {
+        config.SetType(NKikimrSchemeOp::EIndexTypeLocalFulltext);
+        auto it = columnIdToName.find(indexProto.GetColumnFulltextIndex().GetColumnId());
+        if (it == columnIdToName.end()) {
+            YDB_LOG_ERROR("ConvertOlapIndexToCreationConfig: fulltext column ID not found",
+                {"columnId", indexProto.GetColumnFulltextIndex().GetColumnId()},
+                {"index", indexProto.GetName()});
+            return false;
+        }
+        config.AddKeyColumnNames(it->second);
+        auto* description = config.MutableFulltextIndexDescription();
+        description->SetOlapIndexId(indexProto.GetId());
+        auto* column = description->MutableSettings()->AddColumns();
+        column->SetColumn(it->second);
+        *column->MutableAnalyzers() = indexProto.GetColumnFulltextIndex().GetAnalyzers();
         return true;
     } else if (indexProto.HasCountMinSketch()) {
         config.SetType(NKikimrSchemeOp::EIndexTypeLocalCountMinSketch);
@@ -174,6 +191,22 @@ inline bool ConvertOlapIndexToRequested(
             }
             return true;
         }
+        case NKikimrSchemeOp::TOlapIndexDescription::kColumnFulltextIndex: {
+            auto* fulltext = dst.MutableColumnFulltextIndex();
+            const auto& srcFulltext = src.GetColumnFulltextIndex();
+            if (srcFulltext.HasColumnId()) {
+                auto it = columnIdToName.find(srcFulltext.GetColumnId());
+                if (it == columnIdToName.end()) {
+                    YDB_LOG_ERROR("ConvertOlapIndexToRequested: fulltext column ID not found",
+                        {"columnId", srcFulltext.GetColumnId()},
+                        {"index", src.GetName()});
+                    return false;
+                }
+                fulltext->SetColumnName(it->second);
+            }
+            *fulltext->MutableAnalyzers() = srcFulltext.GetAnalyzers();
+            return true;
+        }
         case NKikimrSchemeOp::TOlapIndexDescription::kCountMinSketch: {
             NKikimrSchemeOp::TRequestedCountMinSketch* sketch = dst.MutableCountMinSketch();
             for (ui32 colId : src.GetCountMinSketch().GetColumnIds()) {
@@ -255,6 +288,18 @@ inline bool ConvertRequestedIndexToCreationConfig(
             }
             return true;
         }
+        case NKikimrSchemeOp::TOlapIndexRequested::kColumnFulltextIndex: {
+            config.SetType(NKikimrSchemeOp::EIndexTypeLocalFulltext);
+            const auto& fulltext = indexProto.GetColumnFulltextIndex();
+            if (!fulltext.GetColumnName().empty()) {
+                config.AddKeyColumnNames(fulltext.GetColumnName());
+            }
+            auto* description = config.MutableFulltextIndexDescription();
+            auto* column = description->MutableSettings()->AddColumns();
+            column->SetColumn(fulltext.GetColumnName());
+            *column->MutableAnalyzers() = fulltext.GetAnalyzers();
+            return true;
+        }
         case NKikimrSchemeOp::TOlapIndexRequested::kCountMinSketch: {
             config.SetType(NKikimrSchemeOp::EIndexTypeLocalCountMinSketch);
             const auto& sketch = indexProto.GetCountMinSketch();
@@ -332,6 +377,18 @@ inline bool ConvertRequestedIndexToAlteringConfig(
             }
             return true;
         }
+        case NKikimrSchemeOp::TOlapIndexRequested::kColumnFulltextIndex: {
+            config.SetType(NKikimrSchemeOp::EIndexTypeLocalFulltext);
+            const auto& fulltext = indexProto.GetColumnFulltextIndex();
+            if (!fulltext.GetColumnName().empty()) {
+                config.AddKeyColumnNames(fulltext.GetColumnName());
+            }
+            auto* description = config.MutableFulltextIndexDescription();
+            auto* column = description->MutableSettings()->AddColumns();
+            column->SetColumn(fulltext.GetColumnName());
+            *column->MutableAnalyzers() = fulltext.GetAnalyzers();
+            return true;
+        }
         case NKikimrSchemeOp::TOlapIndexRequested::kCountMinSketch: {
             config.SetType(NKikimrSchemeOp::EIndexTypeLocalCountMinSketch);
             const auto& sketch = indexProto.GetCountMinSketch();
@@ -370,6 +427,8 @@ inline bool ConvertAlteringConfigToCreationConfig(
         *creationConfig.MutableBloomFilterDescription() = alterConfig.GetBloomFilterDescription();
     } else if (alterConfig.HasBloomNGrammFilterDescription()) {
         *creationConfig.MutableBloomNGrammFilterDescription() = alterConfig.GetBloomNGrammFilterDescription();
+    } else if (alterConfig.HasFulltextIndexDescription()) {
+        *creationConfig.MutableFulltextIndexDescription() = alterConfig.GetFulltextIndexDescription();
     }
 
     return true;
@@ -444,6 +503,24 @@ inline bool ConvertCreationConfigToRequested(
             for (const auto& colName : config.GetKeyColumnNames()) {
                 min_max->SetColumnName(colName);
                 break; // Only one column for min_max index
+            }
+            return true;
+        }
+        case NKikimrSchemeOp::EIndexTypeLocalFulltext: {
+            requested.SetClassName(TString(NKikimr::NFulltext::LocalFulltextClassName));
+            auto* fulltext = requested.MutableColumnFulltextIndex();
+            if (config.HasFulltextIndexDescription() && config.GetFulltextIndexDescription().GetSettings().columns_size() > 0) {
+                const auto& column = config.GetFulltextIndexDescription().GetSettings().columns(0);
+                if (!column.column().empty()) {
+                    fulltext->SetColumnName(column.column());
+                }
+                *fulltext->MutableAnalyzers() = column.analyzers();
+            }
+            if (fulltext->GetColumnName().empty()) {
+                for (const auto& colName : config.GetKeyColumnNames()) {
+                    fulltext->SetColumnName(colName);
+                    break;
+                }
             }
             return true;
         }

@@ -3299,6 +3299,10 @@ TIndexDescription TIndexDescription::FromProto(const TProto& proto) {
         type = EIndexType::LocalMinMax;
         specializedIndexSettings = std::monostate{};
         break;
+    case TProto::kLocalFulltextIndex:
+        type = EIndexType::LocalFulltext;
+        specializedIndexSettings = TFulltextIndexSettings::FromProto(proto.local_fulltext_index().fulltext_settings());
+        break;
     case TProto::TYPE_NOT_SET:
         type = EIndexType::GlobalSync;
         globalIndexSettings.resize(1);
@@ -3419,6 +3423,14 @@ void TIndexDescription::SerializeTo(Ydb::Table::TableIndex& proto) const {
         proto.mutable_local_min_max_index();
         break;
     }
+    case EIndexType::LocalFulltext: {
+        if (const auto* ftSettings = std::get_if<TFulltextIndexSettings>(&SpecializedIndexSettings_)) {
+            ftSettings->SerializeTo(*proto.mutable_local_fulltext_index()->mutable_fulltext_settings());
+        } else {
+            proto.mutable_local_fulltext_index();
+        }
+        break;
+    }
     case EIndexType::Unknown:
         break;
     }
@@ -3449,6 +3461,11 @@ void TIndexDescription::Out(IOutputStream& o) const {
     case EIndexType::LocalBloomNgramFilter:
     case EIndexType::LocalMinMax:
     case EIndexType::Unknown:
+        break;
+    case EIndexType::LocalFulltext:
+        if (auto settings = std::get_if<TFulltextIndexSettings>(&SpecializedIndexSettings_)) {
+            o << ", fulltext_settings: " << *settings;
+        }
         break;
     case EIndexType::GlobalVectorKMeansTree:
         if (auto settings = std::get_if<TKMeansTreeSettings>(&SpecializedIndexSettings_)) {

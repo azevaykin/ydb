@@ -51,6 +51,8 @@ const TString ImplTables[] = {
     TString{NKMeans::PostingTable} + NKMeans::BuildSuffix1,
     NFulltext::DocsTable,
     NFulltext::DictTable,
+    NFulltext::DocIdMapTable,
+    NFulltext::StateTable,
     NFulltext::StatsTable,
 };
 
@@ -89,6 +91,36 @@ constexpr std::string_view GlobalFulltextCompactRelevanceImplTables[] = {
 };
 static_assert(std::is_sorted(std::begin(GlobalFulltextCompactRelevanceImplTables), std::end(GlobalFulltextCompactRelevanceImplTables)));
 
+constexpr std::string_view ColumnFulltextPlainNativeImplTables[] = {
+    NFulltext::StateTable,
+    ImplTable,
+};
+static_assert(std::is_sorted(std::begin(ColumnFulltextPlainNativeImplTables), std::end(ColumnFulltextPlainNativeImplTables)));
+
+constexpr std::string_view ColumnFulltextPlainSyntheticImplTables[] = {
+    NFulltext::DocIdMapTable,
+    NFulltext::StateTable,
+    ImplTable,
+};
+static_assert(std::is_sorted(std::begin(ColumnFulltextPlainSyntheticImplTables), std::end(ColumnFulltextPlainSyntheticImplTables)));
+
+constexpr std::string_view ColumnFulltextRelevanceNativeImplTables[] = {
+    NFulltext::DocsTable,
+    NFulltext::StateTable,
+    NFulltext::StatsTable,
+    ImplTable,
+};
+static_assert(std::is_sorted(std::begin(ColumnFulltextRelevanceNativeImplTables), std::end(ColumnFulltextRelevanceNativeImplTables)));
+
+constexpr std::string_view ColumnFulltextRelevanceSyntheticImplTables[] = {
+    NFulltext::DocIdMapTable,
+    NFulltext::DocsTable,
+    NFulltext::StateTable,
+    NFulltext::StatsTable,
+    ImplTable,
+};
+static_assert(std::is_sorted(std::begin(ColumnFulltextRelevanceSyntheticImplTables), std::end(ColumnFulltextRelevanceSyntheticImplTables)));
+
 bool IsSecondaryIndex(NKikimrSchemeOp::EIndexType indexType) {
     switch (indexType) {
         case NKikimrSchemeOp::EIndexTypeGlobal:
@@ -102,6 +134,11 @@ bool IsSecondaryIndex(NKikimrSchemeOp::EIndexType indexType) {
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
         case NKikimrSchemeOp::EIndexTypeGlobalJsonCompact:
+        case NKikimrSchemeOp::EIndexTypeLocalBloomFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalMinMax:
+        case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
+        case NKikimrSchemeOp::EIndexTypeLocalFulltext:
             return false;
         default:
             Y_ENSURE(false, InvalidIndexType(indexType));
@@ -211,6 +248,7 @@ bool IsLocalTableIndex(Ydb::Table::TableIndex::TypeCase type) {
         case Ydb::Table::TableIndex::kLocalBloomFilterIndex:
         case Ydb::Table::TableIndex::kLocalBloomNgramFilterIndex:
         case Ydb::Table::TableIndex::kLocalMinMaxIndex:
+        case Ydb::Table::TableIndex::kLocalFulltextIndex:
             return true;
     }
 }
@@ -317,6 +355,11 @@ bool DoesIndexSupportTTL(NKikimrSchemeOp::EIndexType indexType) {
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
         case NKikimrSchemeOp::EIndexTypeGlobalJsonCompact:
+        case NKikimrSchemeOp::EIndexTypeLocalBloomFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalMinMax:
+        case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
+        case NKikimrSchemeOp::EIndexTypeLocalFulltext:
             return false;
         default:
             Y_DEBUG_ABORT_S(InvalidIndexType(indexType));
@@ -349,8 +392,31 @@ std::span<const std::string_view> GetImplTables(
         case NKikimrSchemeOp::EIndexTypeGlobalJson:
         case NKikimrSchemeOp::EIndexTypeGlobalJsonCompact:
             return GlobalFulltextPlainImplTables;
+        case NKikimrSchemeOp::EIndexTypeLocalBloomFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalBloomNgramFilter:
+        case NKikimrSchemeOp::EIndexTypeLocalMinMax:
+        case NKikimrSchemeOp::EIndexTypeLocalCountMinSketch:
+        case NKikimrSchemeOp::EIndexTypeLocalFulltext:
+            return {};
         default:
             Y_ENSURE(false, InvalidIndexType(indexType));
+    }
+}
+
+std::span<const std::string_view> GetColumnTableFulltextImplTables(
+        NKikimrSchemeOp::EIndexType indexType,
+        NKikimrSchemeOp::TFulltextIndexDescription::EDocIdPolicy docIdPolicy)
+{
+    const bool synthetic = docIdPolicy == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+    switch (indexType) {
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompact:
+            return synthetic ? std::span<const std::string_view>(ColumnFulltextPlainSyntheticImplTables)
+                             : std::span<const std::string_view>(ColumnFulltextPlainNativeImplTables);
+        case NKikimrSchemeOp::EIndexTypeGlobalFulltextCompactRelevance:
+            return synthetic ? std::span<const std::string_view>(ColumnFulltextRelevanceSyntheticImplTables)
+                             : std::span<const std::string_view>(ColumnFulltextRelevanceNativeImplTables);
+        default:
+            return {};
     }
 }
 
@@ -367,6 +433,12 @@ bool IsBuildImplTable(std::string_view tableName) {
 }
 
 namespace NFulltext {
+
+ui64 SyntheticDocIdFromSeq(ui64 seq) {
+    Y_ENSURE(IsSyntheticDocIdSeq(seq),
+        "synthetic fulltext document id sequence is exhausted; ids are never recycled");
+    return RowIdFromSeq(seq);
+}
 
 namespace {
 

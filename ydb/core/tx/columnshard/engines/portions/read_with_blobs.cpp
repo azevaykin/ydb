@@ -129,6 +129,11 @@ std::optional<TWritePortionInfoWithBlobsResult> TReadPortionInfoWithBlobs::SyncP
     const bool sameSchema = from->GetVersion() == to->GetVersion();
     const auto& fromIndexInfo = from->GetIndexInfo();
     const ui32 recordsCount = source.PortionInfo.GetPortionInfo().GetRecordsCount();
+    // Fulltext postings follow the portion tier: the index inherits portion storage, and
+    // targetTier selects that operator. Compatible chunks are moved when they fit the
+    // destination blob limit. Otherwise AppendIndex rebuilds against that limit, or omits
+    // the index. Column chunks above stay either way, so text evaluation still sees the rows.
+    // Restore uses the same rule: optional postings may be rebuilt or left absent.
     for (auto&& [indexId, toIndex] : to->GetIndexInfo().GetIndexes()) {
         bool reused = false;
         if (fromIndexInfo.HasIndexId(indexId)) {

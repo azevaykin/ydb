@@ -613,6 +613,11 @@ void TCreateTableFormatter::Format(const TableIndex& index) {
             Stream << " LOCAL USING min_max ON ";
             break;
         }
+        case Ydb::Table::TableIndex::kLocalFulltextIndex: {
+            Stream << " LOCAL USING fulltext ON ";
+            fulltextIndexSettings = index.local_fulltext_index().fulltext_settings();
+            break;
+        }
         case Ydb::Table::TableIndex::TYPE_NOT_SET:
             ythrow TFormatFail(Ydb::StatusIds::INTERNAL_ERROR, "Unexpected Ydb::Table::TableIndex::TYPE_NOT_SET");
     }
@@ -1542,7 +1547,7 @@ TFormatResult TCreateTableFormatter::Format(const TString& tablePath, const TStr
         try {
             for (const auto& index : schema.GetIndexes()) {
                 // Check if this is a bloom filter or bloom ngram filter that should be formatted inline
-                if (index.HasBloomFilter() || index.HasBloomNGrammFilter() || index.HasMinMaxIndex()) {
+                if (index.HasBloomFilter() || index.HasBloomNGrammFilter() || index.HasMinMaxIndex() || index.HasColumnFulltextIndex()) {
                     if (isFamilyPrinted || hasInlineIndex) {
                         Stream << ",\n";
                         isFamilyPrinted = false;
@@ -1553,6 +1558,8 @@ TFormatResult TCreateTableFormatter::Format(const TString& tablePath, const TStr
                         FormatLocalBloomFilterIndexInline(index, columns);
                     } else if (index.HasBloomNGrammFilter()){
                         FormatLocalBloomNgramFilterIndexInline(index, columns);
+                    } else if (index.HasColumnFulltextIndex()) {
+                        FormatLocalFulltextIndexInline(index, columns);
                     } else {
                         FormatLocalMinMaxIndexInline(index, columns);
                     }
@@ -2168,6 +2175,20 @@ void TCreateTableFormatter::FormatUpsertIndex(const TString& tablePath, const TS
             Stream << ");";
             break;
         }
+        case NKikimrSchemeOp::TOlapIndexDescription::kColumnFulltextIndex: {
+            const auto& fulltext = indexDesc.GetColumnFulltextIndex();
+            if (!fulltext.HasColumnId() || !columns.contains(fulltext.GetColumnId())) {
+                ythrow TFormatFail(Ydb::StatusIds::INTERNAL_ERROR, "fulltext index column id is not present in table description");
+            }
+            Stream << "ALTER TABLE ";
+            EscapeName(fullPath, Stream);
+            Stream << "\nADD INDEX ";
+            EscapeName(indexDesc.GetName(), Stream);
+            Stream << " LOCAL USING fulltext ON (";
+            EscapeName(columns.at(fulltext.GetColumnId())->GetName(), Stream);
+            Stream << ");";
+            break;
+        }
         case NKikimrSchemeOp::TOlapIndexDescription::kMinMaxIndex: {
             const auto& minMaxIndex = indexDesc.GetMinMaxIndex();
             auto columnIdFieldName= minMaxIndex.GetDescriptor()->FindFieldByNumber(TMinMaxIndex::kColumnIdFieldNumber)->full_name();
@@ -2528,6 +2549,82 @@ void TCreateTableFormatter::FormatLocalMinMaxIndexInline(const NKikimrSchemeOp::
 
     const auto& columnName = columns.at(min_max.GetColumnId())->GetName();
     EscapeName(columnName, Stream);
+    Stream << ")";
+}
+
+void TCreateTableFormatter::FormatLocalFulltextIndexInline(const NKikimrSchemeOp::TOlapIndexDescription& indexDesc,
+        const std::map<ui32, const TOlapColumnDescription*>& columns) {
+    const auto& fulltext = indexDesc.GetColumnFulltextIndex();
+    if (!fulltext.HasColumnId()) {
+        ythrow TFormatFail(Ydb::StatusIds::UNSUPPORTED, "ColumnId have to be in fulltext index description");
+    }
+    Stream << "\tINDEX ";
+    EscapeName(indexDesc.GetName(), Stream);
+    Stream << " LOCAL USING fulltext ON (";
+    const auto& columnName = columns.at(fulltext.GetColumnId())->GetName();
+    EscapeName(columnName, Stream);
+    Stream << ")";
+
+    const auto& analyzers = fulltext.GetAnalyzers();
+    if (!analyzers.has_tokenizer()) {
+        return;
+    }
+    Stream << " WITH (tokenizer=";
+    switch (analyzers.tokenizer()) {
+        case Ydb::Table::FulltextIndexSettings::WHITESPACE:
+            Stream << "whitespace";
+            break;
+        case Ydb::Table::FulltextIndexSettings::STANDARD:
+            Stream << "standard";
+            break;
+        case Ydb::Table::FulltextIndexSettings::KEYWORD:
+            Stream << "keyword";
+            break;
+        case Ydb::Table::FulltextIndexSettings::ALPHANUMERIC:
+            Stream << "alphanumeric";
+            break;
+        default:
+            ythrow TFormatFail(Ydb::StatusIds::INTERNAL_ERROR, "Unexpected fulltext tokenizer");
+    }
+    if (analyzers.has_language()) {
+        Stream << ", language=\"" << analyzers.language() << "\"";
+    }
+    auto writeBool = [&](const char* name, bool value) {
+        Stream << ", " << name << "=" << (value ? "true" : "false");
+    };
+    if (analyzers.has_use_filter_lowercase()) {
+        writeBool("use_filter_lowercase", analyzers.use_filter_lowercase());
+    }
+    if (analyzers.has_use_filter_stopwords()) {
+        writeBool("use_filter_stopwords", analyzers.use_filter_stopwords());
+    }
+    if (analyzers.has_use_filter_ngram()) {
+        writeBool("use_filter_ngram", analyzers.use_filter_ngram());
+    }
+    if (analyzers.has_use_filter_edge_ngram()) {
+        writeBool("use_filter_edge_ngram", analyzers.use_filter_edge_ngram());
+    }
+    if (analyzers.has_filter_ngram_min_length()) {
+        Stream << ", filter_ngram_min_length=" << analyzers.filter_ngram_min_length();
+    }
+    if (analyzers.has_filter_ngram_max_length()) {
+        Stream << ", filter_ngram_max_length=" << analyzers.filter_ngram_max_length();
+    }
+    if (analyzers.has_use_filter_length()) {
+        writeBool("use_filter_length", analyzers.use_filter_length());
+    }
+    if (analyzers.has_filter_length_min()) {
+        Stream << ", filter_length_min=" << analyzers.filter_length_min();
+    }
+    if (analyzers.has_filter_length_max()) {
+        Stream << ", filter_length_max=" << analyzers.filter_length_max();
+    }
+    if (analyzers.has_use_filter_snowball()) {
+        writeBool("use_filter_snowball", analyzers.use_filter_snowball());
+    }
+    if (analyzers.has_use_filter_superlemmer()) {
+        writeBool("use_filter_superlemmer", analyzers.use_filter_superlemmer());
+    }
     Stream << ")";
 }
 

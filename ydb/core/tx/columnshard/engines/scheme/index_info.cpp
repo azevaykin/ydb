@@ -1,12 +1,14 @@
 #include "index_info.h"
 
 #include <ydb/core/base/appdata.h>
+#include <ydb/core/base/fulltext.h>
 #include <ydb/core/formats/arrow/arrow_batch_builder.h>
 #include <ydb/core/formats/arrow/serializer/native.h>
 #include <ydb/core/formats/arrow/transformer/dictionary.h>
 #include <ydb/core/protos/config.pb.h>
 #include <ydb/core/tx/columnshard/engines/storage/chunks/column.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/count_min_sketch/meta.h>
+#include <ydb/core/tx/columnshard/engines/storage/indexes/fulltext/counters.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/max/meta.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/min_max/meta.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/portions/meta.h>
@@ -15,6 +17,7 @@
 
 #include <ydb/library/formats/arrow/simple_arrays_cache.h>
 
+#include <util/generic/ylimits.h>
 #include <util/string/join.h>
 
 #define YDB_LOG_THIS_FILE_COMPONENT NKikimrServices::TX_COLUMNSHARD
@@ -525,27 +528,78 @@ NKikimr::TConclusionStatus TIndexInfo::AppendIndex(const THashMap<ui32, std::vec
     auto it = Indexes.find(indexId);
     AFL_VERIFY(it != Indexes.end());
     auto& index = it->second;
+    const TString& indexStorageId = GetIndexStorageId(indexId, specialTier);
+    auto opStorage = operators->GetOperatorVerified(indexStorageId);
+    NIndexes::TIndexBuildContext context;
+    context.TargetTier = specialTier;
+    context.MaxChunkBytes = opStorage->GetBlobSplitSettings().GetMaxBlobSize();
+    context.ConstructionMemoryBudget = Max<ui64>();
+    context.AnalyzerMaxInputBytes = Max<ui64>();
+    context.AnalyzerMaxGeneratedTokens = Max<ui64>();
+    context.AnalyzerMaxRetainedBytes = Max<ui64>();
+    if (index->GetClassName() == TString(NKikimr::NFulltext::LocalFulltextClassName)) {
+        context.ConstructionMemoryBudget = NKikimr::NFulltext::LocalFulltextConstructionMemoryBudget;
+        context.AnalyzerMaxInputBytes = NKikimr::NFulltext::LocalFulltextAnalyzerMaxInputBytes;
+        context.AnalyzerMaxGeneratedTokens = NKikimr::NFulltext::LocalFulltextAnalyzerMaxGeneratedTokens;
+        context.AnalyzerMaxRetainedBytes = NKikimr::NFulltext::LocalFulltextAnalyzerMaxRetainedBytes;
+    }
     TMemoryProfileGuard mpg("IndexConstruction::" + index->GetIndexName());
-    TConclusion<std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>>> indexChunkConclusion =
-        index->BuildIndexOptional(originalData, recordsCount, *this);
+    TConclusion<NIndexes::TIndexBuildOutcome> indexChunkConclusion = index->BuildIndexOptional(originalData, recordsCount, *this, context);
     if (indexChunkConclusion.IsFail()) {
         return indexChunkConclusion;
     }
-    if (indexChunkConclusion->empty()) {
+    const bool fulltext = index->GetClassName() == TString(NKikimr::NFulltext::LocalFulltextClassName);
+    if (indexChunkConclusion->IsSkipped()) {
+        if (fulltext) {
+            NIndexes::NFulltext::TFulltextBuildCounters::OnSkipped();
+        }
+        // The portion stays readable through the text scan. This is not a build failure.
+        YDB_LOG_WARN("",
+            {"event", "index_skipped"},
+            {"index_name", index->GetIndexName()},
+            {"reason", indexChunkConclusion->GetSkipReason()},
+            {"target_tier", context.TargetTier},
+            {"max_chunk_bytes", context.MaxChunkBytes});
         return TConclusionStatus::Success();
     }
-    std::vector<std::shared_ptr<IPortionDataChunk>> chunks(
-        std::make_move_iterator(indexChunkConclusion->begin()), std::make_move_iterator(indexChunkConclusion->end()));
+    std::vector<std::shared_ptr<IPortionDataChunk>> chunks = indexChunkConclusion->DetachChunks();
+    if (chunks.empty()) {
+        return TConclusionStatus::Success();
+    }
+    ui64 builtBytes = 0;
+    for (const auto& chunk : chunks) {
+        builtBytes += chunk->GetPackedSize();
+    }
+    const ui32 builtChunks = chunks.size();
     auto conclusion = ReuseIndexChunks(std::move(chunks), indexId, operators, recordsCount, specialTier, result);
     if (conclusion.IsFail()) {
+        if (fulltext) {
+            NIndexes::NFulltext::TFulltextBuildCounters::OnSkipped();
+        }
         // The index does not fit the target storage. Store the portion without it, like a portion older than
         // the index itself: the data stays correct, only the skip optimization is lost.
         YDB_LOG_WARN("",
             {"event", "index_skipped"},
             {"index_name", index->GetIndexName()},
             {"reason", conclusion.GetErrorMessage()});
+        return TConclusionStatus::Success();
+    }
+    if (fulltext) {
+        NIndexes::NFulltext::TFulltextBuildCounters::OnBuilt(recordsCount, builtChunks, builtBytes);
     }
     return TConclusionStatus::Success();
+}
+
+bool TIndexInfo::NeedsFulltextBuildFrom(const TIndexInfo& source) const {
+    for (const auto& [indexId, meta] : Indexes) {
+        if (meta->GetClassName() != TString(NKikimr::NFulltext::LocalFulltextClassName)) {
+            continue;
+        }
+        if (!source.HasIndexId(indexId)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::shared_ptr<NIndexes::NMax::TIndexMeta> TIndexInfo::GetIndexMetaMax(const ui32 columnId) const {

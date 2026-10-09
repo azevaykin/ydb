@@ -12,7 +12,14 @@ NKikimr::TConclusionStatus TIndexScannerConstructor::ParseProgram(
     const ISnapshotSchema::TPtr schema =
         read.GetTableMetadataAccessor()->GetSnapshotSchemaVerified(context.GetVersionedSchemas(), read.GetSnapshot());
     NCommon::TIndexColumnResolver columnResolver(schema->GetIndexInfo());
-    return TBase::ParseProgram(context, proto.GetOlapProgramType(), proto.GetOlapProgram(), read, columnResolver);
+    auto status = TBase::ParseProgram(context, proto.GetOlapProgramType(), proto.GetOlapProgram(), read, columnResolver);
+    if (status.IsFail()) {
+        return status;
+    }
+    if (read.GetProgram().HasFulltextMatch()) {
+        return TConclusionStatus::Fail("unsupported plan: column fulltext match is not supported by the PLAIN reader");
+    }
+    return TConclusionStatus::Success();
 }
 
 std::vector<TNameTypeInfo> TIndexScannerConstructor::GetPrimaryKeyScheme(const NColumnShard::TColumnShard* self) const {
