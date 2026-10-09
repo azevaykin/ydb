@@ -443,7 +443,8 @@ TVector<ISubOperation::TPtr> CreateDropIndex(TOperationId nextId, const TTxTrans
     if (columnParent) {
         const auto* indexInfo = context.SS->Indexes.FindPtr(indexPath.Base()->PathId);
         if (!indexInfo || !NTableIndex::IsColumnTableCompactFulltext((*indexInfo)->Type)) {
-            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter, NTableIndex::ColumnTableGlobalFulltextCompactOnly)};
+            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter,
+                TString(NTableIndex::ColumnTableGlobalFulltextCompactOnly))};
         }
     }
 

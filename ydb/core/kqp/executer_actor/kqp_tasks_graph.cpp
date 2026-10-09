@@ -2977,7 +2977,8 @@ void TKqpTasksGraph::BuildFullTextScanTasksFromSource(TStageInfo& stageInfo, TQu
         to->MutableColumns()->CopyFrom(from.GetColumns());
     };
     if (fullTextSource.HasDocIdPolicy()) {
-        settings->SetDocIdPolicy(fullTextSource.GetDocIdPolicy());
+        settings->SetDocIdPolicy(static_cast<NKikimrSchemeOp::TFulltextIndexDescription::EDocIdPolicy>(
+            fullTextSource.GetDocIdPolicy()));
     }
     if (fullTextSource.HasBuildGeneration()) {
         settings->SetBuildGeneration(fullTextSource.GetBuildGeneration());
@@ -2989,7 +2990,7 @@ void TKqpTasksGraph::BuildFullTextScanTasksFromSource(TStageInfo& stageInfo, TQu
         settings->SetAnalyzerIdentity(fullTextSource.GetAnalyzerIdentity());
     }
     if (fullTextSource.HasIndexState()) {
-        settings->SetIndexState(fullTextSource.GetIndexState());
+        settings->SetIndexState(static_cast<NKikimrSchemeOp::EIndexState>(fullTextSource.GetIndexState()));
     }
     if (fullTextSource.HasReadyVersion()) {
         *settings->MutableReadyVersion() = fullTextSource.GetReadyVersion();

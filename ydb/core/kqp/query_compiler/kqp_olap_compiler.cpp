@@ -69,6 +69,10 @@ public:
         return columnIt->second;
     }
 
+    const TKikimrTableMetadata& GetTableMeta() const {
+        return TableMeta;
+    }
+
     bool HasPhysicalReadColumn(const std::string& name) const {
         return ReadColumns.contains(name);
     }
@@ -944,7 +948,7 @@ ui64 CompileComparison(const TKqpOlapFilterBinaryOp& comparison, TKqpOlapCompile
 ui64 CompileColumnFulltextMatch(const TKqpOlapFulltextMatch& match, TKqpOlapCompileContext& ctx) {
     const TString indexName(match.IndexName().Value());
     const TIndexDescription* index = nullptr;
-    for (const auto& candidate : ctx.TableMeta.Indexes) {
+    for (const auto& candidate : ctx.GetTableMeta().Indexes) {
         if (candidate.Name == indexName) {
             index = &candidate;
             break;

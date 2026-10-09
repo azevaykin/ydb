@@ -562,9 +562,14 @@ NKikimr::TConclusionStatus TIndexInfo::AppendIndex(const THashMap<ui32, std::vec
             {"max_chunk_bytes", context.MaxChunkBytes});
         return TConclusionStatus::Success();
     }
-    std::vector<std::shared_ptr<IPortionDataChunk>> chunks = indexChunkConclusion->DetachChunks();
-    if (chunks.empty()) {
+    auto indexChunks = indexChunkConclusion->DetachChunks();
+    if (indexChunks.empty()) {
         return TConclusionStatus::Success();
+    }
+    std::vector<std::shared_ptr<IPortionDataChunk>> chunks;
+    chunks.reserve(indexChunks.size());
+    for (auto& chunk : indexChunks) {
+        chunks.emplace_back(std::move(chunk));
     }
     ui64 builtBytes = 0;
     for (const auto& chunk : chunks) {

@@ -25,6 +25,7 @@ struct TEvIndexBuilder {
         EvListResponse,
         EvUploadSampleKResponse,
         EvGetIndexStatsResponse,
+        EvColumnFulltextSeedResponse,
 
         EvEnd
     };
@@ -135,7 +136,6 @@ struct TEvIndexBuilder {
         size_t FieldCount = 0;
         std::shared_ptr<TEqHeightHistogram> Histogram;
     };
-
 
 }; // TEvIndexBuilder
 

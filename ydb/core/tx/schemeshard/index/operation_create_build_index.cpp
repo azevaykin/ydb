@@ -187,10 +187,10 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
     }
     if (columnParent) {
         if (!context.SS->EnableColumnTableGlobalFulltextIndex) {
-            return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed, ColumnTableGlobalFulltextDisabled)};
+            return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed, TString(ColumnTableGlobalFulltextDisabled))};
         }
         if (!IsColumnTableCompactFulltext(GetIndexType(indexDesc))) {
-            return {CreateReject(opId, NKikimrScheme::StatusInvalidParameter, ColumnTableGlobalFulltextCompactOnly)};
+            return {CreateReject(opId, NKikimrScheme::StatusInvalidParameter, TString(ColumnTableGlobalFulltextCompactOnly))};
         }
         if (op.GetIsRebuild()) {
             return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed,
@@ -213,7 +213,7 @@ TVector<ISubOperation::TPtr> CreateBuildIndex(TOperationId opId, const TTxTransa
         // Deletion TTL must not run beside an unadapted C index. Reject until C6's TTL adapter lands.
         if (!columnTtlColumn.empty()) {
             return {CreateReject(opId, NKikimrScheme::StatusPreconditionFailed,
-                ColumnTableGlobalFulltextTtlRejected)};
+                TString(ColumnTableGlobalFulltextTtlRejected))};
         }
         columnShards = ColumnTableShardCount(*columnTable);
         const auto baseColumns = ExtractInfo(columnBaseDesc);

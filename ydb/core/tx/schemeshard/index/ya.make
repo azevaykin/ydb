@@ -34,6 +34,7 @@ SRCS(
     operation_move_index.cpp
     operation_move_table_index.cpp
     operation_prepare_index_validation.cpp
+    column_fulltext_seed_factory.cpp
 )
 
 GENERATE_ENUM_SERIALIZATION(index_build_info.h)

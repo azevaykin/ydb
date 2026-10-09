@@ -1786,7 +1786,8 @@ bool TPath::IsInsideTableIndexPath(bool failOnUnresolved) const {
     }
 
     ++item;
-    if (!(*item)->IsTable()) {
+    // Compact fulltext on STORE=COLUMN places the index under a column table.
+    if (!(*item)->IsTable() && !(*item)->IsColumnTable()) {
         return false;
     }
 

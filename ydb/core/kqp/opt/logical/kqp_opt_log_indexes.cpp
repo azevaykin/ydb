@@ -2551,7 +2551,7 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
         return FailColumnFulltext(ctx, queryExpr.Pos(), "Fulltext query must be a non-null String or Utf8 literal or parameter");
     }
     if (queryIsParameter) {
-        const auto* type = queryExpr.Ref().GetTypeAnn();
+        const auto type = queryExpr.Ref().GetTypeAnn();
         const auto* dataType = type && type->GetKind() == ETypeAnnotationKind::Data ? type->Cast<TDataExprType>() : nullptr;
         if (!dataType || (dataType->GetSlot() != EDataSlot::String && dataType->GetSlot() != EDataSlot::Utf8)) {
             return FailColumnFulltext(ctx, queryExpr.Pos(), "Fulltext query must be a non-null String or Utf8 literal or parameter");

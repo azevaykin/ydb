@@ -19,6 +19,7 @@ SRCS(
 PEERDIR(
     ydb/core/testlib
     ydb/core/kqp
+    ydb/core/kqp/column_fulltext_seed
     ydb/core/kqp/ut/common
     ydb/core/local_indexes/bloom
     yql/essentials/sql/pg_dummy
@@ -26,6 +27,7 @@ PEERDIR(
     ydb/core/tx/columnshard/hooks/testing
     ydb/core/tx/columnshard/test_helper
     ydb/core/tx/columnshard
+    ydb/core/tx/schemeshard/index
     ydb/core/kqp/ut/olap/helpers
     ydb/core/kqp/ut/olap/combinatory
 )

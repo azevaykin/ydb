@@ -14,6 +14,7 @@
 
 #include <ydb/core/base/auth.h>
 #include <ydb/core/base/table_index.h>
+#include <ydb/core/tx/schemeshard/index/column_fulltext_seed.h>
 #include <ydb/core/scheme/scheme_tablecell.h>
 #include <ydb/core/scheme/scheme_types_proto.h>
 #include <ydb/core/tx/datashard/range_ops.h>
@@ -1158,6 +1159,50 @@ THolder<TEvSchemeShard::TEvModifySchemeTransaction> AlterSequencePropose(
 
 using namespace NTabletFlatExecutor;
 
+namespace {
+
+NKikimrKqp::TKqpColumnMetadataProto MakeScanColumn(
+    const TString& name,
+    ui32 id,
+    NScheme::TTypeInfo type,
+    bool notNull)
+{
+    NKikimrKqp::TKqpColumnMetadataProto column;
+    column.SetName(name);
+    column.SetId(id);
+    column.SetTypeId(type.GetTypeId());
+    if (type.GetTypeId() == NScheme::NTypeIds::Pg) {
+        NScheme::ProtoFromTypeInfo(type, {}, *column.MutableTypeInfo());
+    }
+    column.SetNotNull(notNull);
+    return column;
+}
+
+Ydb::Type MakeYdbType(NScheme::TTypeInfo type) {
+    Ydb::Type out;
+    NScheme::ProtoFromTypeInfo(type, out);
+    return out;
+}
+
+TVector<std::pair<TString, Ydb::Type>> TableUploadColumns(const TTableInfo& table) {
+    TVector<std::pair<TString, Ydb::Type>> columns;
+    columns.reserve(table.Columns.size());
+    THashSet<ui32> keyIds(table.KeyColumnIds.begin(), table.KeyColumnIds.end());
+    for (ui32 keyId : table.KeyColumnIds) {
+        const auto& column = table.Columns.at(keyId);
+        columns.emplace_back(column.Name, MakeYdbType(column.PType));
+    }
+    for (const auto& [_, column] : table.Columns) {
+        if (column.IsDropped() || keyIds.contains(column.Id)) {
+            continue;
+        }
+        columns.emplace_back(column.Name, MakeYdbType(column.PType));
+    }
+    return columns;
+}
+
+} // namespace
+
 struct TSchemeShard::TIndexBuilder::TTxProgress: public TSchemeShard::TIndexBuilder::TTxBase {
 private:
     TMap<TTabletId, THolder<IEventBase>> ToTabletSend;
@@ -1944,6 +1989,199 @@ private:
         ToTabletSend.emplace(shardId, std::move(ev));
     }
 
+    void SendColumnFulltextSeedRequest(TShardIdx shardIdx, TIndexBuildInfo& buildInfo) {
+        auto& shardStatus = buildInfo.Shards.at(shardIdx);
+        ++shardStatus.SeqNoRound;
+
+        const auto tabletId = Self->ShardInfos.at(shardIdx).TabletID;
+        const auto parentPath = TPath::Init(buildInfo.TablePathId, Self);
+        const auto columnTable = Self->ColumnTables.GetVerified(buildInfo.TablePathId);
+        TOlapStoreInfo::TPtr store;
+        if (!columnTable->IsStandalone() && columnTable->Description.GetSchema().ColumnsSize() == 0) {
+            store = Self->OlapStores.at(columnTable->GetOlapStorePathIdVerified());
+        }
+        const auto schema = NTableIndex::ReadColumnTableSchema(*columnTable, store.get());
+        const auto baseDesc = NTableIndex::ColumnSchemaToTableDescription(schema);
+
+        THashMap<TString, const NKikimrSchemeOp::TOlapColumnDescription*> schemaColumns;
+        for (const auto& column : schema.GetColumns()) {
+            schemaColumns[TString(column.GetName())] = &column;
+        }
+
+        auto makeType = [&](const TString& name) -> NScheme::TTypeInfo {
+            const auto* column = schemaColumns.FindPtr(name);
+            Y_ENSURE(column && *column);
+            if ((*column)->HasTypeInfo()) {
+                return NScheme::TypeInfoFromProto((*column)->GetTypeId(), (*column)->GetTypeInfo());
+            }
+            return NScheme::TTypeInfo(static_cast<NScheme::TTypeId>((*column)->GetTypeId()));
+        };
+
+        NKqp::TColumnFulltextSeedSettings settings;
+        settings.Owner = Self->SelfId();
+        settings.BuildId = ui64(BuildId);
+        settings.ColumnTabletId = ui64(tabletId);
+        settings.SeqNoGeneration = Self->Generation();
+        settings.SeqNoRound = shardStatus.SeqNoRound;
+        settings.Database = CanonizePath(Self->RootPathElements);
+        settings.ParentTableId = TTableId(buildInfo.TablePathId, columnTable->AlterVersion);
+        settings.ParentTablePath = parentPath.PathString();
+        settings.SnapshotStep = ui64(buildInfo.SnapshotStep);
+        settings.SnapshotTxId = ui64(buildInfo.SnapshotTxId);
+        settings.LastKeyAck = shardStatus.LastKeyAck;
+        settings.MaxBatchRows = Max<ui32>(1, buildInfo.ScanSettings.GetMaxBatchRows());
+
+        for (const auto& keyName : baseDesc.GetKeyColumnNames()) {
+            const auto* column = schemaColumns.at(keyName);
+            settings.ScanColumns.push_back(MakeScanColumn(
+                keyName, column->GetId(), makeType(keyName), column->GetNotNull()));
+        }
+        settings.KeyColumnCount = settings.ScanColumns.size();
+
+        THashSet<TString> scanNames;
+        for (const auto& column : settings.ScanColumns) {
+            scanNames.insert(column.GetName());
+        }
+        auto addScanColumn = [&](const TString& name) {
+            if (!name || scanNames.contains(name)) {
+                return;
+            }
+            const auto* column = schemaColumns.at(name);
+            settings.ScanColumns.push_back(MakeScanColumn(
+                name, column->GetId(), makeType(name), column->GetNotNull()));
+            scanNames.insert(name);
+        };
+
+        const auto* fulltextDesc = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(
+            &buildInfo.SpecializedIndexDescription);
+        Y_ENSURE(fulltextDesc);
+        Y_ENSURE(!buildInfo.IndexColumns.empty());
+        const TString textColumn = buildInfo.IndexColumns.back();
+        addScanColumn(textColumn);
+        for (size_t i = 0; i + 1 < buildInfo.IndexColumns.size(); ++i) {
+            addScanColumn(buildInfo.IndexColumns[i]);
+        }
+        for (const auto& covered : buildInfo.DataColumns) {
+            addScanColumn(covered);
+        }
+
+        auto postingPath = GetBuildPath(Self, buildInfo, NTableIndex::ImplTable);
+        auto statePath = GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::StateTable);
+        settings.PostingTablePath = postingPath.PathString();
+        settings.StateTablePath = statePath.PathString();
+        settings.GenSequencePath = postingPath.PathString() + "/" + NTableIndex::NFulltext::GenSequence;
+
+        const bool relevance = buildInfo.IsBuildFulltextRelevance();
+        const bool synthetic = fulltextDesc->GetDocIdPolicy()
+            == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+
+        settings.PostingId = postingPath->PathId;
+        settings.StateId = statePath->PathId;
+        settings.Relevance = relevance;
+        settings.Synthetic = synthetic;
+        settings.BuildGeneration = fulltextDesc->GetBuildGeneration() == 0
+            ? 1
+            : fulltextDesc->GetBuildGeneration();
+        settings.Settings = fulltextDesc->GetSettings();
+        settings.TextColumn = textColumn;
+        settings.TextType = makeType(textColumn);
+        settings.TextNotNull = schemaColumns.at(textColumn)->GetNotNull();
+        for (size_t i = 0; i + 1 < buildInfo.IndexColumns.size(); ++i) {
+            settings.PrefixColumns.push_back(buildInfo.IndexColumns[i]);
+        }
+        settings.CoveredColumns = buildInfo.DataColumns;
+
+        const auto& stateTable = *Self->Tables.at(statePath->PathId);
+        settings.StateKeyColumnCount = stateTable.KeyColumnIds.size();
+        settings.StateUploadColumns = TableUploadColumns(stateTable);
+        auto toProto = [](const TTableInfo::TColumn& column) {
+            NKikimrKqp::TKqpColumnMetadataProto proto;
+            proto.SetName(column.Name);
+            proto.SetId(column.Id);
+            proto.SetTypeId(column.PType.GetTypeId());
+            if (column.PType.GetTypeId() == NScheme::NTypeIds::Pg) {
+                NScheme::ProtoFromTypeInfo(column.PType, {}, *proto.MutableTypeInfo());
+            }
+            proto.SetNotNull(column.NotNull);
+            return proto;
+        };
+        for (ui32 keyId : stateTable.KeyColumnIds) {
+            settings.StateColumns.push_back(toProto(stateTable.Columns.at(keyId)));
+        }
+        {
+            THashSet<ui32> stateKeyIds(stateTable.KeyColumnIds.begin(), stateTable.KeyColumnIds.end());
+            for (const auto& [_, column] : stateTable.Columns) {
+                if (column.IsDropped() || stateKeyIds.contains(column.Id)) {
+                    continue;
+                }
+                settings.StateColumns.push_back(toProto(column));
+                settings.StateValueNames.push_back(column.Name);
+            }
+        }
+        for (const auto& [_, column] : stateTable.Columns) {
+            if (column.Name == NTableIndex::NFulltext::DocIdColumn) {
+                settings.DocIdType = column.PType;
+                break;
+            }
+        }
+
+        const auto& postingTable = *Self->Tables.at(postingPath->PathId);
+        settings.PostingKeyColumnCount = postingTable.KeyColumnIds.size();
+        settings.PostingColumns = TableUploadColumns(postingTable);
+
+        if (relevance) {
+            auto docsPath = GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::DocsTable);
+            auto statsPath = GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::StatsTable);
+            settings.DocsTablePath = docsPath.PathString();
+            settings.StatsTablePath = statsPath.PathString();
+            settings.DocsId = docsPath->PathId;
+            settings.StatsId = statsPath->PathId;
+            const auto& docsTable = *Self->Tables.at(docsPath->PathId);
+            const auto& statsTable = *Self->Tables.at(statsPath->PathId);
+            settings.DocsKeyColumnCount = docsTable.KeyColumnIds.size();
+            settings.StatsKeyColumnCount = statsTable.KeyColumnIds.size();
+            settings.DocsColumns = TableUploadColumns(docsTable);
+            settings.StatsColumns = TableUploadColumns(statsTable);
+        }
+        if (synthetic) {
+            auto mapPath = GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::DocIdMapTable);
+            settings.MapTablePath = mapPath.PathString();
+            settings.DocIdSequencePath = mapPath.PathString() + "/" + NTableIndex::NFulltext::DocIdSequence;
+            settings.MapId = mapPath->PathId;
+            const auto& mapTable = *Self->Tables.at(mapPath->PathId);
+            settings.MapKeyColumnCount = mapTable.KeyColumnIds.size();
+            settings.MapUploadColumns = TableUploadColumns(mapTable);
+            for (const auto& [_, column] : mapTable.Columns) {
+                if (!column.IsDropped()) {
+                    settings.MapColumns.push_back(toProto(column));
+                }
+            }
+        }
+
+        YDB_LOG_NOTICE(LogPrefix << "TTxBuildProgress: ColumnFulltextSeed",
+            {"buildId", BuildId},
+            {"tabletId", tabletId},
+            {"seqNo", shardStatus.SeqNoRound},
+            {"lastKeyAck", bool(settings.LastKeyAck)},
+        );
+
+        auto* actor = NKqp::CreateColumnFulltextSeedActor(std::move(settings));
+        if (!actor) {
+            YDB_LOG_ERROR(LogPrefix << "Column fulltext seed factory is not registered");
+            auto response = MakeHolder<NKqp::TEvColumnFulltextSeed::TEvResponse>();
+            response->BuildId = ui64(BuildId);
+            response->TabletId = ui64(tabletId);
+            response->RequestSeqNoGeneration = Self->Generation();
+            response->RequestSeqNoRound = shardStatus.SeqNoRound;
+            response->Status = NKikimrIndexBuilder::EBuildStatus::BUILD_ERROR;
+            response->Issues = "Column fulltext seed factory is not registered";
+            TActivationContext::AsActorContext().Send(Self->SelfId(), response.Release());
+            return;
+        }
+        const auto actorId = TActivationContext::AsActorContext().Register(actor);
+        Self->ColumnFulltextSeedActors[std::make_pair(ui64(BuildId), shardIdx)] = actorId;
+    }
+
     NKikimrTxDataShard::EFulltextIndexType ConvertFulltextType(NKikimrSchemeOp::EIndexType indexType) {
         switch (indexType) {
         case NKikimrSchemeOp::EIndexTypeGlobalFulltextPlain:
@@ -2174,6 +2412,14 @@ private:
 
         ToTabletSend.clear();
         Self->IndexBuildPipes.CloseAll(BuildId, ctx);
+        for (auto it = Self->ColumnFulltextSeedActors.begin(); it != Self->ColumnFulltextSeedActors.end();) {
+            if (it->first.first == ui64(BuildId)) {
+                ctx.Send(it->second, new TEvents::TEvPoison);
+                Self->ColumnFulltextSeedActors.erase(it++);
+            } else {
+                ++it;
+            }
+        }
     }
 
     template<typename Send>
@@ -3195,11 +3441,10 @@ private:
         }
 
         for (const auto& shardIdx : shards) {
-            // DONE: empty conditional seed for shards with no pre-fence rows.
-            // A later ColumnShard seed scanner will initialize keys that still
-            // lack forward state before Ready is published for non-empty tables.
+            // Queue each column shard for the fence-snapshot seed scan. Status stays
+            // INVALID so AddAllShards puts it in ToUploadShards (not DoneShards).
+            // Empty LastKeyAck means the scan starts from the beginning of the shard.
             TIndexBuildShardStatus status{TSerializedTableRange(), ""};
-            status.Status = NKikimrIndexBuilder::EBuildStatus::DONE;
             auto [it, emplaced] = buildInfo.Shards.emplace(shardIdx, status);
             Y_ENSURE(emplaced);
             Self->PersistBuildIndexShardStatusInitiate(db, BuildId, shardIdx, it->second);
@@ -3207,10 +3452,9 @@ private:
         return true;
     }
 
-    // Column-table compact fulltext: after the WriteOnly fence, initialize shards
-    // and publish Ready. Pre-existing rows that still lack forward state are seeded
-    // by the follow-up ColumnShard conditional scanner; empty tables become Ready
-    // immediately so post-fence C2 maintenance covers all subsequent writes.
+    // Column-table compact fulltext: after the WriteOnly fence, seed each ColumnShard
+    // at SnapshotStep/SnapshotTxId so pre-fence rows get forward state before Ready.
+    // Empty tables finish as soon as every shard reports an empty scan.
     bool FillColumnTableFulltext(TTransactionContext& txc, TIndexBuildInfo& buildInfo) {
         YDB_LOG_DEBUG(LogPrefix << "FillColumnTableFulltext Start",
             {"buildId", BuildId},
@@ -3224,16 +3468,16 @@ private:
         if (NoShardsAdded(buildInfo)) {
             AddAllShards(buildInfo);
         }
-        const bool done = buildInfo.DoneShards.size() == buildInfo.Shards.size()
-            && buildInfo.InProgressShards.empty()
-            && buildInfo.ToUploadShards.empty();
-        if (done) {
+        const bool idle = SendToShards(buildInfo, [&](TShardIdx shardIdx) {
+            SendColumnFulltextSeedRequest(shardIdx, buildInfo);
+        }) && buildInfo.DoneShards.size() == buildInfo.Shards.size();
+        if (idle) {
             YDB_LOG_DEBUG(LogPrefix << "FillColumnTableFulltext Done",
                 {"buildId", BuildId},
                 {"shards", buildInfo.Shards.size()},
             );
         }
-        return done;
+        return idle;
     }
 
     bool FillIndex(TTransactionContext& txc, TIndexBuildInfo& buildInfo) {
@@ -5457,6 +5701,101 @@ ITransaction* TSchemeShard::CreateTxReply(TEvDataShard::TEvBuildFulltextDictResp
 
 ITransaction* TSchemeShard::CreateTxReply(TEvIndexBuilder::TEvGetIndexStatsResponse::TPtr& response) {
     return new TIndexBuilder::TTxReplyStatistics(this, response);
+}
+
+struct TSchemeShard::TIndexBuilder::TTxReplyColumnFulltextSeed: public TSchemeShard::TIndexBuilder::TTxReply {
+    NKqp::TEvColumnFulltextSeed::TEvResponse::TPtr Response;
+
+    explicit TTxReplyColumnFulltextSeed(TSelf* self, NKqp::TEvColumnFulltextSeed::TEvResponse::TPtr& response)
+        : TTxReply(self, TIndexBuildId(response->Get()->BuildId))
+        , Response(response)
+    {
+    }
+
+    bool DoExecute(TTransactionContext& txc, const TActorContext& ctx) override {
+        auto* record = Response->Get();
+        TTabletId shardId = TTabletId(record->TabletId);
+        TShardIdx shardIdx = Self->GetShardIdx(shardId);
+
+        const auto* buildInfoPtr = Self->IndexBuilds.FindPtr(BuildId);
+        if (!buildInfoPtr) {
+            return true;
+        }
+        auto& buildInfo = *buildInfoPtr->get();
+        if (!buildInfo.Shards.contains(shardIdx) || buildInfo.State != TIndexBuildInfo::EState::Filling) {
+            return true;
+        }
+        if (!buildInfo.InProgressShards.contains(shardIdx)) {
+            return true;
+        }
+
+        TIndexBuildShardStatus& shardStatus = buildInfo.Shards.at(shardIdx);
+        auto actualSeqNo = std::pair<ui64, ui64>(Self->Generation(), shardStatus.SeqNoRound);
+        auto recordSeqNo = std::pair<ui64, ui64>(record->RequestSeqNoGeneration, record->RequestSeqNoRound);
+        if (actualSeqNo != recordSeqNo) {
+            Y_ENSURE(actualSeqNo > recordSeqNo);
+            return true;
+        }
+
+        NIceDb::TNiceDb db(txc.DB);
+        shardStatus.Processed += record->MeteringStats;
+        buildInfo.Processed += record->MeteringStats;
+        shardStatus.DebugMessage = record->Issues;
+        shardStatus.Status = record->Status;
+        // Column parents are not in Tables; persist LastKeyAck without row-table monotonicity checks.
+        if (!record->LastKeyAck.empty()) {
+            shardStatus.LastKeyAck = record->LastKeyAck;
+        }
+
+        switch (shardStatus.Status) {
+        case NKikimrIndexBuilder::EBuildStatus::IN_PROGRESS:
+        case NKikimrIndexBuilder::EBuildStatus::ACCEPTED: {
+            Self->PersistBuildIndexShardStatus(db, BuildId, shardIdx, shardStatus);
+            return true;
+        }
+        case NKikimrIndexBuilder::EBuildStatus::DONE: {
+            bool erased = buildInfo.InProgressShards.erase(shardIdx);
+            Y_ENSURE(erased);
+            buildInfo.DoneShards.emplace_back(shardIdx);
+            if (record->Issues) {
+                Self->PersistBuildIndexAddIssue(db, buildInfo, record->Issues);
+            }
+            Self->PersistBuildIndexShardStatus(db, BuildId, shardIdx, shardStatus);
+            Self->ColumnFulltextSeedActors.erase(std::make_pair(ui64(BuildId), shardIdx));
+            Progress(BuildId);
+            return true;
+        }
+        case NKikimrIndexBuilder::EBuildStatus::ABORTED: {
+            bool erased = buildInfo.InProgressShards.erase(shardIdx);
+            Y_ENSURE(erased);
+            buildInfo.ToUploadShards.emplace_front(shardIdx);
+            Self->PersistBuildIndexShardStatus(db, BuildId, shardIdx, shardStatus);
+            Self->ColumnFulltextSeedActors.erase(std::make_pair(ui64(BuildId), shardIdx));
+            Progress(BuildId);
+            return true;
+        }
+        case NKikimrIndexBuilder::EBuildStatus::BUILD_ERROR:
+        case NKikimrIndexBuilder::EBuildStatus::BAD_REQUEST: {
+            Self->PersistBuildIndexAddIssue(db, buildInfo, TStringBuilder()
+                << "Column fulltext seed shard reported " << shardStatus.Status << " " << shardStatus.DebugMessage
+                << ", shardId: " << shardId
+                << ", shardIdx: " << shardIdx);
+            Self->PersistBuildIndexShardStatus(db, BuildId, shardIdx, shardStatus);
+            Self->ColumnFulltextSeedActors.erase(std::make_pair(ui64(BuildId), shardIdx));
+            ChangeState(buildInfo.Id, TIndexBuildInfo::EState::Rejection_Applying);
+            Progress(BuildId);
+            return true;
+        }
+        case NKikimrIndexBuilder::EBuildStatus::INVALID:
+            Y_ENSURE(false, "Unreachable");
+        }
+        Y_UNUSED(ctx);
+        return true;
+    }
+};
+
+ITransaction* TSchemeShard::CreateTxReply(NKqp::TEvColumnFulltextSeed::TEvResponse::TPtr& response) {
+    return new TIndexBuilder::TTxReplyColumnFulltextSeed(this, response);
 }
 
 ITransaction* TSchemeShard::CreatePipeRetry(TIndexBuildId indexBuildId, TTabletId tabletId) {

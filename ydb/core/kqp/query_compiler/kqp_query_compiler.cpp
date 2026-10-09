@@ -1514,7 +1514,7 @@ private:
                     fullTextProto.SetBuildGeneration(columnFulltext->GetBuildGeneration());
                     fullTextProto.SetAnalyzerRevision(columnFulltext->GetAnalyzerRevision());
                     fullTextProto.SetAnalyzerIdentity(columnFulltext->GetAnalyzerIdentity());
-                    fullTextProto.SetIndexState(static_cast<NKikimrSchemeOp::EIndexState>(static_cast<ui32>(index->State)));
+                    fullTextProto.SetIndexState(static_cast<i32>(static_cast<ui32>(index->State)));
                     if (columnFulltext->HasReadyVersion()) {
                         *fullTextProto.MutableReadyVersion() = columnFulltext->GetReadyVersion();
                     }

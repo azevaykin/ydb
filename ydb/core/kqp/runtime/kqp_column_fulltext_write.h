@@ -114,6 +114,17 @@ public:
 
     TString Build(std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc, std::vector<TWriteBatch>& out, TStats& stats);
 
+    // Fence-snapshot seed: scanned rows are the final image. Indexes must already
+    // be added with SeedOnly=true and forward state filled via SetStateRow.
+    // Initialized live rows and tombstones produce no writes. Support tables only.
+    // After PrepareSeed, call Sequences()/AssignSequences() then BuildSeedBatches.
+    TString PrepareSeed(const std::vector<TInputRow>& rows);
+
+    TString BuildSeedBatches(
+        std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc,
+        std::vector<TWriteBatch>& out,
+        TStats& stats);
+
 private:
     struct TResolved {
         bool Found = false;

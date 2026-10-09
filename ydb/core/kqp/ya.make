@@ -1,6 +1,7 @@
 LIBRARY()
 
 SRCS(
+    column_fulltext_seed_link.cpp
 )
 
 PEERDIR(
@@ -17,6 +18,7 @@ PEERDIR(
     ydb/core/formats
     ydb/core/grpc_services/local_rpc
     ydb/core/kqp/common
+    ydb/core/kqp/column_fulltext_seed
     ydb/core/kqp/compile_service
     ydb/core/kqp/compute_actor
     ydb/core/kqp/counters
@@ -56,6 +58,7 @@ END()
 
 RECURSE(
     common
+    column_fulltext_seed
     compile_service
     compute_actor
     counters

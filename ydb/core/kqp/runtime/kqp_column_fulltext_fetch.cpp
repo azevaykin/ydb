@@ -335,11 +335,16 @@ void TColumnShardPkFetch::HandleScanData(TEvKqpCompute::TEvScanData::TPtr& ev) {
         for (const auto& batch : NArrow::SliceToRecordBatches(ev->Get()->ArrowBatch)) {
             auto renamed = arrow::RecordBatch::Make(renamedSchema, batch->num_rows(), batch->columns());
             struct TCopyRows : NArrow::IRowWriter {
+                explicit TCopyRows(std::function<void(TConstArrayRef<TCell>)> consume)
+                    : Consume(std::move(consume))
+                {
+                }
+
                 std::function<void(TConstArrayRef<TCell>)> Consume;
                 void AddRow(const TConstArrayRef<TCell>& cells) override {
                     Consume(cells);
                 }
-            } writer{consume};
+            } writer(consume);
             NArrow::TArrowToYdbConverter converter(schema, writer, false, false);
             TString error;
             if (!converter.Process(*renamed, error)) {

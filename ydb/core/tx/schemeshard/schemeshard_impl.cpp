@@ -6230,6 +6230,7 @@ void TSchemeShard::StateWork(STFUNC_SIG) {
         HFuncTraced(TEvDataShard::TEvBuildFulltextIndexResponse, Handle);
         HFuncTraced(TEvDataShard::TEvBuildFulltextDictResponse, Handle);
         HFuncTraced(TEvIndexBuilder::TEvGetIndexStatsResponse, Handle);
+        HFuncTraced(NKqp::TEvColumnFulltextSeed::TEvResponse, Handle);
         // } // NIndexBuilder
 
         // namespace NForcedCompaction {

@@ -41,6 +41,7 @@
 #include <ydb/core/protos/workload_manager_config.pb.h>
 #include <ydb/core/resource_pools/resource_pool_settings.h>
 #include <ydb/core/sys_view/common/registry.h>
+#include <ydb/core/tx/schemeshard/index/column_fulltext_seed.h>
 #include <ydb/core/tx/schemeshard/schemeshard.h>
 #include <ydb/core/ydb_convert/ydb_convert.h>
 #include <ydb/library/aclib/user_context.h>
@@ -2541,6 +2542,7 @@ IActor* CreateKqpProxyService(const NKikimrConfig::TLogConfig& logConfig,
     std::shared_ptr<NYql::NDq::IS3ActorsFactory> s3ActorsFactory
     )
 {
+    ForceLinkColumnFulltextSeed();
     return new TKqpProxyService(logConfig, tableServiceConfig, queryServiceConfig, tliConfig, std::move(settings),
         std::move(queryReplayFactory), std::move(kqpProxySharedResources), std::move(federatedQuerySetupFactory), std::move(s3ActorsFactory));
 }

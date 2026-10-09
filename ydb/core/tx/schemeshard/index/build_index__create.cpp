@@ -105,13 +105,13 @@ public:
                 || (settings.index().type_case() != Ydb::Table::TableIndex::kGlobalFulltextPlainIndex
                     && settings.index().type_case() != Ydb::Table::TableIndex::kGlobalFulltextRelevanceIndex))
             {
-                return Reply(Ydb::StatusIds::BAD_REQUEST, NTableIndex::ColumnTableGlobalFulltextCompactOnly);
+                return Reply(Ydb::StatusIds::BAD_REQUEST, TString(NTableIndex::ColumnTableGlobalFulltextCompactOnly));
             }
             if (!Self->EnableColumnTableGlobalFulltextIndex) {
-                return Reply(Ydb::StatusIds::PRECONDITION_FAILED, NTableIndex::ColumnTableGlobalFulltextDisabled);
+                return Reply(Ydb::StatusIds::PRECONDITION_FAILED, TString(NTableIndex::ColumnTableGlobalFulltextDisabled));
             }
             if (!Self->EnableCompactFulltextIndex) {
-                return Reply(Ydb::StatusIds::PRECONDITION_FAILED, NTableIndex::ColumnTableGlobalFulltextCompactOnly);
+                return Reply(Ydb::StatusIds::PRECONDITION_FAILED, TString(NTableIndex::ColumnTableGlobalFulltextCompactOnly));
             }
             if (settings.is_rebuild()) {
                 return Reply(Ydb::StatusIds::PRECONDITION_FAILED,

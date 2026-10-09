@@ -109,7 +109,7 @@ TVector<ISubOperation::TPtr> ApplyBuildIndex(TOperationId nextId, const TTxTrans
         const auto* indexInfoPtr = context.SS->Indexes.FindPtr(index.Base()->PathId);
         if (!indexInfoPtr || !NTableIndex::IsColumnTableCompactFulltext((*indexInfoPtr)->Type)) {
             return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter,
-                NTableIndex::ColumnTableGlobalFulltextCompactOnly)};
+                TString(NTableIndex::ColumnTableGlobalFulltextCompactOnly))};
         }
         TVector<ISubOperation::TPtr> result;
         auto tableIndexAltering = TransactionTemplate(table.PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpAlterTableIndex);
@@ -255,7 +255,8 @@ TVector<ISubOperation::TPtr> CancelBuildIndex(TOperationId nextId, const TTxTran
         }
         const auto* indexInfo = context.SS->Indexes.FindPtr(index.Base()->PathId);
         if (!indexInfo || !NTableIndex::IsColumnTableCompactFulltext((*indexInfo)->Type)) {
-            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter, NTableIndex::ColumnTableGlobalFulltextCompactOnly)};
+            return {CreateReject(nextId, NKikimrScheme::StatusInvalidParameter,
+                TString(NTableIndex::ColumnTableGlobalFulltextCompactOnly))};
         }
         TVector<ISubOperation::TPtr> result;
         auto mainTableIndexDropping = TransactionTemplate(table.Parent().PathString(), NKikimrSchemeOp::EOperationType::ESchemeOpDropTableIndexAtMainTable);

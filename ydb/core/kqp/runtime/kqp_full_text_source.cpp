@@ -113,9 +113,6 @@ constexpr double B_FACTOR_DEFAULT = 0.75;
 // Explicit K1/B at or below this value leave the defaults above in place.
 constexpr double EPSILON = 1e-6;
 
-// Column-table BM25 keeps every matched candidate until df is known. Past this
-// budget the query fails instead of dropping candidates.
-constexpr i64 ColumnFulltextCandidateMemoryBudget = 64ll * 1024 * 1024;
 constexpr size_t ColumnFetchQueueLimit = 256;
 constexpr size_t ColumnFetchBatchKeys = 128;
 
@@ -602,7 +599,9 @@ public:
                 continue;
             }
 
-            if (cellIndex == 0 && !queryCtx.GetUseRowIdAsDocId()) {
+            // Native integer doc ids equal the primary key. After synthetic or
+            // __ydb_row_id resolution, RowCells hold the typed primary key.
+            if (cellIndex == 0 && !queryCtx.GetUseRowIdAsDocId() && !PkResolved) {
                 rowItems[i] = NMiniKQL::GetCellValue(TCell::Make(DocumentNumId), cellType);
                 computeBytes += NMiniKQL::GetUnboxedValueSize(rowItems[i], cellType).AllocatedBytes;
                 continue;
@@ -2608,7 +2607,6 @@ private:
     std::deque<TDocInfoPtr> ColumnFetchPending;
     absl::flat_hash_map<TString, TDocInfoPtr> FetchByPk;
     absl::flat_hash_map<ui64, std::vector<TDocInfoPtr>> DocIdMapItems;
-    i64 CandidateMemory = 0;
     bool Failed = false;
     TReadLockInfo LockInfo;
 
@@ -2830,7 +2828,7 @@ private:
     }
 
     // Shared implementation for the downstream stages of FetchDocumentDetails
-    // (row-id resolution, covered check, main-table reads).
+    // (row-id resolution, covered check, main-table / column-table reads).
     void FetchDocumentDetailsImpl(std::vector<TDocInfoPtr>& docInfos) {
         // __ydb_row_id mode: resolve doc_id (__ydb_row_id) -> primary key via the unique
         // index before doing main-table reads.  Skipped once docs are resolved
@@ -2851,12 +2849,32 @@ private:
             return;
         }
 
+        // Column-table synthetic ids: resolve via the reverse map before PK fetch.
+        if (IsSyntheticDocId() && !docInfos.empty() && !docInfos.front()->HasPkResolved()) {
+            EnqueueDocIdMapResolve(docInfos);
+            return;
+        }
+
         if (!docInfos.empty() && docInfos.back()->IsCovered(MainTableCovered)) {
             for(auto& doc: docInfos) {
                 ResultQueue.emplace_back(std::move(doc));
             }
             docInfos.clear();
             NotifyCA();
+            return;
+        }
+
+        if (IsColumnTableFulltext()) {
+            for (auto& doc : docInfos) {
+                ColumnFetchPending.emplace_back(std::move(doc));
+            }
+            docInfos.clear();
+            PumpColumnFetch();
+            if (ReadsState.Empty() && ColumnFetchPending.empty() && FetchByPk.empty()
+                && (!ColumnFetch || ColumnFetch->Idle()))
+            {
+                NotifyCA();
+            }
             return;
         }
 
@@ -2986,7 +3004,11 @@ private:
 
         auto request = std::make_unique<NSchemeCache::TSchemeCacheRequest>();
         request->DatabaseName = Database;
-        MainTableReader->AddResolvePartitioningRequest(request);
+        // Column parents are not DataShard-partitioned; PK rows are fetched via
+        // TColumnShardPkFetch after index matching.
+        if (!IsColumnTableFulltext()) {
+            MainTableReader->AddResolvePartitioningRequest(request);
+        }
         IndexTableReader->AddResolvePartitioningRequest(request);
         if (Settings->GetIndexType() == NKqpProto::EKqpFullTextIndexType::EKqpFullTextRelevance ||
             Settings->GetIndexType() == NKqpProto::EKqpFullTextIndexType::EKqpFullTextCompactRelevance) {
@@ -2999,6 +3021,9 @@ private:
         }
         if (UniqueIndexReader) {
             UniqueIndexReader->AddResolvePartitioningRequest(request);
+        }
+        if (DocIdMapReader) {
+            DocIdMapReader->AddResolvePartitioningRequest(request);
         }
 
         YQL_ENSURE(request->ResultSet.size() >= 1, "Expected at least one table to resolve partitioning");
@@ -3307,11 +3332,52 @@ public:
         switch (ev->GetTypeRewrite()) {
             hFunc(TEvDataShard::TEvReadResult, HandleReadResult);
             hFunc(TEvTxProxySchemeCache::TEvResolveKeySetResult, HandleResolve);
+            hFunc(TEvTxProxySchemeCache::TEvNavigateKeySetResult, HandleColumnNavigate);
+            hFunc(TEvKqpCompute::TEvScanInitActor, HandleColumnScanInit);
+            hFunc(TEvKqpCompute::TEvScanData, HandleColumnScanData);
+            hFunc(TEvKqpCompute::TEvScanError, HandleColumnScanError);
+            hFunc(TEvents::TEvWakeup, HandleColumnWakeup);
             hFunc(TEvPipeCache::TEvDeliveryProblem, HandleError);
             hFunc(TEvPrivate::TEvRetryRead, HandleRetryRead);
             hFunc(TEvPrivate::TEvRetrySingleRead, HandleRetrySingleRead);
             IgnoreFunc(TEvInterconnect::TEvNodeConnected);
             IgnoreFunc(TEvTxProxySchemeCache::TEvInvalidateTableResult);
+        }
+    }
+
+    void HandleColumnNavigate(TEvTxProxySchemeCache::TEvNavigateKeySetResult::TPtr& ev) {
+        if (ColumnFetch) {
+            ColumnFetch->HandleNavigate(ev);
+            PumpColumnFetch();
+        }
+    }
+
+    void HandleColumnScanInit(TEvKqpCompute::TEvScanInitActor::TPtr& ev) {
+        if (ColumnFetch) {
+            ColumnFetch->HandleScanInit(ev);
+        }
+    }
+
+    void HandleColumnScanData(TEvKqpCompute::TEvScanData::TPtr& ev) {
+        if (ColumnFetch) {
+            ColumnFetch->HandleScanData(ev);
+            PumpColumnFetch();
+            NotifyCA();
+        }
+    }
+
+    void HandleColumnScanError(TEvKqpCompute::TEvScanError::TPtr& ev) {
+        if (ColumnFetch) {
+            ColumnFetch->HandleScanError(ev);
+            PumpColumnFetch();
+            NotifyCA();
+        }
+    }
+
+    void HandleColumnWakeup(TEvents::TEvWakeup::TPtr&) {
+        if (ColumnFetch) {
+            ColumnFetch->RetryScan(0);
+            PumpColumnFetch();
         }
     }
 
@@ -3391,6 +3457,15 @@ public:
                 EnqueueRowIdResolve(docs);
                 break;
             }
+            case EReadKind_DocIdMap: {
+                auto it = DocIdMapItems.find(readId);
+                YQL_ENSURE(it != DocIdMapItems.end());
+                std::vector<TDocInfoPtr> docs = std::move(it->second);
+                DocIdMapItems.erase(it);
+                ReadsState.RemoveRead(readId);
+                EnqueueDocIdMapResolve(docs);
+                break;
+            }
         }
     }
 
@@ -3444,6 +3519,10 @@ public:
             {"tablet", ev->Get()->TabletId});
 
         ui64 shardId = ev->Get()->TabletId;
+        if (ColumnFetch && ColumnFetch->HandleDeliveryProblem(shardId)) {
+            PumpColumnFetch();
+            return;
+        }
         ReadsState.UntrackPipe(shardId);
 
         Counters->IteratorDeliveryProblems->Inc();
@@ -3473,27 +3552,35 @@ public:
         }
 
         auto& resultSet = ev->Get()->Request->ResultSet;
-        size_t expectedCount = 2;
-        YQL_ENSURE(resultSet.size() >= expectedCount, "Expected at least " << expectedCount << " tables for fulltext index");
-        MainTableReader->SetPartitionInfo(resultSet[0].KeyDescription);
-        IndexTableReader->SetPartitionInfo(resultSet[1].KeyDescription);
+        size_t idx = 0;
+        size_t expectedCount = IsColumnTableFulltext() ? 1 : 2;
+        expectedCount += (UniqueIndexReader ? 1 : 0) + (DocIdMapReader ? 1 : 0);
         if (Settings->GetIndexType() == NKqpProto::EKqpFullTextIndexType::EKqpFullTextRelevance ||
             Settings->GetIndexType() == NKqpProto::EKqpFullTextIndexType::EKqpFullTextCompactRelevance) {
             expectedCount += (DocsTableReader ? 1 : 0) + (StatsTableReader ? 1 : 0);
-            YQL_ENSURE(resultSet.size() >= expectedCount, "Expected at least " << expectedCount << " tables for fulltext_relevance index");
+        }
+        YQL_ENSURE(resultSet.size() == expectedCount, "Expected " << expectedCount << " tables for fulltext index");
+
+        if (!IsColumnTableFulltext()) {
+            MainTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
+        }
+        IndexTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
+        if (Settings->GetIndexType() == NKqpProto::EKqpFullTextIndexType::EKqpFullTextRelevance ||
+            Settings->GetIndexType() == NKqpProto::EKqpFullTextIndexType::EKqpFullTextCompactRelevance) {
             if (DocsTableReader) {
-                DocsTableReader->SetPartitionInfo(resultSet[expectedCount-2].KeyDescription);
+                DocsTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
             }
             if (StatsTableReader) {
-                StatsTableReader->SetPartitionInfo(resultSet[expectedCount-1].KeyDescription);
+                StatsTableReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
             }
         }
         if (UniqueIndexReader) {
-            expectedCount++;
-            YQL_ENSURE(resultSet.size() >= expectedCount, "Expected at least " << expectedCount << " tables for fulltext index with surrogate key");
-            UniqueIndexReader->SetPartitionInfo(resultSet[expectedCount-1].KeyDescription);
+            UniqueIndexReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
         }
-        YQL_ENSURE(resultSet.size() == expectedCount, "Expected " << expectedCount << " tables for fulltext index");
+        if (DocIdMapReader) {
+            DocIdMapReader->SetPartitionInfo(resultSet[idx++].KeyDescription);
+        }
+        YQL_ENSURE(idx == expectedCount);
 
         if (ExtractAndTokenizeExpression()) {
             if (StatsTableReader) {
@@ -3812,6 +3899,7 @@ public:
             case EReadKind_Document:      return "main";
             case EReadKind_TotalStats:    return "stats";
             case EReadKind_RowIdResolve:  return "rowid_unique";
+            case EReadKind_DocIdMap:      return "docid_map";
         }
     }
 
@@ -3828,6 +3916,8 @@ public:
                 return StatsTableReader ? StatsTableReader->GetTablePath() : TString();
             case EReadKind_RowIdResolve:
                 return UniqueIndexReader ? UniqueIndexReader->GetTablePath() : TString();
+            case EReadKind_DocIdMap:
+                return DocIdMapReader ? DocIdMapReader->GetTablePath() : TString();
         }
     }
 
@@ -3953,6 +4043,173 @@ public:
             case EReadKind_RowIdResolve:
                 RowIdResolveResult(msg, readId, record.GetFinished());
                 break;
+            case EReadKind_DocIdMap:
+                DocIdMapResult(msg, readId, record.GetFinished());
+                break;
+        }
+    }
+
+    void EnqueueDocIdMapResolve(std::vector<TDocInfoPtr>& docInfos) {
+        YQL_ENSURE(DocIdMapReader);
+        absl::flat_hash_map<ui64, std::pair<ui64, std::deque<TOwnedTableRange>>> byShard;
+        absl::flat_hash_map<ui64, std::vector<TDocInfoPtr>> docsByReadId;
+        for (auto& doc : docInfos) {
+            ui64 docId = static_cast<ui64>(doc->DocumentNumId);
+            TVector<TCell> keyCells = {TCell::Make(docId)};
+            TTableRange range(keyCells, true, keyCells, true, true);
+            auto partitions = DocIdMapReader->GetRangePartitioning(range);
+            YQL_ENSURE(partitions.size() == 1, "Expected single partition for doc id map resolve, got " << partitions.size());
+            ui64 shardId = partitions[0].ShardId;
+            auto& [readId, ranges] = byShard[shardId];
+            if (readId == 0) {
+                readId = ReadsState.GetNextReadId();
+            }
+            ranges.emplace_back(TOwnedTableRange(partitions[0].TableRange));
+            docsByReadId[readId].emplace_back(doc);
+        }
+        docInfos.clear();
+
+        for (auto& [shardId, pair] : byShard) {
+            auto& [readId, ranges] = pair;
+            auto evRead = DocIdMapReader->GetReadRequest(readId, ranges);
+            DocIdMapItems[readId] = std::move(docsByReadId[readId]);
+            ReadsState.SendEvRead(shardId, evRead, TReadInfo{.ReadKind = EReadKind_DocIdMap, .Cookie = readId, .ShardId = shardId});
+        }
+    }
+
+    void DocIdMapResult(NKikimr::TEvDataShard::TEvReadResult& msg, ui64 readId, bool finished) {
+        auto it = DocIdMapItems.find(readId);
+        YQL_ENSURE(it != DocIdMapItems.end(), "DocIdMapResult: unknown readId " << readId);
+        auto& docs = it->second;
+
+        absl::flat_hash_map<ui64, TDocInfoPtr> docsById;
+        docsById.reserve(docs.size());
+        for (auto& doc : docs) {
+            docsById.emplace(static_cast<ui64>(doc->DocumentNumId), doc);
+        }
+
+        ui64 rows = 0;
+        ui64 bytes = 0;
+        for (size_t i = 0; i < msg.GetRowsCount(); ++i) {
+            const auto& row = msg.GetCells(i);
+            for (const auto& cell : row) {
+                bytes += std::max(cell.Size(), (ui32)8);
+            }
+            rows++;
+            YQL_ENSURE(row.size() >= 2, "Doc id map row must have at least 2 cells (__ydb_doc_id, pk...)");
+            const ui64 docId = row.at(0).AsValue<ui64>();
+            auto docIt = docsById.find(docId);
+            YQL_ENSURE(docIt != docsById.end(), "Doc id map returned unexpected __ydb_doc_id");
+            docIt->second->SetPkCells(row.subspan(1));
+        }
+
+        DocIdMapReader->RecvStats(rows, bytes);
+
+        if (finished) {
+            std::vector<TDocInfoPtr> resolvedDocs = std::move(it->second);
+            DocIdMapItems.erase(it);
+            for (auto& doc : resolvedDocs) {
+                YQL_ENSURE(doc->HasPkResolved(),
+                    "Missing __ydb_doc_id " << doc->DocumentNumId << " in reverse map (orphan posting entry)");
+            }
+            FetchDocumentDetails(resolvedDocs);
+        }
+    }
+
+    void EnsureColumnFetch() {
+        if (ColumnFetch || Failed) {
+            return;
+        }
+
+        TColumnShardPkFetch::TConfig config;
+        config.TableId = FromProto(Settings->GetTable());
+        config.TablePath = Settings->GetTable().GetPath();
+        config.Database = Database;
+        config.Snapshot = Snapshot;
+        if (Settings->HasLockTxId()) {
+            config.LockTxId = Settings->GetLockTxId();
+            config.LockNodeId = Settings->GetLockNodeId();
+            config.LockMode = Settings->GetLockMode();
+        }
+
+        THashSet<TString> keyNames;
+        for (const auto& column : Settings->GetKeyColumns()) {
+            config.Columns.push_back(column);
+            keyNames.insert(column.GetName());
+        }
+        config.KeyColumnCount = config.Columns.size();
+        for (const auto& column : Settings->GetColumns()) {
+            if (column.GetName() == FullTextRelevanceColumn) {
+                continue;
+            }
+            if (keyNames.contains(column.GetName())) {
+                continue;
+            }
+            config.Columns.push_back(column);
+        }
+
+        ColumnFetch = std::make_unique<TColumnShardPkFetch>(
+            std::move(config),
+            this->SelfId(),
+            [this](std::vector<TColumnShardPkFetch::TRow> rows) {
+                OnColumnFetchRows(std::move(rows));
+            },
+            [this](NYql::NDqProto::StatusIds::StatusCode status, const TString& message) {
+                RuntimeError(message, status);
+            },
+            [this](const TVector<NKikimrDataEvents::TLock>& locks, const TVector<NKikimrDataEvents::TLock>& broken) {
+                LockInfo.Locks.insert(LockInfo.Locks.end(), locks.begin(), locks.end());
+                LockInfo.BrokenLocks.insert(LockInfo.BrokenLocks.end(), broken.begin(), broken.end());
+            });
+    }
+
+    void OnColumnFetchRows(std::vector<TColumnShardPkFetch::TRow> rows) {
+        if (Failed) {
+            return;
+        }
+        for (auto& row : rows) {
+            const TString token = TSerializedCellVec::Serialize(row.Cells);
+            auto it = FetchByPk.find(token);
+            YQL_ENSURE(it != FetchByPk.end(), "Column fetch returned an unexpected primary key");
+            it->second->AddRow(row.Cells);
+            ResultQueue.emplace_back(std::move(it->second));
+            FetchByPk.erase(it);
+        }
+        PumpColumnFetch();
+        NotifyCA();
+    }
+
+    void PumpColumnFetch() {
+        if (Failed || ColumnFetchPending.empty()) {
+            return;
+        }
+        if (FetchByPk.size() >= ColumnFetchQueueLimit) {
+            return;
+        }
+        EnsureColumnFetch();
+        if (!ColumnFetch || !ColumnFetch->Idle()) {
+            return;
+        }
+
+        std::vector<TOwnedCellVec> keys;
+        keys.reserve(std::min(ColumnFetchBatchKeys, ColumnFetchPending.size()));
+        while (!ColumnFetchPending.empty()
+            && keys.size() < ColumnFetchBatchKeys
+            && FetchByPk.size() < ColumnFetchQueueLimit)
+        {
+            auto doc = std::move(ColumnFetchPending.front());
+            ColumnFetchPending.pop_front();
+            auto key = TOwnedCellVec(doc->GetKeyCells());
+            const TString token = TSerializedCellVec::Serialize(key);
+            if (!FetchByPk.emplace(token, std::move(doc)).second) {
+                RuntimeError("Duplicate primary key in column fulltext fetch",
+                    NYql::NDqProto::StatusIds::INTERNAL_ERROR);
+                return;
+            }
+            keys.push_back(std::move(key));
+        }
+        if (!keys.empty()) {
+            ColumnFetch->Submit(std::move(keys));
         }
     }
 

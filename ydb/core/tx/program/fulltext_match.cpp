@@ -170,7 +170,7 @@ TConclusionStatus AppendTextChunk(std::vector<std::optional<TString>>& out, cons
             if (!decoded.ok()) {
                 return TConclusionStatus::Fail(TString(decoded.status().message()));
             }
-            const auto array = decoded->make_array();
+            const auto array = *decoded;
             if (!array) {
                 return TConclusionStatus::Fail("Fulltext match column must be String or Utf8");
             }

@@ -203,11 +203,16 @@ public:
             AFL_ENSURE(!Schema.empty() || !Data || Data->num_rows() == 0);
             if (Data && Data->num_rows() > 0) {
                 struct TCopyRows : NArrow::IRowWriter {
+                    explicit TCopyRows(TOwnedCellVecBatch& rows)
+                        : Rows(rows)
+                    {
+                    }
+
                     TOwnedCellVecBatch& Rows;
                     void AddRow(const TConstArrayRef<TCell>& cells) override {
                         Rows.Append(cells);
                     }
-                } writer{RowView};
+                } writer(RowView);
                 NArrow::TArrowToYdbConverter converter(Schema, writer, false, false);
                 TString error;
                 if (!converter.Process(*Data, error)) {

@@ -39,6 +39,7 @@
 #include <ydb/core/external_sources/external_source_factory.h>
 #include <ydb/core/filestore/core/filestore.h>
 #include <ydb/core/kesus/tablet/events.h>
+#include <ydb/core/tx/schemeshard/index/column_fulltext_seed.h>
 #include <ydb/core/persqueue/events/global.h>
 #include <ydb/core/protos/auth.pb.h>
 #include <ydb/core/protos/blockstore_config.pb.h>
@@ -1933,6 +1934,8 @@ public:
     // do not share pipes with operations
     // also do not share pipes between IndexBuilds
     TDedicatedPipePool<TIndexBuildId> IndexBuildPipes;
+    // Local ColumnShard fulltext seed actors keyed by (buildId, shardIdx).
+    THashMap<std::pair<ui64, TShardIdx>, TActorId> ColumnFulltextSeedActors;
 
     TDedicatedPipePool<TIndexBuildId> SetColumnConstraintPipes;
 
@@ -2004,6 +2007,7 @@ public:
         struct TTxReplyValidateUniqueIndex;
         struct TTxReplyFulltextIndex;
         struct TTxReplyFulltextDict;
+        struct TTxReplyColumnFulltextSeed;
         struct TTxReplyStatistics;
 
         struct TTxPipeReset;
@@ -2038,6 +2042,7 @@ public:
     NTabletFlatExecutor::ITransaction* CreateTxReply(TEvDataShard::TEvBuildFulltextIndexResponse::TPtr& response);
     NTabletFlatExecutor::ITransaction* CreateTxReply(TEvDataShard::TEvBuildFulltextDictResponse::TPtr& response);
     NTabletFlatExecutor::ITransaction* CreateTxReply(TEvIndexBuilder::TEvGetIndexStatsResponse::TPtr& response);
+    NTabletFlatExecutor::ITransaction* CreateTxReply(NKqp::TEvColumnFulltextSeed::TEvResponse::TPtr& response);
     NTabletFlatExecutor::ITransaction* CreatePipeRetry(TIndexBuildId indexBuildId, TTabletId tabletId);
     NTabletFlatExecutor::ITransaction* CreateTxBilling(TEvPrivate::TEvIndexBuildingMakeABill::TPtr& ev);
 
@@ -2059,6 +2064,7 @@ public:
     void Handle(TEvDataShard::TEvBuildFulltextIndexResponse::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvDataShard::TEvBuildFulltextDictResponse::TPtr& ev, const TActorContext& ctx);
     void Handle(TEvIndexBuilder::TEvGetIndexStatsResponse::TPtr& ev, const TActorContext& ctx);
+    void Handle(NKqp::TEvColumnFulltextSeed::TEvResponse::TPtr& ev, const TActorContext& ctx);
 
     void Handle(TEvPrivate::TEvIndexBuildingMakeABill::TPtr& ev, const TActorContext& ctx);
 

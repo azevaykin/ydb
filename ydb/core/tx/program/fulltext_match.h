@@ -11,7 +11,7 @@
 
 namespace arrow {
 class RecordBatch;
-class Scalar;
+struct Scalar;
 }
 
 namespace NKikimr::NArrow::NAccessor {

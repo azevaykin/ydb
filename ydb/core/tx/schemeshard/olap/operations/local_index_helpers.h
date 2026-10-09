@@ -80,9 +80,9 @@ inline bool ConvertOlapIndexToCreationConfig(
         config.AddKeyColumnNames(it->second);
         auto* description = config.MutableFulltextIndexDescription();
         description->SetOlapIndexId(indexProto.GetId());
-        auto* column = description->MutableSettings()->AddColumns();
-        column->SetColumn(it->second);
-        *column->MutableAnalyzers() = indexProto.GetColumnFulltextIndex().GetAnalyzers();
+        auto* column = description->MutableSettings()->add_columns();
+        column->set_column(it->second);
+        *column->mutable_analyzers() = indexProto.GetColumnFulltextIndex().GetAnalyzers();
         return true;
     } else if (indexProto.HasCountMinSketch()) {
         config.SetType(NKikimrSchemeOp::EIndexTypeLocalCountMinSketch);
@@ -295,9 +295,9 @@ inline bool ConvertRequestedIndexToCreationConfig(
                 config.AddKeyColumnNames(fulltext.GetColumnName());
             }
             auto* description = config.MutableFulltextIndexDescription();
-            auto* column = description->MutableSettings()->AddColumns();
-            column->SetColumn(fulltext.GetColumnName());
-            *column->MutableAnalyzers() = fulltext.GetAnalyzers();
+            auto* column = description->MutableSettings()->add_columns();
+            column->set_column(fulltext.GetColumnName());
+            *column->mutable_analyzers() = fulltext.GetAnalyzers();
             return true;
         }
         case NKikimrSchemeOp::TOlapIndexRequested::kCountMinSketch: {
@@ -384,9 +384,9 @@ inline bool ConvertRequestedIndexToAlteringConfig(
                 config.AddKeyColumnNames(fulltext.GetColumnName());
             }
             auto* description = config.MutableFulltextIndexDescription();
-            auto* column = description->MutableSettings()->AddColumns();
-            column->SetColumn(fulltext.GetColumnName());
-            *column->MutableAnalyzers() = fulltext.GetAnalyzers();
+            auto* column = description->MutableSettings()->add_columns();
+            column->set_column(fulltext.GetColumnName());
+            *column->mutable_analyzers() = fulltext.GetAnalyzers();
             return true;
         }
         case NKikimrSchemeOp::TOlapIndexRequested::kCountMinSketch: {

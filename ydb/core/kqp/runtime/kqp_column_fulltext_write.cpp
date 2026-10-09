@@ -789,6 +789,32 @@ void TColumnFulltextMaintainer::AssignSequences(const TPathId& pathId, const std
     }
 }
 
+TString TColumnFulltextMaintainer::PrepareSeed(const std::vector<TInputRow>& rows) {
+    for (const auto& index : Indexes) {
+        if (!index.Index.SeedOnly) {
+            return "Fulltext seed requires SeedOnly indexes";
+        }
+    }
+    std::vector<TInputRow> seeded;
+    seeded.reserve(rows.size());
+    for (const auto& row : rows) {
+        TInputRow copy = row;
+        copy.BaseExists = true;
+        copy.BaseExistenceKnown = true;
+        seeded.push_back(copy);
+    }
+    SetRows(NKikimrKqp::TKqpTableSinkSettings::MODE_UPSERT, seeded);
+    return Prepare();
+}
+
+TString TColumnFulltextMaintainer::BuildSeedBatches(
+        std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc,
+        std::vector<TWriteBatch>& out,
+        TStats& stats)
+{
+    return Build(std::move(alloc), out, stats);
+}
+
 TString TColumnFulltextMaintainer::Build(
         std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc,
         std::vector<TWriteBatch>& out,

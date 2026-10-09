@@ -1394,11 +1394,16 @@ private:
             auto renamed = arrow::RecordBatch::Make(renamedSchema, batch->num_rows(), batch->columns());
             AFL_ENSURE(renamed);
             struct TCopyRows : NArrow::IRowWriter {
+                explicit TCopyRows(TOwnedCellVecBatch& out)
+                    : Out(out)
+                {
+                }
+
                 TOwnedCellVecBatch& Out;
                 void AddRow(const TConstArrayRef<TCell>& cells) override {
                     Out.Append(cells);
                 }
-            } writer{request.Rows};
+            } writer(request.Rows);
             NArrow::TArrowToYdbConverter converter(schema, writer, false, false);
             TString error;
             if (!converter.Process(*renamed, error)) {

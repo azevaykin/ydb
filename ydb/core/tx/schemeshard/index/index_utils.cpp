@@ -1,5 +1,6 @@
 #include <ydb/core/tx/schemeshard/schemeshard_info_types.h>
 #include <ydb/core/tx/schemeshard/schemeshard_generated_column_utils.h>
+#include <ydb/core/tx/schemeshard/schemeshard_impl.h>
 #include <ydb/core/tx/schemeshard/index/index_utils.h>
 #include <ydb/core/tx/schemeshard/olap/table/table.h>
 #include <ydb/core/tx/schemeshard/olap/store/store.h>
@@ -1483,7 +1484,7 @@ NKikimrSchemeOp::TColumnTableSchema ReadColumnTableSchema(
     }
     Y_ENSURE(store, "column table schema preset is missing");
     NKikimrSchemeOp::TColumnTableSchema schema;
-    store->GetPresetVerified(table.Description.GetSchemaPresetId()).Serialize(schema);
+    store->GetPresetVerified(table.Description.GetSchemaPresetId()).TOlapSchema::Serialize(schema);
     return schema;
 }
 

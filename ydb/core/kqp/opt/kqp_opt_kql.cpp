@@ -1437,11 +1437,8 @@ TExprNode::TPtr HandleReadTable(const TKiReadTable& read, TExprContext& ctx, con
                     TStringBuilder() << "Requested index: " << indexName << " is not ready to use"));
                 return nullptr;
             }
-            auto readNode = BuildReadTable(read, tableData, true, withSystemColumns, ctx);
-            if (!readNode) {
-                return nullptr;
-            }
-            auto rangesRead = TExprBase(readNode).Cast<TKqlReadTableRanges>();
+            auto rangesRead = BuildReadTable(read, tableData, true, withSystemColumns, ctx, {})
+                .Cast<TKqlReadTableRanges>();
             auto settings = TKqpReadTableSettings::Parse(rangesRead);
             settings.LocalFulltextIndex = indexName;
             return Build<TKqlReadTableRanges>(ctx, read.Pos())

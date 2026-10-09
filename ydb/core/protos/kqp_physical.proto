@@ -502,12 +502,14 @@ message TKqpFullTextSource {
     // Column-table compact fulltext. Unset for row-table indexes.
     optional TIndexTable StateTable = 17;
     optional TIndexTable DocIdMapTable = 18;
-    optional NKikimrSchemeOp.TFulltextIndexDescription.EDocIdPolicy DocIdPolicy = 19;
+    // Stored as int32 because this file is proto3 and cannot embed proto2 enums.
+    // Values match NKikimrSchemeOp.TFulltextIndexDescription.EDocIdPolicy / EIndexState.
+    optional int32 DocIdPolicy = 19;
     optional uint64 BuildGeneration = 20;
     optional uint64 AnalyzerRevision = 21;
     optional bytes AnalyzerIdentity = 22;
     optional NKikimrSchemeOp.TFulltextIndexDescription.TReadyVersion ReadyVersion = 23;
-    optional NKikimrSchemeOp.EIndexState IndexState = 24;
+    optional int32 IndexState = 24;
 }
 
 message TKqpReadSampling {

@@ -4,6 +4,8 @@
 #include <ydb/core/tx/schemeshard/schemeshard__operation_part.h>
 #include <ydb/core/tx/schemeshard/schemeshard__operation_common.h>
 #include <ydb/core/tx/schemeshard/schemeshard_impl.h>
+#include <ydb/core/tx/schemeshard/index/index_build_info.h>
+#include <ydb/core/tx/schemeshard/index/index_utils.h>
 
 #include <ydb/core/scheme/scheme_types_proto.h>
 
@@ -283,6 +285,32 @@ public:
 
             if (!checks) {
                 result->SetError(checks.GetStatus(), checks.GetError());
+                return result;
+            }
+        }
+
+        // Column fulltext seed checkpoints LastKeyAck per shard; resharding would invalidate
+        // those cursors until cursor migration exists.
+        if (isAlterSharding) {
+            TString lockErr;
+            if (!context.SS->CheckLocks(path.Base()->PathId, Transaction, lockErr)) {
+                result->SetError(NKikimrScheme::StatusMultipleModifications, TStringBuilder()
+                    << "Cannot reshard column table while an index build is in progress: " << lockErr);
+                return result;
+            }
+            for (const auto& [buildId, buildInfoPtr] : context.SS->IndexBuilds) {
+                Y_UNUSED(buildId);
+                const auto& buildInfo = *buildInfoPtr;
+                if (buildInfo.TablePathId != path.Base()->PathId) {
+                    continue;
+                }
+                if (!NTableIndex::IsColumnTableCompactFulltext(buildInfo.IndexType)
+                    || buildInfo.IsFinished())
+                {
+                    continue;
+                }
+                result->SetError(NKikimrScheme::StatusMultipleModifications,
+                    "Cannot reshard column table while a compact fulltext index build is in progress");
                 return result;
             }
         }

@@ -17,6 +17,7 @@ PEERDIR(
     ydb/core/actorlib_impl
     ydb/core/base
     ydb/core/cms/console
+    ydb/core/kqp/column_fulltext_seed
     ydb/core/kqp/common
     ydb/core/kqp/common/events
     ydb/core/kqp/compile_service
@@ -31,6 +32,7 @@ PEERDIR(
     ydb/core/protos
     ydb/core/tx/scheme_cache
     ydb/core/tx/schemeshard
+    ydb/core/tx/schemeshard/index
     ydb/core/tx/tx_proxy
     ydb/library/actors/core
     ydb/library/actors/http

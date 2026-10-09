@@ -68,6 +68,7 @@ PEERDIR(
     ydb/core/persqueue/public
     ydb/core/protos
     ydb/core/scheme
+    ydb/core/tx/datashard
     ydb/core/tx/scheme_board
     ydb/core/ydb_convert
     ydb/library/aclib

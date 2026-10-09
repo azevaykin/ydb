@@ -7,7 +7,7 @@ Two tracks for `STORE = COLUMN` fulltext:
 | Track | Intent | Status |
 | --- | --- | --- |
 | **A** | `LOCAL USING fulltext` — portion-local postings, boolean `FulltextMatch` | Core path A0–A4 landed. Partial A5 (tests exist; force-fallback switch / full counters TBD). |
-| **C** | Compact `GLOBAL USING fulltext_*` on a column parent | C0–C2 landed. C3 fence/Ready path stubs the seed scanner. C4/C5 query path largely present. C6 rejects BulkUpsert (TTL adapter TBD). C7 incomplete. |
+| **C** | Compact `GLOBAL USING fulltext_*` on a column parent | C0–C3 landed (fence seed scanner). C4/C5 query path largely present. C6 rejects BulkUpsert (TTL adapter TBD). C7 incomplete. |
 
 No package has been compiled or tested in a final `-j80` pass yet.
 
@@ -35,6 +35,12 @@ No package has been compiled or tested in a final `-j80` pass yet.
 - Column-table queries leave `ItemsLimit` unset; residual filters then ORDER BY/LIMIT in KQP
 - Not Ready / snapshot before `ReadyVersion` → `PRECONDITION_FAILED`
 
+### C3 — column fulltext seed scanner
+- `InitiateColumnShards` queues shards (not false DONE); `FillColumnTableFulltext` drives seed actors
+- Seed actor (`ydb/core/kqp/column_fulltext_seed`): `TEvKqpScan` at fence snapshot + `PrepareSeed`/`BuildSeedBatches` + UploadRows
+- SchemeShard checkpoints `LastKeyAck`; reboot resumes; resharding rejected during active compact fulltext build
+- UTs: `ColumnGlobalFulltextPreFenceSeed`, `ColumnGlobalFulltextDeleteRaceDuringSeed`, `ColumnGlobalFulltextSeedResumeAfterSchemeShardReboot`
+
 ### C6 — partial (reject-first)
 - BulkUpsert rejected via `ColumnTableGlobalFulltextBulkUpsertRejected` in upload path
 - Rejection string for deletion TTL exists; adapter and full enforcement TBD
@@ -48,8 +54,6 @@ No package has been compiled or tested in a final `-j80` pass yet.
 
 | Package | Gap |
 | --- | --- |
-| **C3 (critical)** | `FillColumnTableFulltext` currently marks all column shards DONE without seeding. Comment admits a follow-up ColumnShard conditional seed scanner. Non-empty tables must not publish Ready until uninitialized keys are seeded. |
-| **C3** | Checkpoints (PK cursor), reboot resume, snapshot retention, cancellation fencing polish |
 | **A5** | Force text-fallback switch; complete counters/hooks; more acceptance cases |
 | **C4/C5** | End-to-end verification; any missing lock/flush edges |
 | **C6** | Wire TTL rejection everywhere; implement BulkUpsert + deletion-TTL adapters for release |

@@ -209,6 +209,8 @@ NKikimrSchemeOp::TColumnTableSchema ReadColumnTableSchema(
 TString ColumnTableTtlColumn(const NSchemeShard::TColumnTableInfo& table);
 ui32 ColumnTableShardCount(const NSchemeShard::TColumnTableInfo& table);
 
+using TColumnTypes = THashMap<TString, NScheme::TTypeInfo>;
+
 // True when the column table already owns a compact global fulltext index child.
 bool ColumnTableHasCompactFulltextIndex(const NSchemeShard::TSchemeShard* ss, const TPathId& tablePathId);
 
@@ -235,8 +237,6 @@ void FillIndexTableColumns(
     std::span<const TString> keys,
     const THashSet<TString>& columns,
     NKikimrSchemeOp::TTableDescription& implTableDesc);
-
-using TColumnTypes = THashMap<TString, NScheme::TTypeInfo>;
 
 bool ExtractTypes(const NSchemeShard::TTableInfo::TPtr& baseTableInfo, TColumnTypes& columnsTypes, TString& explain);
 bool ExtractTypes(const NKikimrSchemeOp::TTableDescription& baseTableDesc, TColumnTypes& columnsTypes, TString& explain);

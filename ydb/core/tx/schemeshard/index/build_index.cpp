@@ -75,6 +75,10 @@ void TSchemeShard::Handle(TEvIndexBuilder::TEvGetIndexStatsResponse::TPtr& ev, c
     Execute(CreateTxReply(ev), ctx);
 }
 
+void TSchemeShard::Handle(NKqp::TEvColumnFulltextSeed::TEvResponse::TPtr& ev, const TActorContext& ctx) {
+    Execute(CreateTxReply(ev), ctx);
+}
+
 void TSchemeShard::Handle(TEvPrivate::TEvIndexBuildingMakeABill::TPtr& ev, const TActorContext& ctx) {
     Execute(CreateTxBilling(ev), ctx);
 }
