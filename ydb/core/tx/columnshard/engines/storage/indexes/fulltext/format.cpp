@@ -1,5 +1,6 @@
 #include "format.h"
 
+#include <util/digest/city.h>
 #include <util/generic/ylimits.h>
 
 #include <algorithm>
@@ -23,10 +24,6 @@ void AppendU64(TString& out, ui64 value) {
         buf[i] = static_cast<char>((value >> (8 * i)) & 0xffu);
     }
     out.append(buf, 8);
-}
-
-void AppendI32(TString& out, i32 value) {
-    AppendU32(out, static_cast<ui32>(value));
 }
 
 bool ReadU32(TStringBuf& in, ui32& value, TString& error) {
@@ -120,8 +117,7 @@ bool ReadVarint(TStringBuf bytes, size_t& pos, ui64& value, TString& error) {
     return true;
 }
 
-bool DecodePlainPostings(TStringBuf bytes, ui32 expectedCount, ui32 chunkRowCount, std::vector<ui32>& rows, TString& error) {
-    rows.clear();
+bool VisitPostings(TStringBuf bytes, ui32 expectedCount, ui32 chunkRowCount, const std::function<void(ui32)>& visitor, TString& error) {
     if (expectedCount == 0) {
         error = "fulltext dictionary entry has no postings";
         return false;
@@ -129,7 +125,6 @@ bool DecodePlainPostings(TStringBuf bytes, ui32 expectedCount, ui32 chunkRowCoun
     size_t pos = 0;
     ui64 last = 0;
     bool any = false;
-    rows.reserve(expectedCount);
     for (ui32 i = 0; i < expectedCount; ++i) {
         if (pos >= bytes.size()) {
             error = "fulltext posting list ended before its declared count";
@@ -152,7 +147,9 @@ bool DecodePlainPostings(TStringBuf bytes, ui32 expectedCount, ui32 chunkRowCoun
             error = "fulltext posting row id is outside the chunk";
             return false;
         }
-        rows.push_back(static_cast<ui32>(row));
+        if (visitor) {
+            visitor(static_cast<ui32>(row));
+        }
         last = row;
         any = true;
     }
@@ -176,32 +173,10 @@ ui64 PostingBytes(const std::vector<ui32>& rows) {
     return bytes;
 }
 
-}
+}   // namespace
 
-TString CanonicalAnalyzerSettings(const Ydb::Table::FulltextIndexSettings::Analyzers& normalized) {
-    TString out;
-    out.reserve(31 + normalized.language().size());
-    AppendU32(out, static_cast<ui32>(normalized.tokenizer()));
-    AppendU32(out, static_cast<ui32>(normalized.language().size()));
-    out.append(normalized.language());
-    out.push_back(normalized.use_filter_lowercase() ? 1 : 0);
-    out.push_back(normalized.use_filter_stopwords() ? 1 : 0);
-    out.push_back(normalized.use_filter_ngram() ? 1 : 0);
-    out.push_back(normalized.use_filter_edge_ngram() ? 1 : 0);
-    const bool ngram = normalized.use_filter_ngram() || normalized.use_filter_edge_ngram();
-    if (ngram) {
-        AppendI32(out, normalized.has_filter_ngram_min_length() ? normalized.filter_ngram_min_length() : 0);
-        AppendI32(out, normalized.has_filter_ngram_max_length() ? normalized.filter_ngram_max_length() : 0);
-    } else {
-        AppendI32(out, FulltextCanonicalNgramMinDefault);
-        AppendI32(out, FulltextCanonicalNgramMaxDefault);
-    }
-    out.push_back(normalized.use_filter_length() ? 1 : 0);
-    AppendI32(out, normalized.use_filter_length() && normalized.has_filter_length_min() ? normalized.filter_length_min() : 0);
-    AppendI32(out, normalized.use_filter_length() && normalized.has_filter_length_max() ? normalized.filter_length_max() : 0);
-    out.push_back(normalized.use_filter_snowball() ? 1 : 0);
-    out.push_back(normalized.use_filter_superlemmer() ? 1 : 0);
-    return out;
+TString CanonicalAnalyzerSettings(const Ydb::Table::FulltextIndexSettings::Analyzers& analyzers) {
+    return NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(analyzers);
 }
 
 TConclusion<Ydb::Table::FulltextIndexSettings::Analyzers> ParseCanonicalAnalyzerSettings(TStringBuf bytes) {
@@ -227,9 +202,10 @@ TConclusion<Ydb::Table::FulltextIndexSettings::Analyzers> ParseCanonicalAnalyzer
     i32 lengthMax = 0;
     bool snowball = false;
     bool superlemmer = false;
-    if (!ReadBool(bytes, lowercase, error) || !ReadBool(bytes, stopwords, error) || !ReadBool(bytes, ngram, error) || !ReadBool(bytes, edge, error) ||
-        !ReadI32(bytes, ngramMin, error) || !ReadI32(bytes, ngramMax, error) || !ReadBool(bytes, length, error) || !ReadI32(bytes, lengthMin, error) ||
-        !ReadI32(bytes, lengthMax, error) || !ReadBool(bytes, snowball, error) || !ReadBool(bytes, superlemmer, error))
+    if (!ReadBool(bytes, lowercase, error) || !ReadBool(bytes, stopwords, error) || !ReadBool(bytes, ngram, error) ||
+        !ReadBool(bytes, edge, error) || !ReadI32(bytes, ngramMin, error) || !ReadI32(bytes, ngramMax, error) ||
+        !ReadBool(bytes, length, error) || !ReadI32(bytes, lengthMin, error) || !ReadI32(bytes, lengthMax, error) ||
+        !ReadBool(bytes, snowball, error) || !ReadBool(bytes, superlemmer, error))
     {
         return TConclusionStatus::Fail(error);
     }
@@ -268,13 +244,13 @@ TConclusion<Ydb::Table::FulltextIndexSettings::Analyzers> ParseCanonicalAnalyzer
     return NKikimr::NFulltext::NormalizeAnalyzers(analyzers);
 }
 
-TConclusion<TString> EncodeFulltextChunk(const TFulltextChunkPlain& chunk) {
+TConclusion<TString> EncodeFulltextChunk(TFulltextChunkPlain chunk) {
     const auto normalized = NKikimr::NFulltext::NormalizeAnalyzers(chunk.Analyzers);
     const TString canonical = CanonicalAnalyzerSettings(normalized);
     if (canonical.size() > Max<ui32>()) {
         return TConclusionStatus::Fail("fulltext canonical settings do not fit a u32");
     }
-    std::vector<TFulltextPostingList> postings = chunk.Postings;
+    std::vector<TFulltextPostingList> postings = std::move(chunk.Postings);
     std::sort(postings.begin(), postings.end(), [](const TFulltextPostingList& left, const TFulltextPostingList& right) {
         return left.Token < right.Token;
     });
@@ -306,6 +282,9 @@ TConclusion<TString> EncodeFulltextChunk(const TFulltextChunkPlain& chunk) {
         postingBytes += PostingBytes(posting.Rows);
     }
     const ui64 serializedSize = FulltextChunkSerializedBytes(static_cast<ui32>(canonical.size()), dictionaryBytes, postingBytes);
+    if (serializedSize > Max<ui32>()) {
+        return TConclusionStatus::Fail("fulltext chunk offsets do not fit a u32");
+    }
     TString out;
     out.reserve(serializedSize);
     out.append(FulltextChunkMagic, 4);
@@ -313,7 +292,7 @@ TConclusion<TString> EncodeFulltextChunk(const TFulltextChunkPlain& chunk) {
     AppendU32(out, FulltextChunkHeaderFixedBytes + static_cast<ui32>(canonical.size()));
     AppendU32(out, chunk.ColumnId);
     AppendU32(out, chunk.IndexId);
-    AppendU64(out, NKikimr::NFulltext::FulltextAnalyzerRevision(normalized));
+    AppendU64(out, NKikimr::NFulltext::FulltextAnalyzerSemanticRevision);
     AppendU32(out, static_cast<ui32>(canonical.size()));
     out.append(canonical);
     AppendU32(out, chunk.ChunkRowCount);
@@ -351,7 +330,7 @@ TConclusion<TString> EncodeFulltextChunk(const TFulltextChunkPlain& chunk) {
     return out;
 }
 
-TConclusion<TFulltextChunkPlain> DecodeFulltextChunk(TStringBuf bytes) {
+TConclusion<TFulltextChunkView> DecodeFulltextChunkView(TStringBuf bytes) {
     if (bytes.size() < FulltextChunkPrefixBytes) {
         return TConclusionStatus::Fail("truncated fulltext chunk prefix");
     }
@@ -366,7 +345,7 @@ TConclusion<TFulltextChunkPlain> DecodeFulltextChunk(TStringBuf bytes) {
     if (!ReadU32(cursor, version, error) || !ReadU32(cursor, headerLength, error)) {
         return TConclusionStatus::Fail(error);
     }
-    if (version != FulltextChunkFormatVersion) {
+    if (version != FulltextChunkFormatVersion && version != FulltextChunkLegacyFormatVersion) {
         return TConclusionStatus::Fail("unsupported fulltext chunk format version");
     }
     if (static_cast<ui64>(headerLength) > cursor.size()) {
@@ -409,28 +388,34 @@ TConclusion<TFulltextChunkPlain> DecodeFulltextChunk(TStringBuf bytes) {
     if (canonical != settingsBytes) {
         return TConclusionStatus::Fail("fulltext canonical settings are not normalized");
     }
-    if (NKikimr::NFulltext::FulltextAnalyzerRevision(analyzers) != revision) {
-        return TConclusionStatus::Fail("fulltext analyzer revision does not match canonical settings");
+    if (version == FulltextChunkLegacyFormatVersion) {
+        // This is the frozen v1 fingerprint, not an analyzer semantic version.
+        // ParseCanonicalAnalyzerSettings reconstructs only the v1 fields.
+        const TString legacyIdentity = analyzers.SerializeAsString();
+        if (CityHash64(legacyIdentity) != revision) {
+            return TConclusionStatus::Fail("fulltext legacy analyzer fingerprint does not match canonical settings");
+        }
+        revision = 1;
     }
 
     if (tokenCount > 0 && cursor.size() / 16 < tokenCount) {
         return TConclusionStatus::Fail("fulltext token count does not fit the dictionary");
     }
-    TFulltextChunkPlain plain;
+    TFulltextChunkView plain;
     plain.ColumnId = columnId;
     plain.IndexId = indexId;
-    plain.AnalyzerRevision = revision;
+    plain.AnalyzerSemanticRevision = revision;
     plain.CanonicalSettings = canonical;
-    plain.Analyzers = analyzers;
     plain.ChunkRowCount = chunkRowCount;
     plain.Postings.reserve(tokenCount);
 
     struct TDictEntry {
-        TString Token;
+        TStringBuf Token;
         ui32 Count = 0;
         ui32 Offset = 0;
         ui32 Length = 0;
     };
+
     std::vector<TDictEntry> entries;
     entries.reserve(tokenCount);
     for (ui32 i = 0; i < tokenCount; ++i) {
@@ -442,13 +427,13 @@ TConclusion<TFulltextChunkPlain> DecodeFulltextChunk(TStringBuf bytes) {
             return TConclusionStatus::Fail("fulltext dictionary token exceeds the blob");
         }
         TDictEntry entry;
-        entry.Token = TString(cursor.data(), tokenSize);
+        entry.Token = cursor.Head(tokenSize);
         cursor.Skip(tokenSize);
         if (!ReadU32(cursor, entry.Count, error) || !ReadU32(cursor, entry.Offset, error) || !ReadU32(cursor, entry.Length, error)) {
             return TConclusionStatus::Fail(error);
         }
-        if (entry.Count == 0) {
-            return TConclusionStatus::Fail("fulltext dictionary entry has no postings");
+        if (entry.Count == 0 || entry.Count > chunkRowCount) {
+            return TConclusionStatus::Fail("fulltext posting count is outside the chunk row count");
         }
         if (!entries.empty() && !(entries.back().Token < entry.Token)) {
             return TConclusionStatus::Fail("fulltext dictionary tokens are not strictly increasing");
@@ -475,15 +460,49 @@ TConclusion<TFulltextChunkPlain> DecodeFulltextChunk(TStringBuf bytes) {
     }
 
     for (const auto& entry : entries) {
-        TFulltextPostingList posting;
-        posting.Token = entry.Token;
         const TStringBuf region = bytes.SubStr(entry.Offset, entry.Length);
-        if (!DecodePlainPostings(region, entry.Count, chunkRowCount, posting.Rows, error)) {
+        if (!VisitPostings(region, entry.Count, chunkRowCount, {}, error)) {
             return TConclusionStatus::Fail(error);
         }
+        plain.Postings.push_back(TFulltextPostingView{ entry.Token, region, entry.Count });
+    }
+    return plain;
+}
+
+void TFulltextPostingView::VisitRows(const std::function<void(ui32)>& visitor) const {
+    TString error;
+    // A view is only exposed after the complete blob was validated.
+    Y_ABORT_UNLESS(VisitPostings(EncodedRows, Count, Max<ui32>(), visitor, error), "%s", error.c_str());
+}
+
+TConclusion<TFulltextChunkPlain> DecodeFulltextChunk(TStringBuf bytes) {
+    auto decoded = DecodeFulltextChunkView(bytes);
+    if (decoded.IsFail()) {
+        return TConclusionStatus::Fail(decoded.GetErrorMessage());
+    }
+    auto view = decoded.DetachResult();
+    auto analyzers = ParseCanonicalAnalyzerSettings(view.CanonicalSettings);
+    if (analyzers.IsFail()) {
+        return TConclusionStatus::Fail(analyzers.GetErrorMessage());
+    }
+    TFulltextChunkPlain plain;
+    plain.ColumnId = view.ColumnId;
+    plain.IndexId = view.IndexId;
+    plain.AnalyzerSemanticRevision = view.AnalyzerSemanticRevision;
+    plain.CanonicalSettings = std::move(view.CanonicalSettings);
+    plain.Analyzers = analyzers.DetachResult();
+    plain.ChunkRowCount = view.ChunkRowCount;
+    plain.Postings.reserve(view.Postings.size());
+    for (const auto& entry : view.Postings) {
+        TFulltextPostingList posting;
+        posting.Token = entry.Token;
+        posting.Rows.reserve(entry.Count);
+        entry.VisitRows([&](ui32 row) {
+            posting.Rows.push_back(row);
+        });
         plain.Postings.push_back(std::move(posting));
     }
     return plain;
 }
 
-} // namespace NKikimr::NOlap::NIndexes::NFulltext
+}   // namespace NKikimr::NOlap::NIndexes::NFulltext

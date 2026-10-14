@@ -1437,11 +1437,11 @@ TStatus AnnotateOlapProjections(const TExprNode::TPtr& node, TExprContext& ctx) 
 }
 
 TStatus AnnotateOlapFulltextMatch(const TExprNode::TPtr& node, TExprContext& ctx) {
-    if (!EnsureArgsCount(*node, 6, ctx)) {
+    if (!EnsureMinMaxArgsCount(*node, 6, 7, ctx)) {
         return TStatus::Error;
     }
     for (ui32 i = 0; i < 5; ++i) {
-        if (!EnsureAtom(*node->Child(i), ctx)) {
+        if ((i == 0 || i == 1 || i == 4) && !EnsureAtom(*node->Child(i), ctx)) {
             return TStatus::Error;
         }
     }

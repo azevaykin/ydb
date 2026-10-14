@@ -18,6 +18,8 @@
 #include <yql/essentials/parser/pg_wrapper/interface/codec.h>
 #include <yql/essentials/utils/yql_panic.h>
 
+#include <arrow/array/concatenate.h>
+
 namespace NKikimr {
 namespace NKqp {
 
@@ -137,7 +139,7 @@ public:
 
     i64 GetMemory() const override {
         AFL_ENSURE(!Extracted);
-        return Memory;
+        return Memory + (RowView ? RowView->DataSizeEstimate() : 0);
     }
 
     bool IsEmpty() const override {
@@ -163,15 +165,31 @@ public:
     }
 
     void DetachAlloc() override {
-        Y_ABORT_UNLESS(false); // Write to CS doesn't need to move data between allocators.
+        AFL_ENSURE(!Detached && !Extracted);
+        if (Alloc) {
+            TNullableAllocGuard guard(Alloc.get());
+            CopyBuffers(arrow::default_memory_pool());
+        }
+        if (RowViewAlloc && RowViewAlloc->Attached()) {
+            RowViewAlloc->Detach();
+        }
+        Alloc.reset();
+        Detached = true;
     }
 
     void AttachAlloc(std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> alloc) override {
-        Y_ABORT_UNLESS(Alloc == alloc); // Write to CS doesn't need to move data between allocators.
+        AFL_ENSURE(Detached && !Extracted && alloc);
+        TNullableAllocGuard guard(alloc.get());
+        CopyBuffers(NMiniKQL::GetArrowMemoryPool());
+        Alloc = std::move(alloc);
+        Detached = false;
+        if (RowViewAlloc) {
+            RowViewAlloc->Attach(Alloc);
+        }
     }
 
     bool AttachedAlloc() const override {
-        return true;
+        return !Detached;
     }
 
     explicit TColumnBatch(
@@ -187,6 +205,7 @@ public:
 
     ~TColumnBatch() {
         TNullableAllocGuard guard(Alloc.get());
+        RowView.reset();
         Data.reset();
     }
 
@@ -197,10 +216,12 @@ public:
     // Typed cells for index maintenance. The Arrow batch itself stays in place
     // for the ColumnShard write. Cell storage is owned here and outlives GetRows().
     const TOwnedCellVecBatch& EnsureRowView() const {
-        if (!RowViewReady) {
+        if (!RowView) {
             TNullableAllocGuard guard(Alloc.get());
             AFL_ENSURE(!Extracted);
             AFL_ENSURE(!Schema.empty() || !Data || Data->num_rows() == 0);
+            RowViewAlloc = CreateOffloadedPoolAllocator(Alloc);
+            RowView.emplace(RowViewAlloc->CreateMemoryPool());
             if (Data && Data->num_rows() > 0) {
                 struct TCopyRows : NArrow::IRowWriter {
                     explicit TCopyRows(TOwnedCellVecBatch& rows)
@@ -212,28 +233,48 @@ public:
                     void AddRow(const TConstArrayRef<TCell>& cells) override {
                         Rows.Append(cells);
                     }
-                } writer(RowView);
+                } writer(*RowView);
                 NArrow::TArrowToYdbConverter converter(Schema, writer, false, false);
                 TString error;
                 if (!converter.Process(*Data, error)) {
                     ythrow yexception() << "Cannot build a row view of a column batch: " << error;
                 }
             }
-            RowViewReady = true;
         }
-        return RowView;
+        return *RowView;
     }
 
 private:
+    // A batch sent to the transaction buffer must outlive the compute actor's
+    // allocator. Copy its Arrow buffers through a neutral pool at the mailbox
+    // boundary, then charge them to the receiving allocator on attachment.
+    void CopyBuffers(arrow::MemoryPool* pool) {
+        if (!Data) {
+            return;
+        }
+        arrow::ArrayVector columns;
+        columns.reserve(Data->num_columns());
+        for (const auto& column : Data->columns()) {
+            auto copy = arrow::Concatenate({column}, pool);
+            if (!copy.ok()) {
+                ythrow yexception() << "Cannot transfer column batch: " << copy.status().ToString();
+            }
+            columns.push_back(*copy);
+        }
+        Data = arrow::RecordBatch::Make(Data->schema(), Data->num_rows(), std::move(columns));
+        Memory = NArrow::GetBatchMemorySize(Data);
+    }
+
     std::shared_ptr<NKikimr::NMiniKQL::TScopedAlloc> Alloc = nullptr;
     TRecordBatchPtr Data;
     std::vector<std::pair<TString, NScheme::TTypeInfo>> Schema;
-    mutable TOwnedCellVecBatch RowView;
-    mutable bool RowViewReady = false;
+    mutable TOffloadedPoolAllocatorPtr RowViewAlloc;
+    mutable std::optional<TOwnedCellVecBatch> RowView;
     i64 SerializedMemory = 0;
     i64 Memory = 0;
 
     bool Extracted = false;
+    bool Detached = false;
 };
 
 

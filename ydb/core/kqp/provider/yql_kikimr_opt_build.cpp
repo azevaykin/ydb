@@ -206,6 +206,17 @@ struct TKiExploreTxResults {
             ops[name] |= TPrimitiveYdbOperation::Read;
 
             const auto indexTables = NKikimr::NKqp::NSchemeHelpers::CreateIndexTablePath(name, index);
+            if (const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&index.SpecializedIndexDescription);
+                fulltext && fulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED)
+            {
+                // Column fulltext maintenance reads forward state and updates all
+                // support tables in the base write's transaction. Track these
+                // dependencies so subsequent statements flush buffered writes.
+                for (const auto& path : indexTables) {
+                    ops[path] |= TPrimitiveYdbOperation::Read | TPrimitiveYdbOperation::Write;
+                }
+                continue;
+            }
             TString indexTable;
             TString dictTable;
             TString dataTable;

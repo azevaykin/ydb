@@ -3,6 +3,7 @@
 
 #include <ydb/core/formats/arrow/accessor/common/additional_data.h>
 #include <ydb/core/formats/arrow/accessor/common/chunk_data.h>
+#include <ydb/core/tx/columnshard/hooks/abstract/abstract.h>
 
 namespace NKikimr::NOlap::NReader::NCommon {
 
@@ -114,6 +115,8 @@ private:
             if (!itFilter.IsBatchForSkip(c->GetMeta().GetRecordsCount())) {
                 reading->SetIsBackgroundProcess(false);
                 reading->AddRange(source.RestoreBlobRange(c->BlobRange));
+                NYDBTest::TControllers::GetColumnShardController()->OnColumnBlobRead(
+                    GetEntityId(), source.RestoreBlobRange(c->BlobRange).Size);
                 ColumnChunks.emplace_back(
                     c->GetMeta().GetRecordsCount(), source.RestoreBlobRange(c->BlobRange), c->GetMeta().GetAdditionalAccessorData());
             } else {

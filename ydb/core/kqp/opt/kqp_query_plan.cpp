@@ -32,6 +32,7 @@
 #include <library/cpp/json/json_reader.h>
 #include <library/cpp/json/writer/json.h>
 #include <library/cpp/protobuf/json/proto2json.h>
+#include <library/cpp/protobuf/json/string_transform.h>
 
 #include <util/generic/queue.h>
 #include <util/string/hex.h>
@@ -192,8 +193,10 @@ NJson::TJsonValue GetSsaProgramInJsonByTable(const TString& tablePath, const NKq
             return NJson::TJsonValue();
         }
         NJson::TJsonValue jsonData;
-        NProtobufJson::Proto2Json(program, jsonData);
-        jsonData.EraseValue("Kernels");
+        program.ClearKernels();
+        NProtobufJson::TProto2JsonConfig config;
+        config.AddStringTransform(MakeIntrusive<NProtobufJson::TBase64EncodeBytesTransform>());
+        NProtobufJson::Proto2Json(program, jsonData, config);
         return jsonData;
     }
     return NJson::TJsonValue();

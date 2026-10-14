@@ -132,26 +132,33 @@ TString AnalyzeDocument(
     if (textType.GetTypeId() != NScheme::NTypeIds::String && textType.GetTypeId() != NScheme::NTypeIds::Utf8) {
         return "Fulltext index text column must be String or Utf8";
     }
-    const auto analyzed = NFulltext::Analyze(text.AsBuf(), analyzers);
-    THashMap<TString, ui32> freq;
-    for (const auto& token : analyzed) {
-        auto& count = freq[token];
-        if (count == std::numeric_limits<ui32>::max()) {
-            return "Fulltext document has too many occurrences of one token";
-        }
-        ++count;
-        if (length == std::numeric_limits<ui32>::max()) {
-            return "Fulltext document is too long";
-        }
-        ++length;
+    NFulltext::TAnalyzeBudget budget;
+    budget.MaxInputBytes = ColumnFulltextAnalyzerMaxInputBytes;
+    budget.MaxGeneratedTokens = ColumnFulltextAnalyzerMaxGeneratedTokens;
+    budget.MaxRetainedBytes = ColumnFulltextTokenMemoryLimit;
+    auto analyzed = NFulltext::AnalyzeBounded(text.AsBuf(), analyzers, budget);
+    switch (analyzed.Status) {
+        case NFulltext::EAnalyzeBudgetStatus::InputExceeded:
+            return "Fulltext analyzer input exceeds the byte limit";
+        case NFulltext::EAnalyzeBudgetStatus::GeneratedTokensExceeded:
+            return "Fulltext analyzer exceeds the generated token limit";
+        case NFulltext::EAnalyzeBudgetStatus::RetainedBytesExceeded:
+            return "Fulltext analyzer exceeds the memory limit";
+        case NFulltext::EAnalyzeBudgetStatus::Ok:
+            break;
     }
-    tokens.reserve(freq.size());
-    for (auto& [token, count] : freq) {
-        tokens.push_back(NFulltext::TDocumentStateToken{token, withFreq ? count : 1});
+    length = analyzed.Tokens.size(); // Bounded by MaxGeneratedTokens, below ui32.
+    std::sort(analyzed.Tokens.begin(), analyzed.Tokens.end());
+    // Deduplicate in place and move token strings into state. A frequency hash
+    // table would retain another copy of every token while the analyzer lives.
+    for (size_t begin = 0; begin < analyzed.Tokens.size();) {
+        size_t end = begin + 1;
+        while (end < analyzed.Tokens.size() && analyzed.Tokens[end] == analyzed.Tokens[begin]) {
+            ++end;
+        }
+        tokens.push_back({std::move(analyzed.Tokens[begin]), withFreq ? static_cast<ui32>(end - begin) : 1});
+        begin = end;
     }
-    std::sort(tokens.begin(), tokens.end(), [](const auto& left, const auto& right) {
-        return left.Token < right.Token;
-    });
     TString encoded;
     TString error;
     if (!NFulltext::EncodeDocumentState(tokens, withFreq, encoded, error)) {

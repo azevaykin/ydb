@@ -9,7 +9,12 @@
 #include <util/generic/vector.h>
 #include <util/stream/output.h>
 
+#include <memory>
 #include <optional>
+
+namespace re2 {
+class RE2;
+}
 
 namespace NKikimr::NFulltext {
 
@@ -82,13 +87,16 @@ struct TCompiledFulltextQuery {
     // Value the row-table posting merge stores before it clamps to the term count:
     // required-term count plus the parsed optional threshold.
     ui32 MinimumShouldMatch = 0;
+    ui32 RequiredTermCount = 0;
     Ydb::Table::FulltextIndexSettings::Analyzers Analyzers;
     // Deterministic analyzer settings bytes and a content hash of those bytes.
     TString AnalyzerIdentity;
-    ui64 AnalyzerRevision = 0;
+    ui64 AnalyzerSemanticRevision = 0;
     EFulltextQueryMode Mode = EFulltextQueryMode::Keywords;
     // Original query text when Mode is Wildcard. Empty for Keywords.
     TString WildcardPattern;
+    // Shared by every portion using this bound query; compiling RE2 per row is expensive.
+    std::shared_ptr<const re2::RE2> WildcardRegexp;
 };
 
 struct TFulltextQueryValidation {
@@ -108,6 +116,8 @@ TFulltextQueryValidation CompileFulltextQuery(
     const TFulltextQueryOptions& options = {});
 
 // Token condition only. Does not apply the wildcard residual.
+bool EvaluateFulltextCounts(const TCompiledFulltextQuery& query, ui32 matchedRequired, ui32 matchedOptional);
+
 bool EvaluateFulltextMembership(
     const TCompiledFulltextQuery& query,
     const THashSet<TString>& documentTokens);

@@ -610,7 +610,7 @@ public:
         LogPrefix = TStringBuilder() << "SelfId: " << this->SelfId() << ", " << LogPrefix;
         try {
             const auto partitioning = TxManager->GetPartitioning(TableId);
-            if (!partitioning) {
+            if (IsOlap || !partitioning) {
                 Resolve();
             } else {
                 Partitioning = partitioning;
@@ -2327,6 +2327,21 @@ public:
     }
 
     i64 GetMemory() const {
+        if (!ColumnFulltext.Empty()) {
+            // Old-image merging replaces Arrow input with cell batches. Their
+            // sizes differ, so cell-size deltas cannot account for this task.
+            i64 memory = 0;
+            for (const auto& batch : BufferedBatches) {
+                memory += batch ? batch->GetMemory() : 0;
+            }
+            for (const auto& batch : ProcessBatches) {
+                memory += batch ? batch->GetMemory() : 0;
+            }
+            for (const auto& write : Writes) {
+                memory += write.Batch ? write.Batch->GetMemory() : 0;
+            }
+            return memory;
+        }
         return Memory;
     }
 
@@ -2639,9 +2654,9 @@ private:
     }
 
     bool ContinueToUniqueOrWrite() {
-        if (!PathLookupInfo.empty()) {
-            // Need to lookup unique indexes.
-            // In this case unique indexes keys are subsets of main table key or operation is INSERT.
+        if (PathLookupInfo.size() > (NeedLookup() ? 1u : 0u)) {
+            // The base old-image lookup is already complete. Only secondary
+            // lookups require unique-key validation; DELETE must skip it.
             if (!PathLockInfo.empty()) {
                 return StartUniqueIndexLock();
             }
@@ -4030,6 +4045,7 @@ struct TWriteSettings {
         NKikimrSchemeOp::EIndexState IndexState = NKikimrSchemeOp::EIndexStateInvalid;
         ui64 BuildGeneration = 0;
         TString TextColumn;
+        std::optional<NKikimrKqp::TKqpColumnMetadataProto> TextColumnMetadata;
         TVector<TString> PrefixColumns;
         TVector<TString> CoveredColumns;
         TString TtlColumn;
@@ -4601,7 +4617,9 @@ public:
         index.Ready = indexSettings.IndexState == NKikimrSchemeOp::EIndexStateReady;
         index.BuildGeneration = indexSettings.BuildGeneration == 0 ? 1 : indexSettings.BuildGeneration;
         index.Settings = indexSettings.FulltextSettings;
-        if (!requireColumn(indexSettings.TextColumn, index.Text)) {
+        if (indexSettings.TextColumnMetadata) {
+            index.Text = ToFulltextColumn(*indexSettings.TextColumnMetadata);
+        } else if (!requireColumn(indexSettings.TextColumn, index.Text)) {
             return false;
         }
         for (const auto& name : indexSettings.PrefixColumns) {
@@ -7879,6 +7897,9 @@ private:
                 ev->Settings->Indexes.back().IndexState = indexSettings.GetIndexState();
                 ev->Settings->Indexes.back().BuildGeneration = indexSettings.GetBuildGeneration();
                 ev->Settings->Indexes.back().TextColumn = indexSettings.GetTextColumn();
+                if (indexSettings.HasTextColumnMetadata()) {
+                    ev->Settings->Indexes.back().TextColumnMetadata = indexSettings.GetTextColumnMetadata();
+                }
                 ev->Settings->Indexes.back().PrefixColumns.assign(
                     indexSettings.GetPrefixColumns().begin(), indexSettings.GetPrefixColumns().end());
                 ev->Settings->Indexes.back().CoveredColumns.assign(

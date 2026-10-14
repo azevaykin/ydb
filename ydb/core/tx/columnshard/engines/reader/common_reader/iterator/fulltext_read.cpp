@@ -2,10 +2,11 @@
 #include "fetch_steps.h"
 #include "source.h"
 
-#include <ydb/core/tx/columnshard/engines/portions/index_chunk.h>
-
+#include <ydb/core/base/appdata.h>
 #include <ydb/core/formats/arrow/accessor/plain/accessor.h>
+#include <ydb/core/tx/columnshard/engines/portions/index_chunk.h>
 #include <ydb/core/tx/columnshard/engines/scheme/index_info.h>
+#include <ydb/core/tx/columnshard/engines/scheme/indexes/abstract/common.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/fulltext/counters.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/fulltext/meta.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/fulltext/posting_match.h>
@@ -14,9 +15,6 @@
 #include <ydb/library/actors/core/log.h>
 
 #include <contrib/libs/apache/arrow/cpp/src/arrow/array/builder_primitive.h>
-
-#include <ydb/core/tx/columnshard/engines/scheme/indexes/abstract/common.h>
-
 #include <util/generic/hash_set.h>
 
 #include <algorithm>
@@ -109,19 +107,6 @@ TConclusion<NArrow::NSSA::TExecutionResult> AddBoolean(
     return NArrow::NSSA::TExecutionResult::Done();
 }
 
-TConclusion<std::vector<std::optional<TString>>> ReadScalarTexts(
-    const NArrow::NSSA::TProcessorContext& context, const ui32 columnId, const ui32 expectedRows) {
-    const std::shared_ptr<arrow::Scalar>& scalar = context.GetResources().GetConstantScalarOptional(columnId);
-    if (!scalar) {
-        return TConclusionStatus::Fail("Fulltext text column is not available");
-    }
-    auto text = NArrow::NSSA::ReadFulltextScalar(*scalar);
-    if (text.IsFail()) {
-        return TConclusionStatus::Fail(text.GetErrorMessage());
-    }
-    return std::vector<std::optional<TString>>(expectedRows, text.GetResult());
-}
-
 bool TextIsPresent(const NArrow::NSSA::TProcessorContext& context, const ui32 columnId) {
     return context.GetResources().GetAccessorOptional(columnId) || context.GetResources().GetConstantScalarOptional(columnId);
 }
@@ -142,32 +127,28 @@ TConclusion<NArrow::NSSA::TExecutionResult> StartTextFetch(
     return source.StartFetch(context, fetchers);
 }
 
-void RememberFallback(TFetchedData::TFulltextMatchState& state, TString reason, const ui32 rows = 0, const ui64 bytes = 0) {
+void RememberFallback(TFetchedData::TFulltextMatchState& state, TString reason) {
     state.IndexCollected = true;
     state.NeedText = true;
     state.HasTokenMask = false;
     state.PortionMask.clear();
     state.FallbackReason = std::move(reason);
-    NIndexes::NFulltext::TFulltextBuildCounters::OnFallback(rows, bytes);
 }
 
-}
+}   // namespace
 
 TConclusion<NArrow::NSSA::TExecutionResult> IDataSource::ReserveFulltextMatch(
     const NArrow::NSSA::TProcessorContext& context, const NArrow::NSSA::TFulltextMatchRequest& request) {
     if (!HasPortionAccessor() || context.GetResources().GetFilter().IsTotalDenyFilter()) {
         return NArrow::NSSA::TExecutionResult::Done();
     }
-    const std::shared_ptr<NIndexes::NFulltext::TFulltextIndexMeta> fulltext = FindUsableIndex(*this, request);
-    if (!fulltext) {
-        return NArrow::NSSA::TExecutionResult::Done();
-    }
-    ui64 bytes = 0;
-    for (const TIndexChunk* chunk : GetPortionAccessor().GetIndexChunksPointers(request.IndexId)) {
-        bytes += chunk->GetDataSize();
-    }
-    if (bytes == 0) {
-        return NArrow::NSSA::TExecutionResult::Done();
+    // Blob bytes plus borrowed dictionary descriptors (at most one per 16
+    // serialized bytes), per-chunk counters, and source/program/output masks.
+    ui64 bytes = static_cast<ui64>(GetRecordsCount()) * 12;
+    if (!AppDataVerified().FeatureFlags.GetForceLocalFulltextTextFallback() && FindUsableIndex(*this, request)) {
+        for (const TIndexChunk* chunk : GetPortionAccessor().GetIndexChunksPointers(request.IndexId)) {
+            bytes += static_cast<ui64>(chunk->GetDataSize()) * 8;
+        }
     }
     return StartProgramStepReserveMemory(*this, bytes, NArrow::NSSA::IMemoryCalculationPolicy::EStage::Filter);
 }
@@ -185,13 +166,15 @@ TConclusion<NArrow::NSSA::TExecutionResult> IDataSource::FetchFulltextIndex(
         state.PortionMask.assign(GetRecordsCount(), 0);
         return NArrow::NSSA::TExecutionResult::Done();
     }
+    if (AppDataVerified().FeatureFlags.GetForceLocalFulltextTextFallback()) {
+        RememberFallback(state, "fulltext text fallback is forced");
+        return NArrow::NSSA::TExecutionResult::Done();
+    }
     const std::shared_ptr<NIndexes::NFulltext::TFulltextIndexMeta> fulltext = FindUsableIndex(*this, request);
     const std::vector<const TIndexChunk*> chunks =
         fulltext ? GetPortionAccessor().GetIndexChunksPointers(request.IndexId) : std::vector<const TIndexChunk*>();
     if (!fulltext || chunks.empty()) {
-        RememberFallback(state,
-            fulltext ? "fulltext index has no chunks" : "fulltext index is not available for this portion",
-            GetRecordsCount());
+        RememberFallback(state, fulltext ? "fulltext index has no chunks" : "fulltext index is not available for this portion");
         YDB_LOG_DEBUG("",
             {"event", "fulltext_fallback"},
             {"reason", state.FallbackReason},
@@ -235,16 +218,16 @@ TConclusion<NArrow::NSSA::TExecutionResult> IDataSource::DecideFulltextMatch(
             if (!bytes) {
                 return Fail("fulltext index chunk bytes are missing");
             }
-            chunks.push_back(TFulltextStoredChunk{*bytes, chunk.GetRecordsCount()});
+            chunks.push_back(TFulltextStoredChunk{ *bytes, chunk.GetRecordsCount() });
         }
-        const auto assessed = NIndexes::NFulltext::BuildFulltextPostingMask(
-            chunks, GetRecordsCount(), request.ColumnId, request.IndexId, request.Query);
+        auto assessed =
+            NIndexes::NFulltext::BuildFulltextPostingMask(chunks, GetRecordsCount(), request.ColumnId, request.IndexId, request.Query);
         if (assessed.Status == EFulltextPostingStatus::Error) {
             NIndexes::NFulltext::TFulltextBuildCounters::OnDecodeError();
             return Fail(assessed.Reason);
         }
         if (assessed.Status == EFulltextPostingStatus::NeedTextFallback) {
-            RememberFallback(state, assessed.Reason, GetRecordsCount());
+            RememberFallback(state, assessed.Reason);
             YDB_LOG_DEBUG("",
                 {"event", "fulltext_fallback"},
                 {"reason", state.FallbackReason},
@@ -252,7 +235,7 @@ TConclusion<NArrow::NSSA::TExecutionResult> IDataSource::DecideFulltextMatch(
         } else {
             state.IndexCollected = true;
             state.HasTokenMask = true;
-            state.PortionMask = assessed.PortionMask;
+            state.PortionMask = std::move(assessed.PortionMask);
             state.NeedText = request.Query.Mode == NFulltext::EFulltextQueryMode::Wildcard && AnyMatch(state.PortionMask);
             state.FallbackReason.clear();
             ui64 bytes = 0;
@@ -262,8 +245,7 @@ TConclusion<NArrow::NSSA::TExecutionResult> IDataSource::DecideFulltextMatch(
             const ui32 matched = std::count_if(state.PortionMask.begin(), state.PortionMask.end(), [](ui8 v) {
                 return v != 0;
             });
-            NIndexes::NFulltext::TFulltextBuildCounters::OnIndexedRead(
-                chunks.size(), bytes, state.PortionMask.size(), matched);
+            NIndexes::NFulltext::TFulltextBuildCounters::OnIndexedRead(chunks.size(), bytes, state.PortionMask.size(), matched);
         }
     }
     return NArrow::NSSA::TExecutionResult::Done();
@@ -275,7 +257,8 @@ TConclusion<NArrow::NSSA::TExecutionResult> IDataSource::ReserveFulltextText(
     if (!state || !state->NeedText || TextIsPresent(context, request.ColumnId) || !HasPortionAccessor()) {
         return NArrow::NSSA::TExecutionResult::Done();
     }
-    const ui64 bytes = GetColumnBlobBytes(std::set<ui32>{request.ColumnId});
+    const std::set<ui32> columns{ request.ColumnId };
+    const ui64 bytes = GetColumnBlobBytes(columns) + GetColumnRawBytes(columns);
     if (bytes == 0) {
         return NArrow::NSSA::TExecutionResult::Done();
     }
@@ -321,75 +304,59 @@ TConclusion<NArrow::NSSA::TExecutionResult> IDataSource::EmitFulltextMatch(
         return AddBoolean(context, outputColumnId, program.GetResult());
     }
 
-    std::vector<std::optional<TString>> texts;
-    if (const std::shared_ptr<NArrow::NAccessor::IChunkedArray>& accessor = context.GetResources().GetAccessorOptional(request.ColumnId)) {
-        const ui32 length = accessor->GetRecordsCount();
-        if (length != space.PortionRows && length != space.ProgramRows) {
-            return Fail("fulltext text column is not aligned with source rows");
-        }
-        auto read = NArrow::NSSA::ReadFulltextTexts(accessor);
-        if (read.IsFail()) {
-            return Fail(read.GetErrorMessage());
-        }
-        texts = read.DetachResult();
-    } else if (context.GetResources().GetConstantScalarOptional(request.ColumnId)) {
-        auto read = ReadScalarTexts(context, request.ColumnId, space.PortionRows);
-        if (read.IsFail()) {
-            return Fail(read.GetErrorMessage());
-        }
-        texts = read.DetachResult();
-    } else {
+    const auto& accessor = context.GetResources().GetAccessorOptional(request.ColumnId);
+    const auto& constant = context.GetResources().GetConstantScalarOptional(request.ColumnId);
+    if (!accessor && !constant) {
         return Fail("Fulltext text column is not available");
     }
-
-    if (state->HasTokenMask) {
-        if (texts.size() == state->PortionMask.size()) {
-            auto portion = NArrow::NSSA::ApplyFulltextWildcardResidual(request.Query, state->PortionMask, texts);
-            if (portion.IsFail()) {
-                return Fail(portion.GetErrorMessage());
-            }
-            auto program = NIndexes::NFulltext::MapFulltextMaskToProgramRows(portion.GetResult(), space.Shrinking, space.ProgramRows);
-            if (program.IsFail()) {
-                return Fail(program.GetErrorMessage());
-            }
-            return AddBoolean(context, outputColumnId, program.GetResult());
-        }
-        if (texts.size() == space.ProgramRows) {
-            auto program = NIndexes::NFulltext::MapFulltextMaskToProgramRows(state->PortionMask, space.Shrinking, space.ProgramRows);
-            if (program.IsFail()) {
-                return Fail(program.GetErrorMessage());
-            }
-            auto matched = NArrow::NSSA::ApplyFulltextWildcardResidual(request.Query, program.GetResult(), texts);
-            if (matched.IsFail()) {
-                return Fail(matched.GetErrorMessage());
-            }
-            return AddBoolean(context, outputColumnId, matched.GetResult());
-        }
+    const ui32 length = accessor ? accessor->GetRecordsCount() : space.PortionRows;
+    if (length != space.PortionRows && length != space.ProgramRows) {
         return Fail("fulltext text column is not aligned with source rows");
     }
-
-    if (texts.size() == space.PortionRows) {
-        auto portion = NArrow::NSSA::EvaluateFulltextTexts(request.Query, texts);
-        if (portion.IsFail()) {
-            return Fail(portion.GetErrorMessage());
+    std::vector<ui8> mask;
+    if (state->HasTokenMask) {
+        if (length == space.PortionRows) {
+            mask = state->PortionMask;
+        } else {
+            auto mapped = NIndexes::NFulltext::MapFulltextMaskToProgramRows(state->PortionMask, space.Shrinking, space.ProgramRows);
+            if (mapped.IsFail()) {
+                return Fail(mapped.GetErrorMessage());
+            }
+            mask = mapped.DetachResult();
         }
-        auto program = NIndexes::NFulltext::MapFulltextMaskToProgramRows(portion.GetResult(), space.Shrinking, space.ProgramRows);
-        if (program.IsFail()) {
-            return Fail(program.GetErrorMessage());
-        }
-        return AddBoolean(context, outputColumnId, program.GetResult());
+    } else {
+        mask.assign(length, 1);
     }
-    if (texts.size() == space.ProgramRows && space.Shrinking) {
-        auto program = NArrow::NSSA::EvaluateFulltextTexts(request.Query, texts);
-        if (program.IsFail()) {
-            return Fail(program.GetErrorMessage());
+    std::optional<bool> constantResult;
+    for (ui32 row = 0; row < length; ++row) {
+        if (!mask[row]) {
+            continue;
         }
-        if (program.GetResult().size() != space.ProgramRows) {
-            return Fail("fulltext text column is not aligned with source rows");
+        if (constantResult) {
+            mask[row] = *constantResult;
+            continue;
         }
-        return AddBoolean(context, outputColumnId, program.GetResult());
+        const auto scalar = accessor ? accessor->GetScalar(row) : constant;
+        auto matched = NArrow::NSSA::EvaluateFulltextScalar(request.Query, *scalar, state->HasTokenMask);
+        if (matched.IsFail()) {
+            return Fail(matched.GetErrorMessage());
+        }
+        mask[row] = matched.GetResult();
+        if (!accessor) {
+            constantResult = matched.GetResult();
+        }
     }
-    return Fail("fulltext text column is not aligned with source rows");
+    if (!state->HasTokenMask) {
+        NIndexes::NFulltext::TFulltextBuildCounters::OnFallback(length, GetColumnBlobBytes(std::set<ui32>{ request.ColumnId }));
+    }
+    if (length == space.PortionRows) {
+        auto mapped = NIndexes::NFulltext::MapFulltextMaskToProgramRows(mask, space.Shrinking, space.ProgramRows);
+        if (mapped.IsFail()) {
+            return Fail(mapped.GetErrorMessage());
+        }
+        return AddBoolean(context, outputColumnId, mapped.GetResult());
+    }
+    return AddBoolean(context, outputColumnId, mask);
 }
 
-}
+}   // namespace NKikimr::NOlap::NReader::NCommon

@@ -966,11 +966,20 @@ ui64 CompileColumnFulltextMatch(const TKqpOlapFulltextMatch& match, TKqpOlapComp
     fulltext->SetColumnId(ctx.GetColumnId(TString(match.ColumnName().Value())));
     fulltext->SetAnalyzerSettings(NKikimr::NFulltext::FulltextAnalyzerIdentity(analyzers));
     fulltext->SetAnalyzerRevision(NKikimr::NFulltext::FulltextAnalyzerRevision(analyzers));
-    if (match.DefaultOperator().Value()) {
-        fulltext->SetDefaultOperator(TString(match.DefaultOperator().Value()));
+    fulltext->SetAnalyzerSemanticRevision(NKikimr::NFulltext::FulltextAnalyzerSemanticRevision);
+    if (auto parameter = match.DefaultOperator().Maybe<TCoParameter>()) {
+        const TString name(parameter.Cast().Name().Value());
+        fulltext->SetDefaultOperatorParameter(name);
+        ctx.AddParameterName(name);
+    } else {
+        fulltext->SetDefaultOperator(TString(match.DefaultOperator().Ref().Content()));
     }
-    if (match.MinimumShouldMatch().Value()) {
-        fulltext->SetMinimumShouldMatch(TString(match.MinimumShouldMatch().Value()));
+    if (auto parameter = match.MinimumShouldMatch().Maybe<TCoParameter>()) {
+        const TString name(parameter.Cast().Name().Value());
+        fulltext->SetMinimumShouldMatchParameter(name);
+        ctx.AddParameterName(name);
+    } else {
+        fulltext->SetMinimumShouldMatch(TString(match.MinimumShouldMatch().Ref().Content()));
     }
     if (match.Mode().Value()) {
         fulltext->SetMode(TString(match.Mode().Value()));

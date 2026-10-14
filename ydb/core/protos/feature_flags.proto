@@ -450,4 +450,6 @@ message TFeatureFlags {
     // DDL for compact GLOBAL fulltext_plain / fulltext_relevance on column tables.
     // Indexes created while the flag was on keep their support tables after it is turned off.
     optional bool EnableColumnTableGlobalFulltextIndex = 363 [default = false];
+    // Evaluate local fulltext predicates from text, including portions with postings.
+    optional bool ForceLocalFulltextTextFallback = 364 [default = false];
 }

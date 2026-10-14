@@ -1184,13 +1184,26 @@ Ydb::Type MakeYdbType(NScheme::TTypeInfo type) {
     return out;
 }
 
-TVector<std::pair<TString, Ydb::Type>> TableUploadColumns(const TTableInfo& table) {
+TVector<std::pair<TString, Ydb::Type>> TableUploadColumns(const TTableInfo& table,
+    const TVector<TString>& valueNames = {}) {
     TVector<std::pair<TString, Ydb::Type>> columns;
     columns.reserve(table.Columns.size());
     THashSet<ui32> keyIds(table.KeyColumnIds.begin(), table.KeyColumnIds.end());
     for (ui32 keyId : table.KeyColumnIds) {
         const auto& column = table.Columns.at(keyId);
         columns.emplace_back(column.Name, MakeYdbType(column.PType));
+    }
+    if (!valueNames.empty()) {
+        for (const auto& name : valueNames) {
+            const auto column = std::find_if(table.Columns.begin(), table.Columns.end(), [&](const auto& item) {
+                return !item.second.IsDropped() && item.second.Name == name;
+            });
+            Y_ENSURE(column != table.Columns.end(), "Missing fulltext upload column " << name);
+            if (!keyIds.contains(column->second.Id)) {
+                columns.emplace_back(name, MakeYdbType(column->second.PType));
+            }
+        }
+        return columns;
     }
     for (const auto& [_, column] : table.Columns) {
         if (column.IsDropped() || keyIds.contains(column.Id)) {
@@ -2092,6 +2105,7 @@ private:
         settings.CoveredColumns = buildInfo.DataColumns;
 
         const auto& stateTable = *Self->Tables.at(statePath->PathId);
+        settings.StateSchemaVersion = stateTable.AlterVersion;
         settings.StateKeyColumnCount = stateTable.KeyColumnIds.size();
         settings.StateUploadColumns = TableUploadColumns(stateTable);
         auto toProto = [](const TTableInfo::TColumn& column) {
@@ -2127,7 +2141,8 @@ private:
 
         const auto& postingTable = *Self->Tables.at(postingPath->PathId);
         settings.PostingKeyColumnCount = postingTable.KeyColumnIds.size();
-        settings.PostingColumns = TableUploadColumns(postingTable);
+        settings.PostingColumns = TableUploadColumns(postingTable,
+            {NTableIndex::NFulltext::AddedColumn, NTableIndex::NFulltext::SegmentColumn});
 
         if (relevance) {
             auto docsPath = GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::DocsTable);
@@ -2140,8 +2155,11 @@ private:
             const auto& statsTable = *Self->Tables.at(statsPath->PathId);
             settings.DocsKeyColumnCount = docsTable.KeyColumnIds.size();
             settings.StatsKeyColumnCount = statsTable.KeyColumnIds.size();
-            settings.DocsColumns = TableUploadColumns(docsTable);
-            settings.StatsColumns = TableUploadColumns(statsTable);
+            TVector<TString> docsValues{NTableIndex::NFulltext::DocLengthColumn};
+            docsValues.insert(docsValues.end(), settings.CoveredColumns.begin(), settings.CoveredColumns.end());
+            settings.DocsColumns = TableUploadColumns(docsTable, docsValues);
+            settings.StatsColumns = TableUploadColumns(statsTable,
+                {NTableIndex::NFulltext::DocCountColumn, NTableIndex::NFulltext::SumDocLengthColumn});
         }
         if (synthetic) {
             auto mapPath = GetBuildPath(Self, buildInfo, NTableIndex::NFulltext::DocIdMapTable);
@@ -2151,9 +2169,13 @@ private:
             const auto& mapTable = *Self->Tables.at(mapPath->PathId);
             settings.MapKeyColumnCount = mapTable.KeyColumnIds.size();
             settings.MapUploadColumns = TableUploadColumns(mapTable);
-            for (const auto& [_, column] : mapTable.Columns) {
-                if (!column.IsDropped()) {
-                    settings.MapColumns.push_back(toProto(column));
+            for (const auto& [name, type] : settings.MapUploadColumns) {
+                Y_UNUSED(type);
+                for (const auto& [_, column] : mapTable.Columns) {
+                    if (!column.IsDropped() && column.Name == name) {
+                        settings.MapColumns.push_back(toProto(column));
+                        break;
+                    }
                 }
             }
         }

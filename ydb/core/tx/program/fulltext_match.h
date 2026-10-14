@@ -25,6 +25,10 @@ TConclusion<std::vector<std::optional<TString>>> ReadFulltextTexts(const std::sh
 
 TConclusion<std::optional<TString>> ReadFulltextScalar(const arrow::Scalar& scalar);
 
+// Evaluates borrowed scalar bytes without copying a portion's text into strings.
+TConclusion<bool> EvaluateFulltextScalar(const NFulltext::TCompiledFulltextQuery& query,
+    const arrow::Scalar& scalar, bool residualOnly = false);
+
 // Null text is false. Empty text is analyzed.
 TConclusion<std::vector<ui8>> EvaluateFulltextTexts(
     const NFulltext::TCompiledFulltextQuery& query, const std::vector<std::optional<TString>>& texts);

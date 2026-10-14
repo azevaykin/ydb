@@ -1,14 +1,13 @@
+#include <ydb/core/formats/arrow/accessor/plain/accessor.h>
+#include <ydb/core/formats/arrow/serializer/abstract.h>
 #include <ydb/core/tx/columnshard/engines/storage/chunks/data.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/fulltext/format.h>
 #include <ydb/core/tx/columnshard/engines/storage/indexes/fulltext/meta.h>
-
-#include <ydb/core/formats/arrow/accessor/plain/accessor.h>
-#include <ydb/core/formats/arrow/serializer/abstract.h>
+#include <ydb/core/tx/program/fulltext_match.h>
 
 #include <contrib/libs/apache/arrow/cpp/src/arrow/array/builder_binary.h>
 #include <library/cpp/testing/common/env.h>
 #include <library/cpp/testing/unittest/registar.h>
-
 #include <util/stream/file.h>
 
 namespace NKikimr::NOlap::NIndexes::NFulltext {
@@ -37,8 +36,8 @@ TIndexBuildContext Context(i64 maxChunkBytes = 1 << 20, ui64 memory = 64ull << 2
     return context;
 }
 
-std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>> MustBuild(const std::vector<std::optional<TString>>& documents, const TFulltextIndexMeta& meta,
-    const TIndexBuildContext& context) {
+std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>> MustBuild(
+    const std::vector<std::optional<TString>>& documents, const TFulltextIndexMeta& meta, const TIndexBuildContext& context) {
     auto outcome = BuildFulltextFromDocuments(documents, meta, context);
     if (outcome.IsFail()) {
         UNIT_ASSERT_C(false, outcome.GetErrorMessage());
@@ -77,8 +76,8 @@ TFulltextChunkPlain FixturePlain() {
     plain.IndexId = 11;
     plain.Analyzers = Analyzers(Ydb::Table::FulltextIndexSettings::KEYWORD);
     plain.ChunkRowCount = 4;
-    plain.Postings.push_back(TFulltextPostingList{"b", {0}});
-    plain.Postings.push_back(TFulltextPostingList{"a", {1, 2}});
+    plain.Postings.push_back(TFulltextPostingList{ "b", { 0 } });
+    plain.Postings.push_back(TFulltextPostingList{ "a", { 1, 2 } });
     return plain;
 }
 
@@ -88,9 +87,32 @@ std::shared_ptr<NArrow::NAccessor::TColumnLoader> MakeLoader(const std::shared_p
         NArrow::NAccessor::TConstructorContainer::GetDefaultConstructor(), field, defaultValue, columnId);
 }
 
-}
+}   // namespace
 
 Y_UNIT_TEST_SUITE(FulltextChunkFormat) {
+    Y_UNIT_TEST(ScanProgramAcceptsLegacyRevisionAndRejectsUnknownSemantics) {
+        const auto analyzers = Analyzers(Ydb::Table::FulltextIndexSettings::WHITESPACE);
+        NKikimrSSA::TProgram::TAssignment::TFulltextMatch match;
+        match.SetIndexId(11);
+        match.SetColumnId(1);
+        match.SetAnalyzerSettings(NKikimr::NFulltext::FulltextAnalyzerIdentity(analyzers));
+        match.SetAnalyzerRevision(NKikimr::NFulltext::FulltextAnalyzerRevision(analyzers));
+        match.SetQueryText("alpha");
+        const NArrow::NSSA::TSchemaColumnResolver resolver(arrow::schema({ arrow::field("text", arrow::utf8()) }));
+        const auto append = [&] {
+            NArrow::NSSA::NGraph::NOptimization::TGraph::TBuilder builder(resolver);
+            return NArrow::NSSA::AppendFulltextMatch(builder, match, 10, nullptr);
+        };
+        UNIT_ASSERT(!match.HasAnalyzerSemanticRevision());
+        UNIT_ASSERT(append().IsSuccess());
+        match.SetAnalyzerSemanticRevision(NKikimr::NFulltext::FulltextAnalyzerSemanticRevision);
+        UNIT_ASSERT(append().IsSuccess());
+        match.SetAnalyzerSemanticRevision(NKikimr::NFulltext::FulltextAnalyzerSemanticRevision + 1);
+        const auto unsupported = append();
+        UNIT_ASSERT(unsupported.IsFail());
+        UNIT_ASSERT_STRING_CONTAINS(unsupported.GetErrorMessage(), "unsupported analyzer semantic revision");
+    }
+
     Y_UNIT_TEST(CanonicalSettingsStoreExplicitDefaults) {
         const auto analyzers = Analyzers(Ydb::Table::FulltextIndexSettings::KEYWORD);
         UNIT_ASSERT(!analyzers.has_filter_ngram_min_length());
@@ -102,20 +124,19 @@ Y_UNIT_TEST_SUITE(FulltextChunkFormat) {
         auto parsed = ParseCanonicalAnalyzerSettings(canonical);
         UNIT_ASSERT_C(parsed.IsSuccess(), parsed.IsFail() ? parsed.GetErrorMessage() : TString());
         UNIT_ASSERT_VALUES_EQUAL(CanonicalAnalyzerSettings(parsed.GetResult()), canonical);
-        UNIT_ASSERT_VALUES_EQUAL(NKikimr::NFulltext::FulltextAnalyzerRevision(parsed.GetResult()), NKikimr::NFulltext::FulltextAnalyzerRevision(analyzers));
+        UNIT_ASSERT_VALUES_EQUAL(NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(parsed.GetResult()),
+            NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(analyzers));
     }
 
-    Y_UNIT_TEST(VersionOneFixtureMatchesEncoder) {
-        auto encoded = EncodeFulltextChunk(FixturePlain());
-        UNIT_ASSERT_C(encoded.IsSuccess(), encoded.IsFail() ? encoded.GetErrorMessage() : TString());
-        const TString fixture = TFileInput(ArcadiaSourceRoot() + "/ydb/core/tx/columnshard/engines/storage/indexes/fulltext/ut/format_v1.bin").ReadAll();
-        UNIT_ASSERT_VALUES_EQUAL(encoded.GetResult(), fixture);
+    Y_UNIT_TEST(VersionOneFixtureRemainsReadable) {
+        const TString fixture =
+            TFileInput(ArcadiaSourceRoot() + "/ydb/core/tx/columnshard/engines/storage/indexes/fulltext/ut/format_v1.bin").ReadAll();
 
         const auto decoded = MustDecode(fixture);
         UNIT_ASSERT_VALUES_EQUAL(decoded.ColumnId, 7);
         UNIT_ASSERT_VALUES_EQUAL(decoded.IndexId, 11);
         UNIT_ASSERT_VALUES_EQUAL(decoded.ChunkRowCount, 4);
-        UNIT_ASSERT_VALUES_EQUAL(decoded.AnalyzerRevision, NKikimr::NFulltext::FulltextAnalyzerRevision(decoded.Analyzers));
+        UNIT_ASSERT_VALUES_EQUAL(decoded.AnalyzerSemanticRevision, 1);
         UNIT_ASSERT_VALUES_EQUAL(decoded.Postings.size(), 2);
         UNIT_ASSERT_VALUES_EQUAL(decoded.Postings[0].Token, "a");
         UNIT_ASSERT_VALUES_EQUAL(decoded.Postings[0].Rows.size(), 2);
@@ -124,6 +145,46 @@ Y_UNIT_TEST_SUITE(FulltextChunkFormat) {
         UNIT_ASSERT_VALUES_EQUAL(decoded.Postings[1].Token, "b");
         UNIT_ASSERT_VALUES_EQUAL(decoded.Postings[1].Rows.size(), 1);
         UNIT_ASSERT_VALUES_EQUAL(decoded.Postings[1].Rows[0], 0);
+    }
+
+    Y_UNIT_TEST(VersionTwoFixtureMatchesEncoder) {
+        const TString fixture =
+            TFileInput(ArcadiaSourceRoot() + "/ydb/core/tx/columnshard/engines/storage/indexes/fulltext/ut/format_v2.bin").ReadAll();
+        const TString encoded = EncodeFulltextChunk(FixturePlain()).DetachResult();
+        UNIT_ASSERT_VALUES_EQUAL(encoded, fixture);
+        const auto decoded = MustDecode(fixture);
+        UNIT_ASSERT_VALUES_EQUAL(decoded.AnalyzerSemanticRevision, NKikimr::NFulltext::FulltextAnalyzerSemanticRevision);
+        UNIT_ASSERT_VALUES_EQUAL(decoded.CanonicalSettings, NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(decoded.Analyzers));
+    }
+
+    Y_UNIT_TEST(LegacyFingerprintCorruptionIsAnError) {
+        TString fixture =
+            TFileInput(ArcadiaSourceRoot() + "/ydb/core/tx/columnshard/engines/storage/indexes/fulltext/ut/format_v1.bin").ReadAll();
+        fixture[20] = static_cast<char>(fixture[20] ^ 1);
+        const auto decoded = DecodeFulltextChunkView(fixture);
+        UNIT_ASSERT(decoded.IsFail());
+        UNIT_ASSERT_STRING_CONTAINS(decoded.GetErrorMessage(), "legacy analyzer fingerprint");
+    }
+
+    Y_UNIT_TEST(ValidatedViewsBorrowTheBlob) {
+        const TString bytes = EncodeFulltextChunk(FixturePlain()).DetachResult();
+        auto decoded = DecodeFulltextChunkView(bytes);
+        UNIT_ASSERT_C(decoded.IsSuccess(), decoded.GetErrorMessage());
+        const auto& view = decoded.GetResult();
+        UNIT_ASSERT_VALUES_EQUAL(view.Postings.size(), 2);
+        for (const auto& posting : view.Postings) {
+            UNIT_ASSERT(posting.Token.data() >= bytes.data());
+            UNIT_ASSERT(posting.Token.data() + posting.Token.size() <= bytes.data() + bytes.size());
+            UNIT_ASSERT(posting.EncodedRows.data() >= bytes.data());
+            UNIT_ASSERT(posting.EncodedRows.data() + posting.EncodedRows.size() <= bytes.data() + bytes.size());
+        }
+        std::vector<ui32> rows;
+        view.Postings[0].VisitRows([&](ui32 row) {
+            rows.push_back(row);
+        });
+        UNIT_ASSERT_VALUES_EQUAL(rows.size(), 2);
+        UNIT_ASSERT_VALUES_EQUAL(rows[0], 1);
+        UNIT_ASSERT_VALUES_EQUAL(rows[1], 2);
     }
 
     Y_UNIT_TEST(MalformedBytesAreErrors) {
@@ -136,7 +197,7 @@ Y_UNIT_TEST_SUITE(FulltextChunkFormat) {
         }
         {
             TString bad = valid;
-            WriteU32At(bad, 4, 2);
+            WriteU32At(bad, 4, FulltextChunkFormatVersion + 1);
             auto decoded = DecodeFulltextChunk(bad);
             UNIT_ASSERT(decoded.IsFail());
             UNIT_ASSERT(decoded.GetErrorMessage().Contains("unsupported fulltext chunk format"));
@@ -161,7 +222,7 @@ Y_UNIT_TEST_SUITE(FulltextChunkFormat) {
             UNIT_ASSERT(decoded.GetErrorMessage().Contains("posting"));
         }
         {
-            auto chunks = MustBuild({TString("a"), TString("a")}, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
+            auto chunks = MustBuild({ TString("a"), TString("a") }, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
             TString bad = chunks.front()->GetData();
             const size_t dict = DictionaryStart(bad);
             const ui32 tokenSize = ReadU32At(bad, dict);
@@ -172,7 +233,7 @@ Y_UNIT_TEST_SUITE(FulltextChunkFormat) {
             UNIT_ASSERT(decoded.GetErrorMessage().Contains("strictly increasing"));
         }
         {
-            auto chunks = MustBuild({TString("a")}, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
+            auto chunks = MustBuild({ TString("a") }, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
             TString bad = chunks.front()->GetData();
             const size_t dict = DictionaryStart(bad);
             const ui32 tokenSize = ReadU32At(bad, dict);
@@ -219,7 +280,7 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
     }
 
     Y_UNIT_TEST(DuplicateTokensEmitOnePosting) {
-        const auto chunks = MustBuild({TString("a a a")}, Meta(Ydb::Table::FulltextIndexSettings::WHITESPACE), Context());
+        const auto chunks = MustBuild({ TString("a a a") }, Meta(Ydb::Table::FulltextIndexSettings::WHITESPACE), Context());
         const auto decoded = MustDecode(chunks[0]->GetData());
         UNIT_ASSERT_VALUES_EQUAL(decoded.ChunkRowCount, 1);
         UNIT_ASSERT_VALUES_EQUAL(decoded.Postings.size(), 1);
@@ -229,17 +290,17 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
     }
 
     Y_UNIT_TEST(NullAndTokenlessChunksKeepCoverage) {
-        const auto nulls = MustBuild({std::nullopt, std::nullopt, std::nullopt}, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
+        const auto nulls = MustBuild({ std::nullopt, std::nullopt, std::nullopt }, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
         const auto nullDecoded = MustDecode(nulls[0]->GetData());
         UNIT_ASSERT_VALUES_EQUAL(nullDecoded.ChunkRowCount, 3);
         UNIT_ASSERT(nullDecoded.Postings.empty());
 
-        const auto empty = MustBuild({TString(), TString()}, Meta(Ydb::Table::FulltextIndexSettings::STANDARD), Context());
+        const auto empty = MustBuild({ TString(), TString() }, Meta(Ydb::Table::FulltextIndexSettings::STANDARD), Context());
         const auto emptyDecoded = MustDecode(empty[0]->GetData());
         UNIT_ASSERT_VALUES_EQUAL(emptyDecoded.ChunkRowCount, 2);
         UNIT_ASSERT(emptyDecoded.Postings.empty());
 
-        const auto keywordEmpty = MustBuild({TString()}, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
+        const auto keywordEmpty = MustBuild({ TString() }, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), Context());
         const auto keywordDecoded = MustDecode(keywordEmpty[0]->GetData());
         UNIT_ASSERT_VALUES_EQUAL(keywordDecoded.Postings.size(), 1);
         UNIT_ASSERT_VALUES_EQUAL(keywordDecoded.Postings[0].Token, "");
@@ -248,12 +309,12 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
 
     Y_UNIT_TEST(MultiChunkCoverageUsesLocalRowIds) {
         const auto meta = Meta(Ydb::Table::FulltextIndexSettings::KEYWORD);
-        const auto one = MustBuild({TString("aa")}, meta, Context());
+        const auto one = MustBuild({ TString("aa") }, meta, Context());
         const i64 limit = one[0]->GetData().size();
-        const auto chunks = MustBuild({TString("aa"), TString("bb"), TString("cc")}, meta, Context(limit));
+        const auto chunks = MustBuild({ TString("aa"), TString("bb"), TString("cc") }, meta, Context(limit));
         UNIT_ASSERT_VALUES_EQUAL(chunks.size(), 3);
         ui32 covered = 0;
-        const TVector<TString> tokens = {"aa", "bb", "cc"};
+        const TVector<TString> tokens = { "aa", "bb", "cc" };
         for (size_t i = 0; i < chunks.size(); ++i) {
             const auto decoded = MustDecode(chunks[i]->GetData());
             UNIT_ASSERT_VALUES_EQUAL(decoded.ChunkRowCount, 1);
@@ -269,7 +330,8 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
     Y_UNIT_TEST(DefaultsOnOlderSchemasUseColumnAccessor) {
         const auto meta = Meta(Ydb::Table::FulltextIndexSettings::KEYWORD);
         const auto context = Context();
-        auto withDefault = BuildFulltextIndex({}, 3, *MakeLoader(std::make_shared<arrow::StringScalar>("hello"), meta.GetColumnId()), meta, context);
+        auto withDefault =
+            BuildFulltextIndex({}, 3, *MakeLoader(std::make_shared<arrow::StringScalar>("hello"), meta.GetColumnId()), meta, context);
         UNIT_ASSERT_C(withDefault.IsSuccess(), withDefault.IsFail() ? withDefault.GetErrorMessage() : TString());
         UNIT_ASSERT(withDefault->IsBuilt());
         const auto decodedDefault = MustDecode(withDefault->GetChunks()[0]->GetData());
@@ -291,7 +353,7 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
         auto trivial = std::make_shared<NArrow::NAccessor::TTrivialArray>(array);
         const auto blob = loader->GetAccessorConstructor().SerializeToBlobAndMeta(trivial, loader->BuildAccessorContext(1)).Blob;
         THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>> data;
-        data[meta.GetColumnId()] = {std::make_shared<NChunks::TPortionIndexChunk>(TChunkAddress(meta.GetColumnId(), 0), 1, blob.size(), blob)};
+        data[meta.GetColumnId()] = { std::make_shared<NChunks::TPortionIndexChunk>(TChunkAddress(meta.GetColumnId(), 0), 1, blob.size(), blob) };
         auto physical = BuildFulltextIndex(data, 1, *loader, meta, context);
         UNIT_ASSERT_C(physical.IsSuccess(), physical.IsFail() ? physical.GetErrorMessage() : TString());
         const auto decodedPhysical = MustDecode(physical->GetChunks()[0]->GetData());
@@ -300,16 +362,16 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
 
     Y_UNIT_TEST(OversizedOneRowSkipsTheWholeIndex) {
         const auto meta = Meta(Ydb::Table::FulltextIndexSettings::KEYWORD);
-        const auto one = MustBuild({TString("a")}, meta, Context());
+        const auto one = MustBuild({ TString("a") }, meta, Context());
         const i64 limit = one[0]->GetData().size();
         const TString huge(static_cast<size_t>(limit), 'z');
-        auto onlyHuge = BuildFulltextFromDocuments({huge}, meta, Context(limit));
+        auto onlyHuge = BuildFulltextFromDocuments({ huge }, meta, Context(limit));
         UNIT_ASSERT(onlyHuge.IsSuccess());
         UNIT_ASSERT(onlyHuge->IsSkipped());
         UNIT_ASSERT(onlyHuge->GetSkipReason().Contains("single row"));
         UNIT_ASSERT(onlyHuge->GetChunks().empty());
 
-        auto prefixThenHuge = BuildFulltextFromDocuments({TString("a"), huge}, meta, Context(limit));
+        auto prefixThenHuge = BuildFulltextFromDocuments({ TString("a"), huge }, meta, Context(limit));
         UNIT_ASSERT(prefixThenHuge.IsSuccess());
         UNIT_ASSERT(prefixThenHuge->IsSkipped());
         UNIT_ASSERT(prefixThenHuge->GetChunks().empty());
@@ -317,12 +379,12 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
 
     Y_UNIT_TEST(ConstructionMemoryKeepsClosedChunks) {
         const auto meta = Meta(Ydb::Table::FulltextIndexSettings::KEYWORD);
-        const auto one = MustBuild({TString("aa")}, meta, Context());
+        const auto one = MustBuild({ TString("aa") }, meta, Context());
         const i64 limit = one[0]->GetData().size();
         const ui64 chunkBytes = one[0]->GetData().size();
-        const auto wide = MustBuild({TString("aa"), TString("bb")}, meta, Context(limit, 8ull << 20));
+        const auto wide = MustBuild({ TString("aa"), TString("bb") }, meta, Context(limit, 8ull << 20));
         UNIT_ASSERT_VALUES_EQUAL(wide.size(), 2);
-        auto tight = BuildFulltextFromDocuments({TString("aa"), TString("bb")}, meta, Context(limit, chunkBytes * 2));
+        auto tight = BuildFulltextFromDocuments({ TString("aa"), TString("bb") }, meta, Context(limit, chunkBytes * 2));
         UNIT_ASSERT(tight.IsSuccess());
         UNIT_ASSERT(tight->IsSkipped());
         UNIT_ASSERT(tight->GetSkipReason().Contains("memory"));
@@ -332,7 +394,7 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
     Y_UNIT_TEST(BoundedAnalysisDoesNotTruncateTokens) {
         auto context = Context();
         context.AnalyzerMaxGeneratedTokens = 1;
-        auto skipped = BuildFulltextFromDocuments({TString("a b")}, Meta(Ydb::Table::FulltextIndexSettings::WHITESPACE), context);
+        auto skipped = BuildFulltextFromDocuments({ TString("a b") }, Meta(Ydb::Table::FulltextIndexSettings::WHITESPACE), context);
         UNIT_ASSERT(skipped.IsSuccess());
         UNIT_ASSERT(skipped->IsSkipped());
         UNIT_ASSERT(skipped->GetSkipReason().Contains("token"));
@@ -340,13 +402,13 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
 
         context.AnalyzerMaxGeneratedTokens = 100000;
         context.AnalyzerMaxInputBytes = 3;
-        auto inputSkipped = BuildFulltextFromDocuments({TString("abcd")}, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), context);
+        auto inputSkipped = BuildFulltextFromDocuments({ TString("abcd") }, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), context);
         UNIT_ASSERT(inputSkipped->IsSkipped());
         UNIT_ASSERT(inputSkipped->GetSkipReason().Contains("input"));
 
         context.AnalyzerMaxInputBytes = 1ull << 20;
         context.AnalyzerMaxRetainedBytes = 1;
-        auto retainedSkipped = BuildFulltextFromDocuments({TString("abcd")}, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), context);
+        auto retainedSkipped = BuildFulltextFromDocuments({ TString("abcd") }, Meta(Ydb::Table::FulltextIndexSettings::KEYWORD), context);
         UNIT_ASSERT(retainedSkipped->IsSkipped());
         UNIT_ASSERT(retainedSkipped->GetSkipReason().Contains("retained"));
 
@@ -358,10 +420,10 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
         const TFulltextIndexMeta ngramMeta(11, "ft", "default", true, 7, NormalizeAnalyzers(analyzers));
         context.AnalyzerMaxRetainedBytes = 1ull << 20;
         context.AnalyzerMaxGeneratedTokens = 2;
-        auto ngramSkipped = BuildFulltextFromDocuments({TString("abcdef")}, ngramMeta, context);
+        auto ngramSkipped = BuildFulltextFromDocuments({ TString("abcdef") }, ngramMeta, context);
         UNIT_ASSERT(ngramSkipped->IsSkipped());
         context.AnalyzerMaxGeneratedTokens = 100000;
-        const auto ngramBuilt = MustBuild({TString("abcdef")}, ngramMeta, context);
+        const auto ngramBuilt = MustBuild({ TString("abcdef") }, ngramMeta, context);
         UNIT_ASSERT(MustDecode(ngramBuilt[0]->GetData()).Postings.size() > 2);
 
         NKikimr::NFulltext::TAnalyzeBudget budget;
@@ -371,16 +433,35 @@ Y_UNIT_TEST_SUITE(FulltextChunkBuilder) {
         UNIT_ASSERT(analyzed.Tokens.empty());
     }
 
+    Y_UNIT_TEST(InputChunkMemoryIsIncludedInConstructionBudget) {
+        const auto meta = Meta(Ydb::Table::FulltextIndexSettings::KEYWORD);
+        auto loader = MakeLoader(nullptr, meta.GetColumnId());
+        arrow::StringBuilder builder;
+        UNIT_ASSERT(builder.Append("hello").ok());
+        auto array = builder.Finish().ValueOrDie();
+        auto trivial = std::make_shared<NArrow::NAccessor::TTrivialArray>(array);
+        const auto blob = loader->GetAccessorConstructor().SerializeToBlobAndMeta(trivial, loader->BuildAccessorContext(1)).Blob;
+        auto context = Context();
+        THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>> data;
+        data[meta.GetColumnId()] = { std::make_shared<NChunks::TPortionIndexChunk>(
+            TChunkAddress(meta.GetColumnId(), 0), 1, context.ConstructionMemoryBudget + 1, blob) };
+        auto result = BuildFulltextIndex(data, 1, *loader, meta, context);
+        UNIT_ASSERT(result.IsSuccess());
+        UNIT_ASSERT(result->IsSkipped());
+        UNIT_ASSERT(result->GetChunks().empty());
+        UNIT_ASSERT_STRING_CONTAINS(result->GetSkipReason(), "memory");
+    }
+
     Y_UNIT_TEST(CorruptColumnIsAnErrorNotASkip) {
         const auto meta = Meta(Ydb::Table::FulltextIndexSettings::KEYWORD);
         auto loader = MakeLoader(nullptr, meta.GetColumnId());
         THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>> data;
         const TString junk = "this is not an arrow column";
-        data[meta.GetColumnId()] = {std::make_shared<NChunks::TPortionIndexChunk>(TChunkAddress(meta.GetColumnId(), 0), 1, junk.size(), junk)};
+        data[meta.GetColumnId()] = { std::make_shared<NChunks::TPortionIndexChunk>(TChunkAddress(meta.GetColumnId(), 0), 1, junk.size(), junk) };
         auto outcome = BuildFulltextIndex(data, 1, *loader, meta, Context());
         UNIT_ASSERT(outcome.IsFail());
         UNIT_ASSERT(!outcome.GetErrorMessage().empty());
     }
 }
 
-} // namespace NKikimr::NOlap::NIndexes::NFulltext
+}   // namespace NKikimr::NOlap::NIndexes::NFulltext

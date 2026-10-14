@@ -4,7 +4,6 @@
 
 #include <re2/re2.h>
 
-#include <util/digest/city.h>
 #include <util/generic/hash.h>
 #include <util/string/builder.h>
 #include <util/string/cast.h>
@@ -62,29 +61,14 @@ re2::RE2::Options WildcardRe2Options() {
     return options;
 }
 
-bool CompileWildcardPattern(TStringBuf likePattern, TString& error) {
+std::shared_ptr<const re2::RE2> CompileWildcardPattern(TStringBuf likePattern, TString& error) {
     const TString pattern = LikePatternToRe2(likePattern);
-    const re2::RE2 regexp(absl::string_view(pattern.data(), pattern.size()), WildcardRe2Options());
-    if (!regexp.ok()) {
+    auto regexp = std::make_shared<const re2::RE2>(absl::string_view(pattern.data(), pattern.size()), WildcardRe2Options());
+    if (!regexp->ok()) {
         error = TStringBuilder() << "Invalid wildcard pattern: `" << EscapeC(TString(likePattern)) << "`";
-        return false;
+        return {};
     }
-    return true;
-}
-
-bool MatchWildcardPattern(TStringBuf likePattern, TStringBuf text) {
-    const TString pattern = LikePatternToRe2(likePattern);
-    const re2::RE2 regexp(absl::string_view(pattern.data(), pattern.size()), WildcardRe2Options());
-    if (!regexp.ok()) {
-        return false;
-    }
-    return regexp.Match(
-        absl::string_view(text.data(), text.size()),
-        0,
-        text.size(),
-        re2::RE2::ANCHOR_BOTH,
-        nullptr,
-        0);
+    return regexp;
 }
 
 std::optional<EFulltextQueryMode> ParseMode(const TFulltextQueryOptions& options, TString& error) {
@@ -130,10 +114,9 @@ TVector<TCompiledFulltextTerm> DeduplicateTerms(const TVector<TSearchTerm>& pars
 }
 
 void SetAnalyzerFingerprint(TCompiledFulltextQuery& compiled, const Ydb::Table::FulltextIndexSettings::Analyzers& analyzers) {
-    compiled.Analyzers.CopyFrom(analyzers);
-    const auto serialized = compiled.Analyzers.SerializeAsString();
-    compiled.AnalyzerIdentity.assign(serialized.data(), serialized.size());
-    compiled.AnalyzerRevision = CityHash64(compiled.AnalyzerIdentity.data(), compiled.AnalyzerIdentity.size());
+    compiled.Analyzers = NormalizeAnalyzers(analyzers);
+    compiled.AnalyzerIdentity = CanonicalFulltextAnalyzerSettings(compiled.Analyzers);
+    compiled.AnalyzerSemanticRevision = FulltextAnalyzerSemanticRevision;
 }
 
 }
@@ -170,8 +153,12 @@ TFulltextQueryValidation CompileFulltextQuery(
         return Fail("No search terms were extracted from the query");
     }
 
-    if (*mode == EFulltextQueryMode::Wildcard && !CompileWildcardPattern(query, error)) {
-        return Fail(std::move(error));
+    std::shared_ptr<const re2::RE2> wildcard;
+    if (*mode == EFulltextQueryMode::Wildcard) {
+        wildcard = CompileWildcardPattern(query, error);
+        if (!wildcard) {
+            return Fail(std::move(error));
+        }
     }
 
     size_t requiredCount = 0;
@@ -191,6 +178,7 @@ TFulltextQueryValidation CompileFulltextQuery(
     compiled.Terms = terms;
     compiled.Operator = defaultOperator;
     compiled.MinimumShouldMatch = static_cast<ui32>(requiredCount) + optionalThreshold;
+    compiled.RequiredTermCount = requiredCount;
     if (defaultOperator == NTableIndex::NFulltext::EDefaultOperator::Or && optionalCount > 0) {
         compiled.OptionalThreshold = optionalThreshold;
     }
@@ -198,20 +186,27 @@ TFulltextQueryValidation CompileFulltextQuery(
     compiled.Mode = *mode;
     if (*mode == EFulltextQueryMode::Wildcard) {
         compiled.WildcardPattern = query;
+        compiled.WildcardRegexp = std::move(wildcard);
     }
     TFulltextQueryValidation result;
     result.Compiled = std::move(compiled);
     return result;
 }
 
+bool EvaluateFulltextCounts(const TCompiledFulltextQuery& query, const ui32 matchedRequired, const ui32 matchedOptional) {
+    if (query.Operator != NTableIndex::NFulltext::EDefaultOperator::Or) {
+        return static_cast<ui64>(matchedRequired) + matchedOptional == query.Terms.size();
+    }
+    return matchedRequired == query.RequiredTermCount &&
+        (!query.OptionalThreshold || matchedOptional >= *query.OptionalThreshold);
+}
+
 bool EvaluateFulltextMembership(const TCompiledFulltextQuery& query, const THashSet<TString>& documentTokens) {
-    size_t required = 0;
-    size_t matchedRequired = 0;
-    size_t matchedOptional = 0;
+    ui32 matchedRequired = 0;
+    ui32 matchedOptional = 0;
     for (const auto& term : query.Terms) {
         const bool present = documentTokens.contains(term.Token);
         if (term.Required) {
-            ++required;
             if (present) {
                 ++matchedRequired;
             }
@@ -220,23 +215,15 @@ bool EvaluateFulltextMembership(const TCompiledFulltextQuery& query, const THash
         }
     }
 
-    if (query.Operator != NTableIndex::NFulltext::EDefaultOperator::Or) {
-        return matchedRequired + matchedOptional == query.Terms.size();
-    }
-    if (matchedRequired != required) {
-        return false;
-    }
-    if (!query.OptionalThreshold.has_value()) {
-        return true;
-    }
-    return matchedOptional >= *query.OptionalThreshold;
+    return EvaluateFulltextCounts(query, matchedRequired, matchedOptional);
 }
 
 bool MatchFulltextWildcardResidual(const TCompiledFulltextQuery& query, TStringBuf text) {
     if (query.Mode != EFulltextQueryMode::Wildcard) {
         return false;
     }
-    return MatchWildcardPattern(query.WildcardPattern, text);
+    return query.WildcardRegexp && query.WildcardRegexp->Match(
+        absl::string_view(text.data(), text.size()), 0, text.size(), re2::RE2::ANCHOR_BOTH, nullptr, 0);
 }
 
 TVector<TString> TokenizeFulltextDocument(const TCompiledFulltextQuery& query, TStringBuf text) {

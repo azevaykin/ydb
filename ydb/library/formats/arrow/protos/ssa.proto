@@ -130,6 +130,11 @@ message TProgram {
                 bytes QueryText = 8;
                 string QueryParameter = 9;
             }
+            optional string DefaultOperatorParameter = 10;
+            optional string MinimumShouldMatchParameter = 11;
+            // Plans written before this field used semantic revision 1.
+            // AnalyzerRevision above remains the legacy settings fingerprint.
+            optional uint64 AnalyzerSemanticRevision = 12 [default = 1];
         }
 
         optional TColumn Column = 1;

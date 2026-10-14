@@ -813,8 +813,11 @@ TExprNode::TPtr ReplaceJsonValuesWithExternalArgs(const TExprNode::TPtr& predica
 
 TFilterOpsLevels PredicatePushdown(const TExprBase& predicate, const TExprNode& argument, TExprContext& ctx, TPositionHandle pos, const TPushdownOptions& pushdownOptions) {
     if (const auto fulltext = predicate.Maybe<TKqpOlapFulltextMatch>()) {
-        Y_UNUSED(argument);
-        return TFilterOpsLevels(fulltext.Cast());
+        // Keep the Member dependency until the predicate enters the scan program.
+        // The OLAP program resolves columns by name and has its own row argument.
+        auto children = fulltext.Cast().Ref().ChildrenList();
+        children.resize(TKqpOlapFulltextMatch::idx_Text);
+        return TFilterOpsLevels(TExprBase(ctx.ChangeChildren(fulltext.Cast().Ref(), std::move(children))));
     }
 
     if (const auto maybeCoalesce = predicate.Maybe<TCoCoalesce>()) {
@@ -1330,7 +1333,10 @@ TExprBase KqpPushOlapFilter(TExprBase node, TExprContext& ctx, const TKqpOptimiz
     const TPushdownOptions pushdownOptions(kqpCtx.Config->GetEnableOlapScalarApply(), kqpCtx.Config->GetEnableOlapSubstringPushdown(),
         /*stripAliasPrefixFromColName=*/false, kqpCtx.Config->GetEnableOlapPushdownRegexp(),
         kqpCtx.Config->GetEnableOlapFastAsciiIgnoreCase());
-    if (!kqpCtx.Config->HasOptEnableOlapPushdown()) {
+    const bool hasFulltext = !!FindNode(node.Ptr(), [](const TExprNode::TPtr& expr) {
+        return TKqpOlapFulltextMatch::Match(expr.Get());
+    });
+    if (!kqpCtx.Config->HasOptEnableOlapPushdown() && !hasFulltext) {
         return node;
     }
 

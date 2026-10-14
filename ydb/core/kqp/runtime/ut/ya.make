@@ -6,6 +6,7 @@ SIZE(MEDIUM)
 REQUIREMENTS(cpu:4)
 
 SRCS(
+    kqp_column_fulltext_write_ut.cpp
     kqp_scan_data_ut.cpp
     kqp_scan_fetcher_ut.cpp
     kqp_write_actor_ut.cpp

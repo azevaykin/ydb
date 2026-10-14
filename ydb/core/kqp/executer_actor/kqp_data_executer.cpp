@@ -124,12 +124,24 @@ public:
     }
 
     bool ForceAcquireSnapshot() const {
+        bool hasColumnFulltextSource = false;
+        for (const auto& [_, stageInfo] : TasksGraph.GetStagesInfo()) {
+            for (const auto& source : stageInfo.Meta.GetStage(stageInfo.Id).GetSources()) {
+                if (source.HasFullTextSource()) {
+                    const auto policy = source.GetFullTextSource().GetDocIdPolicy();
+                    hasColumnFulltextSource |=
+                        policy == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_NATIVE ||
+                        policy == NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_SYNTHETIC;
+                }
+            }
+        }
+        // Posting reads and ColumnShard payload fetches must share a snapshot,
+        // even when the normal OLAP execution path does not acquire one here.
         const bool forceSnapshot = (
             !GetSnapshot().IsValid() &&
             ReadOnlyTx &&
-            !ImmediateTx &&
             !HasPersistentChannels &&
-            !HasOlapTable &&
+            (hasColumnFulltextSource || (!ImmediateTx && !HasOlapTable)) &&
             (!Database.empty() || AppData()->EnableMvccSnapshotWithLegacyDomainRoot)
         );
         AFL_ENSURE(!forceSnapshot || Request.IsolationLevel != NKqpProto::ISOLATION_LEVEL_READ_COMMITTED_RW);

@@ -317,7 +317,10 @@ private:
                     if (!ValidateTableHasIndex(tableDesc->Metadata, ctx, node.Pos())) {
                         return TStatus::Error;
                     }
-                    if (tableDesc->Metadata->GetIndexMetadata(view->Name).first == nullptr) {
+                    const auto [implTable, index] = tableDesc->Metadata->GetIndex(view->Name);
+                    const bool localFulltext = tableDesc->Metadata->IsOlap() && index
+                        && index->Type == TIndexDescription::EType::LocalFulltext;
+                    if (!implTable && !localFulltext) {
                         ctx.AddError(YqlIssue(ctx.GetPosition(node.Pos()), TIssuesIds::KIKIMR_SCHEME_ERROR, TStringBuilder()
                             << "Required global index not found, index name: " << view->Name));
                         return TStatus::Error;

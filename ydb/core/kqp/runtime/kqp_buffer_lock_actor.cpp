@@ -215,6 +215,11 @@ public:
 
         if (!Partitioning) {
             state.ResolvePending = !worker->AllRowsProcessed();
+            if (state.ResolvePending && !ResolveTableShards()) {
+                RuntimeError(NYql::NDqProto::StatusIds::UNAVAILABLE,
+                    NYql::TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE,
+                    TStringBuilder() << "Cannot resolve lock table " << Settings.TablePath);
+            }
             return;
         }
 

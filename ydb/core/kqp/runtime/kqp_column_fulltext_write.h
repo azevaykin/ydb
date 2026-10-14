@@ -18,6 +18,9 @@
 namespace NKikimr::NKqp {
 
 inline constexpr i64 ColumnFulltextTokenMemoryLimit = 8ll * 1024 * 1024;
+// Bound analyzer work before constructing the retained forward-state token set.
+inline constexpr ui64 ColumnFulltextAnalyzerMaxInputBytes = 8ull << 20;
+inline constexpr ui64 ColumnFulltextAnalyzerMaxGeneratedTokens = 100000;
 
 // Plans column-table compact fulltext maintenance for one statement flush.
 // The caller reads forward state (and, when needed, the column old image) first.
@@ -41,7 +44,8 @@ public:
         bool Synthetic = false;
         bool Ready = false;
         // When true, skip keys that already have forward state. Used by the
-        // online build scanner so a concurrent mutation that won the race is kept.
+        // online build scanner. The caller must protect this state read against
+        // concurrent writes in the transaction that commits the seed batches.
         bool SeedOnly = false;
         ui64 BuildGeneration = 1;
         NScheme::TTypeInfo DocIdType;

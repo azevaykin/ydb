@@ -244,9 +244,9 @@ public:
             const auto* existing = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&indexIt->second->SpecializedIndexDescription);
             const auto* requested = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&newIndexData->AlterData->SpecializedIndexDescription);
             const bool sameAnalyzers = existing && requested
-                && NKikimr::NFulltext::FulltextAnalyzerIdentity(NKikimr::NFulltext::NormalizeAnalyzers(
+                && NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(NKikimr::NFulltext::NormalizeAnalyzers(
                     existing->GetSettings().columns().empty() ? Ydb::Table::FulltextIndexSettings::Analyzers() : existing->GetSettings().columns(0).analyzers()))
-                == NKikimr::NFulltext::FulltextAnalyzerIdentity(NKikimr::NFulltext::NormalizeAnalyzers(
+                == NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(NKikimr::NFulltext::NormalizeAnalyzers(
                     requested->GetSettings().columns().empty() ? Ydb::Table::FulltextIndexSettings::Analyzers() : requested->GetSettings().columns(0).analyzers()));
             const bool sameColumns = newIndexData->AlterData->IndexKeys.empty()
                 || newIndexData->AlterData->IndexKeys == indexIt->second->IndexKeys;

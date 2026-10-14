@@ -305,6 +305,11 @@ public:
 
         if (!Partitioning) {
             state.ResolvePending = !state.Worker->AllRowsProcessed();
+            if (state.ResolvePending && !ResolveTableShards()) {
+                RuntimeError(NYql::NDqProto::StatusIds::UNAVAILABLE,
+                    NYql::TIssuesIds::KIKIMR_TEMPORARILY_UNAVAILABLE,
+                    TStringBuilder() << "Cannot resolve lookup table " << Settings.TablePath);
+            }
             return;
         }
 
@@ -989,14 +994,29 @@ public:
     void AddLookupTask(ui64 cookie, const std::vector<TConstArrayRef<TCell>>& keys) override {
         AFL_ENSURE(!Failed);
         auto& request = Requests.at(cookie);
-        AFL_ENSURE(!request.Started);
+        if (request.Started) {
+            AFL_ENSURE(IsRequestReady(request, cookie) && (request.Extracted || request.Rows.Empty()));
+            request.Keys.clear();
+            request.Extracted = false;
+            request.Started = false;
+        }
         request.Started = true;
         request.Keys.reserve(keys.size());
         for (const auto& key : keys) {
             AFL_ENSURE(key.size() == request.KeyColumns.size());
             request.Keys.emplace_back(TOwnedCellVec::Make(key));
         }
+        const auto compare = [&](const TOwnedCellVec& left, const TOwnedCellVec& right) {
+            return CompareTypedCellVectors(left.data(), right.data(), KeyColumnTypes.data(), KeyColumnTypes.size());
+        };
+        std::sort(request.Keys.begin(), request.Keys.end(), [&](const auto& left, const auto& right) {
+            return compare(left, right) < 0;
+        });
+        request.Keys.erase(std::unique(request.Keys.begin(), request.Keys.end(), [&](const auto& left, const auto& right) {
+            return compare(left, right) == 0;
+        }), request.Keys.end());
         if (request.Keys.empty()) {
+            Settings.Callbacks->OnLookupTaskFinished();
             return;
         }
         if (!Sharding) {
@@ -1172,6 +1192,7 @@ private:
         }
         ResolveInProgress = false;
         auto pending = std::move(PendingCookies);
+        PendingCookies.clear();
         for (const ui64 cookie : pending) {
             StartScans(cookie);
         }
@@ -1294,16 +1315,15 @@ private:
     }
 
     void Handle(TEvKqpCompute::TEvScanInitActor::TPtr& ev) {
-        if (Failed) {
-            return;
-        }
+        const auto actor = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
         auto scanIt = Scans.find(ev->Get()->Record.GetScanId());
-        if (scanIt == Scans.end() || scanIt->second.Finished) {
+        if (Failed || scanIt == Scans.end() || scanIt->second.Finished) {
+            Send(actor, new TEvents::TEvPoisonPill());
             return;
         }
         scanIt->second.Generation = ev->Get()->Record.GetGeneration();
         scanIt->second.ScanActor = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
-        Send(scanIt->second.ScanActor, new TEvKqpCompute::TEvScanDataAck(1ull << 30, scanIt->second.Generation));
+        Send(scanIt->second.ScanActor, new TEvKqpCompute::TEvScanDataAck(8ull << 20, scanIt->second.Generation, 1));
     }
 
     void Handle(TEvKqpCompute::TEvScanData::TPtr& ev) {
@@ -1315,7 +1335,7 @@ private:
             return;
         }
         auto& scan = scanIt->second;
-        if (scan.ScanActor != TActorId() && ev->Get()->Generation != scan.Generation) {
+        if (ev->Sender != scan.ScanActor || ev->Get()->Generation != scan.Generation) {
             return;
         }
         auto& request = Requests.at(scan.Cookie);
@@ -1327,7 +1347,7 @@ private:
             return;
         }
         if (!ev->Get()->Finished) {
-            Send(ev->Sender, new TEvKqpCompute::TEvScanDataAck(1ull << 30, ev->Get()->Generation));
+            Send(ev->Sender, new TEvKqpCompute::TEvScanDataAck(8ull << 20, ev->Get()->Generation, 1));
             return;
         }
         FinishScan(scanIt);
@@ -1447,11 +1467,23 @@ private:
             return;
         }
         Failed = true;
+        StopScans();
         Settings.Callbacks->OnLookupError(statusCode, id, message, subIssues);
     }
 
-    void PassAway() override {
+    void StopScans() {
+        for (const auto& [id, scan] : Scans) {
+            Y_UNUSED(id);
+            if (scan.ScanActor) {
+                Send(scan.ScanActor, new TEvents::TEvPoisonPill());
+            }
+        }
         Scans.clear();
+        PendingCookies.clear();
+    }
+
+    void PassAway() override {
+        StopScans();
         Unlink();
         TActorBootstrapped<TKqpBufferOlapLookupActor>::PassAway();
     }

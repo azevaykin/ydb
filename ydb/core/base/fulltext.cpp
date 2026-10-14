@@ -881,7 +881,7 @@ bool CollectNgrams(const TString& token, size_t lengthMin, size_t lengthMax, boo
     while (ngram_begin_ptr < end) {
         const unsigned char* ngram_end_ptr = ngram_begin_ptr;
         size_t ngram_length = 0;
-        while (ngram_end_ptr < end) {
+        while (ngram_end_ptr < end && ngram_length < lengthMax) {
             if (SafeReadUTF8Char(symbol, symbolBytes, ngram_end_ptr, end) != RECODE_OK) {
                 Y_ASSERT(false); // should already be validated during tokenization
                 return true;
@@ -1064,9 +1064,9 @@ TBoundedAnalyzeResult AnalyzeBounded(const TStringBuf text, const Ydb::Table::Fu
 }
 
 TVector<TString> Analyze(const TStringBuf text, const Ydb::Table::FulltextIndexSettings::Analyzers& settings, const std::unordered_set<wchar32>& ignoredDelimiters) {
-    const TBoundedAnalyzeResult result = AnalyzeBounded(text, settings, TAnalyzeBudget{}, ignoredDelimiters);
+    TBoundedAnalyzeResult result = AnalyzeBounded(text, settings, TAnalyzeBudget{}, ignoredDelimiters);
     Y_ENSURE(result.Ok(), "unlimited fulltext analysis exceeded a budget");
-    return result.Tokens;
+    return std::move(result.Tokens);
 }
 
 TVector<TString> BuildSearchTerms(const TString& query, const Ydb::Table::FulltextIndexSettings::Analyzers& settings) {
@@ -1256,8 +1256,40 @@ TString FulltextAnalyzerIdentity(const Ydb::Table::FulltextIndexSettings::Analyz
 }
 
 ui64 FulltextAnalyzerRevision(const Ydb::Table::FulltextIndexSettings::Analyzers& normalizedAnalyzers) {
-    const TString bytes = FulltextAnalyzerIdentity(normalizedAnalyzers);
-    return CityHash64(bytes.data(), bytes.size());
+    return CityHash64(FulltextAnalyzerIdentity(normalizedAnalyzers));
+}
+
+TString CanonicalFulltextAnalyzerSettings(const Ydb::Table::FulltextIndexSettings::Analyzers& analyzers) {
+    const auto normalized = NormalizeAnalyzers(analyzers);
+    const auto appendU32 = [](TString& out, ui32 value) {
+        for (ui32 i = 0; i < 4; ++i) {
+            out.push_back(static_cast<char>((value >> (8 * i)) & 0xffu));
+        }
+    };
+    TString out;
+    out.reserve(31 + normalized.language().size());
+    appendU32(out, static_cast<ui32>(normalized.tokenizer()));
+    appendU32(out, static_cast<ui32>(normalized.language().size()));
+    out.append(normalized.language());
+    out.push_back(normalized.use_filter_lowercase() ? 1 : 0);
+    out.push_back(normalized.use_filter_stopwords() ? 1 : 0);
+    out.push_back(normalized.use_filter_ngram() ? 1 : 0);
+    out.push_back(normalized.use_filter_edge_ngram() ? 1 : 0);
+    const bool ngram = normalized.use_filter_ngram() || normalized.use_filter_edge_ngram();
+    if (ngram) {
+        appendU32(out, normalized.has_filter_ngram_min_length() ? normalized.filter_ngram_min_length() : 0);
+        appendU32(out, normalized.has_filter_ngram_max_length() ? normalized.filter_ngram_max_length() : 0);
+    } else {
+        // Frozen inactive-filter defaults from the v1 local chunk format.
+        appendU32(out, 3);
+        appendU32(out, 4);
+    }
+    out.push_back(normalized.use_filter_length() ? 1 : 0);
+    appendU32(out, normalized.use_filter_length() && normalized.has_filter_length_min() ? normalized.filter_length_min() : 0);
+    appendU32(out, normalized.use_filter_length() && normalized.has_filter_length_max() ? normalized.filter_length_max() : 0);
+    out.push_back(normalized.use_filter_snowball() ? 1 : 0);
+    out.push_back(normalized.use_filter_superlemmer() ? 1 : 0);
+    return out;
 }
 
 namespace {

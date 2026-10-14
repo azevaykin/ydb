@@ -108,7 +108,7 @@ private:
         if (Request) {
             result.InsertValue("index_id", Request->IndexId);
             result.InsertValue("column_id", Request->ColumnId);
-            result.InsertValue("analyzer_revision", Request->Query.AnalyzerRevision);
+            result.InsertValue("analyzer_semantic_revision", Request->Query.AnalyzerSemanticRevision);
             result.InsertValue("mode", Request->Query.Mode == NFulltext::EFulltextQueryMode::Wildcard ? "wildcard" : "keywords");
         }
         return result;
@@ -181,18 +181,10 @@ TConclusionStatus AppendTextChunk(std::vector<std::optional<TString>>& out, cons
     }
 }
 
-TConclusion<TString> ReadBoundQuery(
-    const NKikimrSSA::TProgram::TAssignment::TFulltextMatch& match, const std::shared_ptr<arrow::RecordBatch>& parameterValues) {
-    if (match.HasQueryText()) {
-        return match.GetQueryText();
-    }
-    if (!match.HasQueryParameter()) {
-        return TConclusionStatus::Fail("Fulltext query is missing");
-    }
+TConclusion<TString> ReadBoundString(const TString& name, const std::shared_ptr<arrow::RecordBatch>& parameterValues) {
     if (!parameterValues) {
         return TConclusionStatus::Fail("Fulltext query parameter is not bound");
     }
-    const auto& name = match.GetQueryParameter();
     if (name.empty()) {
         return TConclusionStatus::Fail("Fulltext query parameter name is empty");
     }
@@ -267,6 +259,27 @@ TConclusion<std::optional<TString>> ReadFulltextScalar(const arrow::Scalar& scal
     }
 }
 
+TConclusion<bool> EvaluateFulltextScalar(const NFulltext::TCompiledFulltextQuery& query,
+    const arrow::Scalar& scalar, const bool residualOnly) {
+    if (!scalar.is_valid || scalar.type->id() == arrow::Type::NA) {
+        return false;
+    }
+    if (scalar.type->id() == arrow::Type::DICTIONARY) {
+        auto decoded = static_cast<const arrow::DictionaryScalar&>(scalar).GetEncodedValue();
+        if (!decoded.ok()) {
+            return TConclusionStatus::Fail(TString(decoded.status().message()));
+        }
+        return EvaluateFulltextScalar(query, **decoded, residualOnly);
+    }
+    if (!arrow::is_base_binary_like(scalar.type->id())) {
+        return TConclusionStatus::Fail("Fulltext match column must be String or Utf8");
+    }
+    const auto& binary = static_cast<const arrow::BaseBinaryScalar&>(scalar);
+    const TStringBuf text = binary.value
+        ? TStringBuf(reinterpret_cast<const char*>(binary.value->data()), binary.value->size()) : TStringBuf();
+    return residualOnly ? NFulltext::MatchFulltextWildcardResidual(query, text) : NFulltext::EvaluateFulltextText(query, text);
+}
+
 TConclusion<std::vector<ui8>> EvaluateFulltextTexts(
     const NFulltext::TCompiledFulltextQuery& query, const std::vector<std::optional<TString>>& texts) {
     std::vector<ui8> result;
@@ -325,8 +338,15 @@ TConclusionStatus AppendFulltextMatch(NGraph::NOptimization::TGraph::TBuilder& b
     if (NFulltext::FulltextAnalyzerRevision(analyzers) != match.GetAnalyzerRevision()) {
         return TConclusionStatus::Fail("Fulltext analyzer revision does not match the analyzer settings");
     }
+    if (match.GetAnalyzerSemanticRevision() != NFulltext::FulltextAnalyzerSemanticRevision) {
+        return TConclusionStatus::Fail("Fulltext scan program uses an unsupported analyzer semantic revision");
+    }
 
-    auto query = ReadBoundQuery(match, parameterValues);
+    if (!match.HasQueryText() && !match.HasQueryParameter()) {
+        return TConclusionStatus::Fail("Fulltext query is missing");
+    }
+    auto query = match.HasQueryParameter() ? ReadBoundString(match.GetQueryParameter(), parameterValues)
+        : TConclusion<TString>(match.GetQueryText());
     if (query.IsFail()) {
         return TConclusionStatus::Fail(query.GetErrorMessage());
     }
@@ -336,12 +356,26 @@ TConclusionStatus AppendFulltextMatch(NGraph::NOptimization::TGraph::TBuilder& b
     options.Mode = match.GetMode();
     options.DefaultOperator = match.GetDefaultOperator();
     options.MinimumShouldMatch = match.GetMinimumShouldMatch();
+    if (match.HasDefaultOperatorParameter()) {
+        auto value = ReadBoundString(match.GetDefaultOperatorParameter(), parameterValues);
+        if (value.IsFail()) {
+            return TConclusionStatus::Fail(value.GetErrorMessage());
+        }
+        options.DefaultOperator = value.DetachResult();
+    }
+    if (match.HasMinimumShouldMatchParameter()) {
+        auto value = ReadBoundString(match.GetMinimumShouldMatchParameter(), parameterValues);
+        if (value.IsFail()) {
+            return TConclusionStatus::Fail(value.GetErrorMessage());
+        }
+        options.MinimumShouldMatch = value.DetachResult();
+    }
     auto compiled = NFulltext::CompileFulltextQuery(query.DetachResult(), analyzers, options);
     if (!compiled) {
         return TConclusionStatus::Fail(compiled.Error);
     }
-    if (compiled.Compiled->AnalyzerIdentity != match.GetAnalyzerSettings() ||
-        compiled.Compiled->AnalyzerRevision != match.GetAnalyzerRevision()) {
+    if (compiled.Compiled->AnalyzerIdentity != NFulltext::CanonicalFulltextAnalyzerSettings(analyzers) ||
+        compiled.Compiled->AnalyzerSemanticRevision != match.GetAnalyzerSemanticRevision()) {
         return TConclusionStatus::Fail("Fulltext analyzer identity does not match the scan program");
     }
 

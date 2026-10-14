@@ -30,6 +30,8 @@
 
 #include <util/string/builder.h>
 
+#include <algorithm>
+
 namespace NKikimr::NKqp {
 
 namespace {
@@ -102,21 +104,28 @@ public:
         : Settings(std::move(settings))
         , Index(MakeIndex(Settings))
         , PipeCacheId(MakePipePerNodeCacheID(false))
-        , Alloc(std::make_shared<NMiniKQL::TScopedAlloc>(__LOCATION__))
-        , TypeEnv(std::make_shared<NMiniKQL::TTypeEnvironment>(*Alloc))
+        , Alloc(std::make_shared<NMiniKQL::TScopedAlloc>(__LOCATION__, TAlignedPagePoolCounters(), false))
         , MemInfo("TColumnFulltextSeedActor")
-        , HolderFactory(std::make_shared<NMiniKQL::THolderFactory>(Alloc->Ref(), MemInfo, AppData()->FunctionRegistry))
         , TxManager(CreateKqpTransactionManager())
     {
+        TGuard<NMiniKQL::TScopedAlloc> guard(*Alloc);
+        TypeEnv = std::make_shared<NMiniKQL::TTypeEnvironment>(*Alloc);
+        HolderFactory = std::make_shared<NMiniKQL::THolderFactory>(Alloc->Ref(), MemInfo, AppData()->FunctionRegistry);
         Maintainer.SetLayout(InputColumnNames(), {}, KeyColumnNames());
         Maintainer.AddIndex(Index);
+    }
+
+    ~TColumnFulltextSeedActor() override {
+        TGuard<NMiniKQL::TScopedAlloc> guard(*Alloc);
+        HolderFactory.reset();
+        TypeEnv.reset();
     }
 
     static constexpr char ActorName[] = "COLUMN_FULLTEXT_SEED_ACTOR";
 
     void Bootstrap() {
         Become(&TThis::StateWork);
-        if (Settings.ScanColumns.empty() || Settings.KeyColumnCount == 0) {
+        if (Settings.ScanColumns.empty() || Settings.KeyColumnCount == 0 || Settings.MaxBatchRows == 0) {
             return Fail("Column fulltext seed is missing scan columns");
         }
         StartScan();
@@ -188,18 +197,19 @@ private:
 
     void Handle(TEvKqpCompute::TEvScanInitActor::TPtr& ev) {
         if (Finished || Failed) {
+            Send(ActorIdFromProto(ev->Get()->Record.GetScanActorId()), new TEvents::TEvPoisonPill);
             return;
         }
         ScanGeneration = ev->Get()->Record.GetGeneration();
         ScanActor = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
-        Send(ScanActor, new TEvKqpCompute::TEvScanDataAck(8ull << 20, ScanGeneration));
+        Send(ScanActor, new TEvKqpCompute::TEvScanDataAck(8ull << 20, ScanGeneration, 1));
     }
 
     void Handle(TEvKqpCompute::TEvScanData::TPtr& ev) {
         if (Finished || Failed || Committing) {
             return;
         }
-        if (ScanActor && ev->Get()->Generation != ScanGeneration) {
+        if (ev->Sender != ScanActor || ev->Get()->Generation != ScanGeneration) {
             return;
         }
 
@@ -210,9 +220,6 @@ private:
                 return;
             }
             rows.emplace_back(cells);
-            if (!cells.empty()) {
-                LastKey = TOwnedCellVec(cells.first(Settings.KeyColumnCount));
-            }
         };
 
         if (!ev->Get()->Rows.empty()) {
@@ -265,7 +272,7 @@ private:
             return;
         }
         if (ScanActor) {
-            Send(ScanActor, new TEvKqpCompute::TEvScanDataAck(8ull << 20, ScanGeneration));
+            Send(ScanActor, new TEvKqpCompute::TEvScanDataAck(8ull << 20, ScanGeneration, 1));
         }
     }
 
@@ -282,12 +289,14 @@ private:
     }
 
     void BeginCommitBatch() {
+        TGuard<NMiniKQL::TScopedAlloc> guard(*Alloc);
         if (Committing || Failed || Finished) {
             return;
         }
         Committing = true;
-        BatchRows = std::move(PendingRows);
-        PendingRows.clear();
+        const size_t count = std::min<size_t>(PendingRows.size(), Settings.MaxBatchRows);
+        BatchRows.assign(std::make_move_iterator(PendingRows.begin()), std::make_move_iterator(PendingRows.begin() + count));
+        PendingRows.erase(PendingRows.begin(), PendingRows.begin() + count);
         if (BatchRows.empty()) {
             Committing = false;
             if (ScanFinished) {
@@ -296,6 +305,7 @@ private:
             return;
         }
 
+        LastKey = TOwnedCellVec(BatchRows.back().first(Settings.KeyColumnCount));
         EnsureStateLookup();
         if (Failed) {
             return;
@@ -318,7 +328,7 @@ private:
         }
         auto [lookup, actor] = CreateKqpBufferTableLookup(TKqpBufferTableLookupSettings{
             .Callbacks = this,
-            .TableId = TTableId(Settings.StateId, 0),
+            .TableId = TTableId(Settings.StateId, Settings.StateSchemaVersion),
             .TablePath = Settings.StateTablePath,
             .LockTxId = Settings.BuildId,
             .LockNodeId = SelfId().NodeId(),
@@ -333,12 +343,19 @@ private:
             .IsOlap = false,
         });
         StateLookup = lookup;
-        StateLookupActor = Register(actor);
+        StateLookupActor = RegisterWithSameMailbox(actor);
 
         TVector<NKikimrKqp::TKqpColumnMetadataProto> keyColumns;
         TVector<NKikimrKqp::TKqpColumnMetadataProto> valueColumns;
         for (ui32 i = 0; i < Settings.KeyColumnCount; ++i) {
-            keyColumns.push_back(Settings.ScanColumns[i]);
+            const auto& keyName = Settings.ScanColumns[i].GetName();
+            const auto column = std::find_if(Settings.StateColumns.begin(), Settings.StateColumns.end(),
+                [&](const auto& item) { return item.GetName() == keyName; });
+            if (column == Settings.StateColumns.end()) {
+                Fail(TStringBuilder() << "Column fulltext seed state table is missing key " << keyName);
+                return;
+            }
+            keyColumns.push_back(*column);
         }
         THashSet<TString> keyNames;
         for (const auto& column : keyColumns) {
@@ -354,10 +371,11 @@ private:
     }
 
     void OnLookupTaskFinished() override {
+        TGuard<NMiniKQL::TScopedAlloc> guard(*Alloc);
         if (Failed || Finished || !Committing) {
             return;
         }
-        if (!StateLookup->HasResult(1)) {
+        if (!StateLookup->HasResult(1) && !StateLookup->IsEmpty(1)) {
             return;
         }
         StateLookup->ExtractResult(1, [&](TConstArrayRef<TCell> row) {
@@ -379,6 +397,7 @@ private:
         }
         PendingSequences = Maintainer.Sequences();
         SequenceValues.clear();
+        SequenceCursor = 0;
         if (PendingSequences.empty()) {
             FinishBuildAndUpload();
             return;
@@ -390,9 +409,9 @@ private:
         NYql::NDqProto::StatusIds::StatusCode,
         NYql::EYqlIssueCode,
         const TString& message,
-        const NYql::TIssues&) override
+        const NYql::TIssues& subIssues) override
     {
-        Fail(message);
+        Fail(TStringBuilder() << message << ": " << subIssues.ToOneLineString());
     }
 
     void RequestNextSequence() {
@@ -572,7 +591,7 @@ private:
             return;
         }
         if (!ScanFinished && ScanActor) {
-            Send(ScanActor, new TEvKqpCompute::TEvScanDataAck(8ull << 20, ScanGeneration));
+            Send(ScanActor, new TEvKqpCompute::TEvScanDataAck(8ull << 20, ScanGeneration, 1));
         }
     }
 
@@ -613,6 +632,9 @@ private:
             return;
         }
         Failed = true;
+        LOG_ERROR_S(*TlsActivationContext, NKikimrServices::KQP_COMPUTE,
+            "Column fulltext seed failed: build=" << Settings.BuildId
+            << " tablet=" << Settings.ColumnTabletId << " error=" << message);
         auto response = MakeHolder<TEvColumnFulltextSeed::TEvResponse>();
         response->BuildId = Settings.BuildId;
         response->TabletId = Settings.ColumnTabletId;
@@ -641,7 +663,7 @@ private:
             StateLookupActor = {};
         }
         if (ScanActor) {
-            Send(ScanActor, new TEvents::TEvPoison);
+            Send(ScanActor, new TEvents::TEvPoisonPill);
             ScanActor = {};
         }
     }

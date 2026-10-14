@@ -12,8 +12,9 @@ PEERDIR(
     ydb/core/formats/arrow
     ydb/core/formats/arrow/accessor/plain
     ydb/core/formats/arrow/serializer
+    ydb/core/tx/columnshard
     library/cpp/testing/common
-    yql/essentials/public/udf/service/stub
+    yql/essentials/public/udf/service/exception_policy
     yql/essentials/sql/pg_dummy
 )
 
@@ -21,6 +22,7 @@ YQL_LAST_ABI_VERSION()
 
 DATA(
     arcadia/ydb/core/tx/columnshard/engines/storage/indexes/fulltext/ut/format_v1.bin
+    arcadia/ydb/core/tx/columnshard/engines/storage/indexes/fulltext/ut/format_v2.bin
 )
 
 END()

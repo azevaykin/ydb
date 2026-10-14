@@ -8,7 +8,6 @@
 
 #include <contrib/libs/apache/arrow/cpp/src/arrow/scalar.h>
 #include <contrib/libs/apache/arrow/cpp/src/arrow/type.h>
-
 #include <util/generic/ylimits.h>
 
 #include <algorithm>
@@ -26,79 +25,20 @@ constexpr TStringBuf SkipAnalyzerRetained = "fulltext analyzer retained-byte bud
 constexpr TStringBuf SkipChunkAddress = "fulltext chunk address space is exhausted";
 
 bool IsTextType(const arrow::Type::type typeId) {
-    return typeId == arrow::Type::STRING || typeId == arrow::Type::BINARY || typeId == arrow::Type::LARGE_STRING || typeId == arrow::Type::LARGE_BINARY;
+    return typeId == arrow::Type::STRING || typeId == arrow::Type::BINARY || typeId == arrow::Type::LARGE_STRING ||
+           typeId == arrow::Type::LARGE_BINARY;
 }
 
-TConclusion<std::optional<TString>> TextFromScalar(const std::shared_ptr<arrow::Scalar>& scalar) {
+TConclusion<std::optional<TStringBuf>> TextFromScalar(const std::shared_ptr<arrow::Scalar>& scalar) {
     if (!scalar || !scalar->is_valid) {
-        return std::optional<TString>();
+        return std::optional<TStringBuf>();
     }
     if (!IsTextType(scalar->type->id())) {
         return TConclusionStatus::Fail("fulltext column value is not String or Utf8");
     }
     const auto& binary = static_cast<const arrow::BaseBinaryScalar&>(*scalar);
-    if (!binary.value) {
-        return std::optional<TString>(TString());
-    }
-    return std::optional<TString>(TString(reinterpret_cast<const char*>(binary.value->data()), binary.value->size()));
-}
-
-TConclusion<std::vector<std::optional<TString>>> ReadDocuments(const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data,
-    const ui32 recordsCount, const NArrow::NAccessor::TColumnLoader& loader, const ui32 columnId) {
-    if (!loader.GetField() || !loader.GetField()->type() || !IsTextType(loader.GetField()->type()->id())) {
-        return TConclusionStatus::Fail("fulltext index column is not String or Utf8");
-    }
-    std::vector<std::optional<TString>> documents;
-    documents.reserve(recordsCount);
-    const auto appendArray = [&](const std::shared_ptr<NArrow::NAccessor::IChunkedArray>& array) -> TConclusionStatus {
-        if (array->GetRecordsCount() > Max<ui32>()) {
-            return TConclusionStatus::Fail("fulltext column chunk has too many rows");
-        }
-        for (ui32 i = 0; i < static_cast<ui32>(array->GetRecordsCount()); ++i) {
-            auto text = TextFromScalar(array->GetScalar(i));
-            if (text.IsFail()) {
-                return TConclusionStatus::Fail(text.GetErrorMessage());
-            }
-            documents.push_back(std::move(text.DetachResult()));
-        }
-        return TConclusionStatus::Success();
-    };
-
-    const auto it = data.find(columnId);
-    if (it == data.end() || it->second.empty()) {
-        // Same accessor ISnapshotSchema::NormalizeBatch uses when the source batch has no physical column.
-        // A missing blob is the column default, which is null only when the schema default is null.
-        auto conclusion = appendArray(loader.BuildDefaultAccessor(recordsCount));
-        if (conclusion.IsFail()) {
-            return conclusion;
-        }
-    } else {
-        auto chunks = it->second;
-        std::stable_sort(chunks.begin(), chunks.end(), [](const std::shared_ptr<IPortionDataChunk>& left, const std::shared_ptr<IPortionDataChunk>& right) {
-            return left->GetChunkIdxOptional().value_or(0) < right->GetChunkIdxOptional().value_or(0);
-        });
-        for (const auto& chunk : chunks) {
-            if (chunk->GetEntityId() != columnId) {
-                return TConclusionStatus::Fail("fulltext column chunk entity does not match the indexed column");
-            }
-            auto applied = loader.ApplyConclusion(chunk->GetData(), chunk->GetRecordsCountVerified(), std::nullopt, chunk->GetAdditionalAccessorDataOptional());
-            if (applied.IsFail()) {
-                return TConclusionStatus::Fail(applied.GetErrorMessage());
-            }
-            auto array = applied.DetachResult();
-            if (array->GetRecordsCount() != chunk->GetRecordsCountVerified()) {
-                return TConclusionStatus::Fail("fulltext column chunk record count does not match its blob");
-            }
-            auto conclusion = appendArray(array);
-            if (conclusion.IsFail()) {
-                return conclusion;
-            }
-        }
-    }
-    if (documents.size() != recordsCount) {
-        return TConclusionStatus::Fail("fulltext column chunks do not cover the portion rows");
-    }
-    return documents;
+    return std::optional<TStringBuf>(
+        binary.value ? TStringBuf(reinterpret_cast<const char*>(binary.value->data()), binary.value->size()) : TStringBuf());
 }
 
 TString AnalyzerSkipReason(const NKikimr::NFulltext::EAnalyzeBudgetStatus status) {
@@ -118,13 +58,17 @@ TString AnalyzerSkipReason(const NKikimr::NFulltext::EAnalyzeBudgetStatus status
 struct TOpenChunk {
     ui32 Rows = 0;
     std::map<TString, std::vector<ui32>> Postings;
+    ui64 TokenCount = 0;
     ui64 TokenBytes = 0;
     ui64 RowBytes = 0;
     ui64 DictionaryBytes = 0;
     ui64 PostingBytes = 0;
 
     ui64 DictMemory() const {
-        return TokenBytes + RowBytes;
+        // Include map nodes, vector capacity growth, and the temporary encoder
+        // descriptors. TString may retain capacity beyond its logical length.
+        return 2 * TokenBytes + 2 * RowBytes +
+               TokenCount * (sizeof(std::pair<const TString, std::vector<ui32>>) + 4 * sizeof(void*) + sizeof(TFulltextPostingList));
     }
 
     ui64 Serialized(const ui32 settingsBytes) const {
@@ -133,13 +77,17 @@ struct TOpenChunk {
 };
 
 struct TPredicted {
+    ui64 TokenCount = 0;
     ui64 TokenBytes = 0;
     ui64 RowBytes = 0;
     ui64 DictionaryBytes = 0;
     ui64 PostingBytes = 0;
 
     ui64 DictMemory() const {
-        return TokenBytes + RowBytes;
+        // Include map nodes, vector capacity growth, and the temporary encoder
+        // descriptors. TString may retain capacity beyond its logical length.
+        return 2 * TokenBytes + 2 * RowBytes +
+               TokenCount * (sizeof(std::pair<const TString, std::vector<ui32>>) + 4 * sizeof(void*) + sizeof(TFulltextPostingList));
     }
 
     ui64 Serialized(const ui32 settingsBytes) const {
@@ -148,10 +96,11 @@ struct TPredicted {
 };
 
 TPredicted Predict(const TOpenChunk& chunk, const TVector<TString>& tokens, const ui32 localRow) {
-    TPredicted next{chunk.TokenBytes, chunk.RowBytes, chunk.DictionaryBytes, chunk.PostingBytes};
+    TPredicted next{ chunk.TokenCount, chunk.TokenBytes, chunk.RowBytes, chunk.DictionaryBytes, chunk.PostingBytes };
     for (const auto& token : tokens) {
         const auto it = chunk.Postings.find(token);
         if (it == chunk.Postings.end()) {
+            ++next.TokenCount;
             next.TokenBytes += token.size();
             next.RowBytes += sizeof(ui32);
             next.DictionaryBytes += 16 + token.size();
@@ -169,7 +118,8 @@ void Commit(TOpenChunk& chunk, const TVector<TString>& tokens, const ui32 localR
     for (const auto& token : tokens) {
         const auto it = chunk.Postings.find(token);
         if (it == chunk.Postings.end()) {
-            chunk.Postings.emplace(token, std::vector<ui32>{localRow});
+            chunk.Postings.emplace(token, std::vector<ui32>{ localRow });
+            ++chunk.TokenCount;
             chunk.TokenBytes += token.size();
             chunk.RowBytes += sizeof(ui32);
             chunk.DictionaryBytes += 16 + token.size();
@@ -189,10 +139,10 @@ bool ChunkBytesFit(const ui64 serialized, const i64 maxChunkBytes) {
 }
 
 bool MemoryFits(const ui64 finalized, const ui64 dictMemory, const ui64 serialized, const ui64 budget) {
-    if (dictMemory > budget || serialized > budget - dictMemory) {
+    if (dictMemory > budget || serialized > (budget - dictMemory) / 2) {
         return false;
     }
-    const ui64 live = dictMemory + serialized;
+    const ui64 live = dictMemory + 2 * serialized;
     return finalized <= budget - live;
 }
 
@@ -202,12 +152,13 @@ TVector<TString> UniqueTokens(TVector<TString> tokens) {
     return tokens;
 }
 
-}
+}   // namespace
 
-TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std::optional<TString>>& documents, const TFulltextIndexMeta& meta,
-    const TIndexBuildContext& context) {
+template <class TReadDocument>
+TConclusion<TIndexBuildOutcome> BuildFulltextFromReader(
+    const ui32 recordsCount, TReadDocument&& readDocument, const TFulltextIndexMeta& meta, const TIndexBuildContext& context) {
     Y_UNUSED(context.TargetTier);
-    if (documents.empty()) {
+    if (!recordsCount) {
         return TIndexBuildOutcome::Built({});
     }
     if (context.MaxChunkBytes <= 0) {
@@ -225,7 +176,7 @@ TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std
     ui64 finalized = 0;
     std::vector<std::shared_ptr<NChunks::TPortionIndexChunk>> chunks;
 
-    const auto close = [&]() -> TConclusionStatus {
+    const auto close = [&](const ui64 scratch = 0) -> TConclusionStatus {
         if (open.Rows == 0) {
             return TConclusionStatus::Success();
         }
@@ -236,7 +187,8 @@ TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std
         if (!ChunkBytesFit(serialized, context.MaxChunkBytes)) {
             return TConclusionStatus::Fail(TString(SkipChunkBytes));
         }
-        if (!MemoryFits(finalized, open.DictMemory(), serialized, context.ConstructionMemoryBudget)) {
+        if (scratch > context.ConstructionMemoryBudget ||
+            !MemoryFits(finalized, open.DictMemory(), serialized, context.ConstructionMemoryBudget - scratch)) {
             return TConclusionStatus::Fail(TString(SkipMemory));
         }
         TFulltextChunkPlain plain;
@@ -245,10 +197,10 @@ TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std
         plain.Analyzers = analyzers;
         plain.ChunkRowCount = open.Rows;
         plain.Postings.reserve(open.Postings.size());
-        for (const auto& [token, rows] : open.Postings) {
-            plain.Postings.push_back(TFulltextPostingList{token, rows});
+        for (auto& [token, rows] : open.Postings) {
+            plain.Postings.push_back(TFulltextPostingList{ token, std::move(rows) });
         }
-        auto encoded = EncodeFulltextChunk(plain);
+        auto encoded = EncodeFulltextChunk(std::move(plain));
         if (encoded.IsFail()) {
             return TConclusionStatus::Fail(encoded.GetErrorMessage());
         }
@@ -257,25 +209,45 @@ TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std
             return TConclusionStatus::Fail("fulltext chunk size estimate diverged from the encoder");
         }
         const ui16 chunkIdx = static_cast<ui16>(chunks.size());
-        chunks.push_back(std::make_shared<NChunks::TPortionIndexChunk>(TChunkAddress(meta.GetIndexId(), chunkIdx), open.Rows, blob.size(), blob));
-        finalized += blob.size();
+        chunks.push_back(
+            std::make_shared<NChunks::TPortionIndexChunk>(TChunkAddress(meta.GetIndexId(), chunkIdx), open.Rows, blob.size(), blob));
+        finalized += blob.size() + 2 * sizeof(std::shared_ptr<NChunks::TPortionIndexChunk>) + sizeof(NChunks::TPortionIndexChunk);
         open = TOpenChunk{};
         return TConclusionStatus::Success();
     };
 
-    for (const auto& document : documents) {
+    for (ui32 row = 0; row < recordsCount; ++row) {
+        auto document = readDocument(row);
+        if (document.IsFail()) {
+            return TConclusionStatus::Fail(document.GetErrorMessage());
+        }
         TVector<TString> tokens;
-        if (document) {
-            const auto analyzed = NKikimr::NFulltext::AnalyzeBounded(*document, analyzers, analyzerBudget);
+        if (document.GetResult()) {
+            if (finalized > context.ConstructionMemoryBudget || open.DictMemory() > context.ConstructionMemoryBudget - finalized) {
+                return TIndexBuildOutcome::Skipped(TString(SkipMemory));
+            }
+            const ui64 remaining = context.ConstructionMemoryBudget - finalized - open.DictMemory();
+            auto rowBudget = analyzerBudget;
+            rowBudget.MaxRetainedBytes = std::min(rowBudget.MaxRetainedBytes, remaining / 2);
+            rowBudget.MaxGeneratedTokens = std::min(rowBudget.MaxGeneratedTokens, remaining / (2 * sizeof(TString)));
+            auto analyzed = NKikimr::NFulltext::AnalyzeBounded(*document.GetResult(), analyzers, rowBudget);
             if (!analyzed.Ok()) {
                 return TIndexBuildOutcome::Skipped(AnalyzerSkipReason(analyzed.Status));
             }
-            tokens = UniqueTokens(analyzed.Tokens);
+            tokens = UniqueTokens(std::move(analyzed.Tokens));
         }
+        ui64 scratch = tokens.capacity() * sizeof(TString);
+        for (const auto& token : tokens) {
+            scratch += token.capacity();
+        }
+        if (scratch > context.ConstructionMemoryBudget) {
+            return TIndexBuildOutcome::Skipped(TString(SkipMemory));
+        }
+        const ui64 available = context.ConstructionMemoryBudget - scratch;
         const auto predicted = Predict(open, tokens, open.Rows);
         const ui64 predictedBytes = predicted.Serialized(settingsBytes);
-        const bool fits = ChunkBytesFit(predictedBytes, context.MaxChunkBytes) &&
-            MemoryFits(finalized, predicted.DictMemory(), predictedBytes, context.ConstructionMemoryBudget);
+        const bool fits =
+            ChunkBytesFit(predictedBytes, context.MaxChunkBytes) && MemoryFits(finalized, predicted.DictMemory(), predictedBytes, available);
         if (!fits) {
             if (open.Rows == 0) {
                 if (!ChunkBytesFit(predictedBytes, context.MaxChunkBytes)) {
@@ -283,7 +255,7 @@ TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std
                 }
                 return TIndexBuildOutcome::Skipped(TString(SkipMemory));
             }
-            auto closed = close();
+            auto closed = close(scratch);
             if (closed.IsFail()) {
                 const TString reason = closed.GetErrorMessage();
                 if (reason == SkipMemory || reason == SkipChunkBytes || reason == SkipChunkAddress) {
@@ -296,7 +268,7 @@ TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std
             if (!ChunkBytesFit(retryBytes, context.MaxChunkBytes)) {
                 return TIndexBuildOutcome::Skipped(TString(SkipChunkBytes));
             }
-            if (!MemoryFits(finalized, retry.DictMemory(), retryBytes, context.ConstructionMemoryBudget)) {
+            if (!MemoryFits(finalized, retry.DictMemory(), retryBytes, available)) {
                 return TIndexBuildOutcome::Skipped(TString(SkipMemory));
             }
         }
@@ -316,22 +288,90 @@ TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(const std::vector<std
     for (const auto& chunk : chunks) {
         covered += chunk->GetRecordsCountVerified();
     }
-    if (covered != documents.size()) {
+    if (covered != recordsCount) {
         return TConclusionStatus::Fail("fulltext chunks do not cover the portion");
     }
     return TIndexBuildOutcome::Built(std::move(chunks));
 }
 
-TConclusion<TIndexBuildOutcome> BuildFulltextIndex(const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data, const ui32 recordsCount,
-    const NArrow::NAccessor::TColumnLoader& loader, const TFulltextIndexMeta& meta, const TIndexBuildContext& context) {
-    if (recordsCount == 0) {
+TConclusion<TIndexBuildOutcome> BuildFulltextFromDocuments(
+    const std::vector<std::optional<TString>>& documents, const TFulltextIndexMeta& meta, const TIndexBuildContext& context) {
+    if (documents.size() > Max<ui32>()) {
+        return TConclusionStatus::Fail("fulltext column has too many rows");
+    }
+    return BuildFulltextFromReader(documents.size(), [&](ui32 row) -> TConclusion<std::optional<TStringBuf>> {
+        return documents[row] ? std::optional<TStringBuf>(*documents[row]) : std::nullopt;
+    }, meta, context);
+}
+
+TConclusion<TIndexBuildOutcome> BuildFulltextIndex(const THashMap<ui32, std::vector<std::shared_ptr<IPortionDataChunk>>>& data,
+    const ui32 recordsCount, const NArrow::NAccessor::TColumnLoader& loader, const TFulltextIndexMeta& meta, const TIndexBuildContext& context) {
+    if (!recordsCount) {
         return TIndexBuildOutcome::Built({});
     }
-    auto documents = ReadDocuments(data, recordsCount, loader, meta.GetColumnId());
-    if (documents.IsFail()) {
-        return TConclusionStatus::Fail(documents.GetErrorMessage());
+    if (!loader.GetField() || !loader.GetField()->type() || !IsTextType(loader.GetField()->type()->id())) {
+        return TConclusionStatus::Fail("fulltext index column is not String or Utf8");
     }
-    return BuildFulltextFromDocuments(documents.DetachResult(), meta, context);
+    std::vector<std::shared_ptr<IPortionDataChunk>> chunks;
+    if (auto it = data.find(meta.GetColumnId()); it != data.end()) {
+        chunks = it->second;
+    }
+    std::stable_sort(chunks.begin(), chunks.end(), [](const auto& left, const auto& right) {
+        return left->GetChunkIdxOptional().value_or(0) < right->GetChunkIdxOptional().value_or(0);
+    });
+    ui64 covered = 0;
+    ui64 inputBytes = 0;
+    for (const auto& chunk : chunks) {
+        if (chunk->GetEntityId() != meta.GetColumnId() || !chunk->GetRecordsCountVerified()) {
+            return TConclusionStatus::Fail("fulltext column chunk identity or record count is invalid");
+        }
+        covered += chunk->GetRecordsCountVerified();
+        inputBytes = std::max(inputBytes, chunk->GetRawBytesVerified());
+    }
+    if (!chunks.empty() && covered != recordsCount) {
+        return TConclusionStatus::Fail("fulltext column chunks do not cover the portion rows");
+    }
+    std::shared_ptr<NArrow::NAccessor::IChunkedArray> array;
+    if (chunks.empty()) {
+        array = loader.BuildDefaultAccessor(recordsCount);
+        inputBytes = array->GetRawSize().value_or(static_cast<ui64>(array->GetValueRawBytes()) * recordsCount);
+    }
+    const ui64 descriptors = chunks.capacity() * sizeof(std::shared_ptr<IPortionDataChunk>);
+    if (inputBytes > context.ConstructionMemoryBudget || descriptors > context.ConstructionMemoryBudget - inputBytes) {
+        return TIndexBuildOutcome::Skipped(TString(SkipMemory));
+    }
+    auto buildContext = context;
+    buildContext.ConstructionMemoryBudget -= inputBytes + descriptors;
+    std::shared_ptr<arrow::Scalar> scalar;
+    size_t nextChunk = 0;
+    ui32 chunkStart = 0;
+    // Retain only the current decoded input chunk. Scalar bytes are borrowed
+    // until the next call; the builder finishes each document synchronously.
+    return BuildFulltextFromReader(recordsCount, [&](ui32 row) -> TConclusion<std::optional<TStringBuf>> {
+        if (!array || row - chunkStart == array->GetRecordsCount()) {
+            if (array) {
+                chunkStart += array->GetRecordsCount();
+                scalar.reset();
+                array.reset();
+            }
+            if (chunks.empty()) {
+                array = loader.BuildDefaultAccessor(recordsCount);
+            } else {
+                const auto& chunk = chunks.at(nextChunk++);
+                auto applied = loader.ApplyConclusion(
+                    chunk->GetData(), chunk->GetRecordsCountVerified(), std::nullopt, chunk->GetAdditionalAccessorDataOptional());
+                if (applied.IsFail()) {
+                    return TConclusionStatus::Fail(applied.GetErrorMessage());
+                }
+                array = applied.DetachResult();
+                if (array->GetRecordsCount() != chunk->GetRecordsCountVerified()) {
+                    return TConclusionStatus::Fail("fulltext column chunk record count does not match its blob");
+                }
+            }
+        }
+        scalar = array->GetScalar(row - chunkStart);
+        return TextFromScalar(scalar);
+    }, meta, buildContext);
 }
 
 TConclusion<TIndexBuildOutcome> TFulltextIndexMeta::DoBuildIndexOptional(
@@ -344,4 +384,4 @@ TConclusion<TIndexBuildOutcome> TFulltextIndexMeta::DoBuildIndexOptional(
     return BuildFulltextIndex(data, recordsCount, *loader, *this, context);
 }
 
-} // namespace NKikimr::NOlap::NIndexes::NFulltext
+}   // namespace NKikimr::NOlap::NIndexes::NFulltext

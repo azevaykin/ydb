@@ -43,8 +43,7 @@ public:
         , Config(config)
     {
 #define HNDL(name) "KqpLogical-"#name, Hndl(&TKqpLogicalOptTransformer::name)
-        AddHandler(0, &TCoFlatMap::Match, HNDL(RewriteColumnLocalFulltext));
-        AddHandler(0, &TKqlReadTableRanges::Match, HNDL(RewriteColumnLocalFulltext));
+        AddHandler(0, &TCoFlatMapBase::Match, HNDL(RewriteColumnLocalFulltext));
         AddHandler(0, &TCoTopBase::Match, HNDL(RewriteHybridRankTopSort));
         AddHandler(0, &TCoTop::Match, HNDL(TopSortSelectIndex));
         AddHandler(0, &TCoTopSort::Match, HNDL(TopSortSelectIndex));
@@ -108,6 +107,7 @@ public:
         AddHandler(5, &TKqlReadTableRangesBase::Match, HNDL(ApplyExtractMembersToReadTable<true>));
         AddHandler(5, &TKqpReadOlapTableRangesBase::Match, HNDL(ApplyExtractMembersToReadOlapTable<true>));
         AddHandler(5, &TKqlLookupTableBase::Match, HNDL(ApplyExtractMembersToReadTable<true>));
+        AddHandler(6, &TKqlReadTableRanges::Match, HNDL(RewriteColumnLocalFulltext));
         AddHandler(6, TOptimizeTransformerBase::Any(), HNDL(InspectErroneousIndexAccess));
 
 #undef HNDL

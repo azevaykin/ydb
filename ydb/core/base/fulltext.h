@@ -55,9 +55,20 @@ bool ValidateSettings(const Ydb::Table::FulltextIndexSettings& settings, TString
 bool HasSuperLemmer(const Ydb::Table::FulltextIndexSettings& settings);
 bool FillSetting(Ydb::Table::FulltextIndexSettings& settings, const TString& nameLower, const TString& value, TString& error);
 
-// Fills unset analyzer flags with their defaults so serialized settings bytes are stable.
+// Increment when tokenization, normalization, stopwords, stemming, or their
+// dependencies change the tokens emitted for the same text and settings.
+// This is a semantic version, independent of protobuf and chunk serialization.
+inline constexpr ui64 FulltextAnalyzerSemanticRevision = 1;
+
+// Fills unset analyzer flags with their defaults.
 Ydb::Table::FulltextIndexSettings::Analyzers NormalizeAnalyzers(const Ydb::Table::FulltextIndexSettings::Analyzers& settings);
 void NormalizeFulltextSettings(Ydb::Table::FulltextIndexSettings& settings);
+// Stable, explicit little-endian settings encoding; ignores protobuf presence
+// and unknown fields. Does not include the separately stored semantic revision.
+TString CanonicalFulltextAnalyzerSettings(const Ydb::Table::FulltextIndexSettings::Analyzers& analyzers);
+
+// Legacy wire/schema fingerprints. Keep these stable for existing query plans
+// and global-index metadata; new local chunks use the semantic revision above.
 TString FulltextAnalyzerIdentity(const Ydb::Table::FulltextIndexSettings::Analyzers& normalizedAnalyzers);
 ui64 FulltextAnalyzerRevision(const Ydb::Table::FulltextIndexSettings::Analyzers& normalizedAnalyzers);
 

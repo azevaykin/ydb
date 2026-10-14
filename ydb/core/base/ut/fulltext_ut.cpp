@@ -3,7 +3,6 @@
 #include "superlemmer.h"
 #include "table_index.h"
 
-#include <util/digest/city.h>
 
 #include <library/cpp/json/json_reader.h>
 #include <library/cpp/resource/resource.h>
@@ -1450,8 +1449,30 @@ namespace NKikimr::NFulltext {
             auto lower = analyzers;
             lower.set_use_filter_lowercase(true);
             UNIT_ASSERT_VALUES_UNEQUAL(keywords.AnalyzerIdentity, MustCompile("Hello", lower).AnalyzerIdentity);
-            UNIT_ASSERT_VALUES_UNEQUAL(keywords.AnalyzerRevision, MustCompile("Hello", lower).AnalyzerRevision);
-            UNIT_ASSERT_VALUES_EQUAL(keywords.AnalyzerRevision, CityHash64(keywords.AnalyzerIdentity));
+            UNIT_ASSERT_VALUES_EQUAL(keywords.AnalyzerSemanticRevision, FulltextAnalyzerSemanticRevision);
+            UNIT_ASSERT_VALUES_EQUAL(keywords.AnalyzerSemanticRevision, MustCompile("Hello", lower).AnalyzerSemanticRevision);
+        }
+
+        Y_UNIT_TEST(AnalyzerIdentityIgnoresProtobufPresenceAndInactiveSettings) {
+            auto analyzers = StandardAnalyzers();
+            const TString identity = CanonicalFulltextAnalyzerSettings(analyzers);
+            auto explicitDefaults = NormalizeAnalyzers(analyzers);
+            explicitDefaults.set_language("");
+            explicitDefaults.set_filter_ngram_min_length(99);
+            explicitDefaults.set_filter_ngram_max_length(100);
+            explicitDefaults.set_filter_length_min(123);
+            explicitDefaults.set_filter_length_max(456);
+            UNIT_ASSERT_VALUES_UNEQUAL(analyzers.SerializeAsString(), explicitDefaults.SerializeAsString());
+            UNIT_ASSERT_VALUES_EQUAL(CanonicalFulltextAnalyzerSettings(explicitDefaults), identity);
+
+            // Unknown protobuf field 1000 must not alter the identity of known settings.
+            auto withUnknown = analyzers;
+            UNIT_ASSERT(withUnknown.ParseFromString(analyzers.SerializeAsString() + "\xc0\x3e\x01"));
+            UNIT_ASSERT_VALUES_EQUAL(CanonicalFulltextAnalyzerSettings(withUnknown), identity);
+            UNIT_ASSERT_VALUES_EQUAL(MustCompile("hello", explicitDefaults).AnalyzerIdentity, identity);
+
+            explicitDefaults.set_use_filter_lowercase(true);
+            UNIT_ASSERT_VALUES_UNEQUAL(CanonicalFulltextAnalyzerSettings(explicitDefaults), identity);
         }
 
         Y_UNIT_TEST(CompiledQueryWildcardResidual) {
@@ -1496,6 +1517,24 @@ namespace NKikimr::NFulltext {
             const auto lower = MustCompile("ABC%", lowerAnalyzers, options);
             UNIT_ASSERT(EvaluateFulltextText(lower, TStringBuf("abcd")));
             UNIT_ASSERT(EvaluateFulltextText(lower, TStringBuf("ABCD")));
+        }
+
+        Y_UNIT_TEST(CompiledWildcardCanBeSharedAcrossPortions) {
+            const auto compiled = MustCompile("abc%", NgramAnalyzers(3, 4), Options({}, {}, "wildcard"));
+            const auto copy = compiled;
+            UNIT_ASSERT(compiled.WildcardRegexp);
+            UNIT_ASSERT(copy.WildcardRegexp == compiled.WildcardRegexp);
+            UNIT_ASSERT(MatchFulltextWildcardResidual(copy, "ABCD"));
+            UNIT_ASSERT(!MatchFulltextWildcardResidual(copy, "xabc"));
+        }
+
+        Y_UNIT_TEST(LongNgramInputHonorsMaximumLength) {
+            const TString text(10000, 'a');
+            const auto tokens = Analyze(text, NgramAnalyzers(2, 3));
+            UNIT_ASSERT_VALUES_EQUAL(tokens.size(), 2 * text.size() - 3);
+            for (const auto& token : tokens) {
+                UNIT_ASSERT(token.size() == 2 || token.size() == 3);
+            }
         }
 
         Y_UNIT_TEST(WordBreakTest) {

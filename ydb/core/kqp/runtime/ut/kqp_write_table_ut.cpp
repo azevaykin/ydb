@@ -89,6 +89,40 @@ IShardedWriteController::TMessageMetadata MetadataWithCookie(const ui64 cookie) 
 } // namespace
 
 Y_UNIT_TEST_SUITE(KqpWriteTable) {
+    Y_UNIT_TEST(ColumnBatchSurvivesAllocatorTransfer) {
+        const TString text(65536, 'x');
+        const std::vector<std::pair<TString, NScheme::TTypeInfo>> columns = {
+            {"key", NScheme::TTypeInfo(NScheme::NTypeIds::Uint64)},
+            {"text", NScheme::TTypeInfo(NScheme::NTypeIds::Utf8)}
+        };
+        const TVector<TCell> row = {TCell::Make(ui64(42)), TCell(text.data(), text.size())};
+        auto alloc = std::make_shared<NMiniKQL::TScopedAlloc>(__LOCATION__, TAlignedPagePoolCounters(), false);
+        std::weak_ptr<NMiniKQL::TScopedAlloc> original = alloc;
+        auto batch = CreateColumnBatchFromCells(columns, {row}, alloc);
+        const TString serialized = batch->SerializeToString();
+        const auto arrowMemory = batch->GetMemory();
+        UNIT_ASSERT_VALUES_EQUAL(GetRows(batch)[0][1].AsBuf(), text);
+        UNIT_ASSERT(batch->GetMemory() > arrowMemory);
+        batch->DetachAlloc();
+        alloc.reset();
+        UNIT_ASSERT(original.expired());
+        UNIT_ASSERT(!batch->AttachedAlloc());
+        UNIT_ASSERT_VALUES_EQUAL(batch->SerializeToString(), serialized);
+
+        auto receiver = std::make_shared<NMiniKQL::TScopedAlloc>(__LOCATION__, TAlignedPagePoolCounters(), false);
+        std::weak_ptr<NMiniKQL::TScopedAlloc> received = receiver;
+        batch->AttachAlloc(receiver);
+        UNIT_ASSERT(batch->AttachedAlloc());
+        const auto rows = GetRows(batch);
+        UNIT_ASSERT_VALUES_EQUAL(rows.size(), 1);
+        UNIT_ASSERT_VALUES_EQUAL(rows[0][0].AsValue<ui64>(), 42);
+        UNIT_ASSERT_VALUES_EQUAL(rows[0][1].AsBuf(), text);
+        batch->DetachAlloc();
+        receiver.reset();
+        UNIT_ASSERT(received.expired());
+        UNIT_ASSERT_VALUES_EQUAL(batch->SerializeToString(), serialized);
+    }
+
     Y_UNIT_TEST(SupersededWriteResultFilter) {
         // A result echoing the cookie of the shard's last sent message is processed.
         UNIT_ASSERT(!IsSupersededWriteResult(7, MetadataWithCookie(7)));

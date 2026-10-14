@@ -1,18 +1,20 @@
 #pragma once
 
 #include <ydb/core/base/fulltext.h>
+
 #include <ydb/library/conclusion/result.h>
 
+#include <functional>
 #include <vector>
 
 namespace NKikimr::NOlap::NIndexes::NFulltext {
 
-// Version 1 portion chunk. Every integer is little-endian. There is no padding.
+// Version 2 portion chunk. Every integer is little-endian. There is no padding.
 // Offsets below are from byte 0 of the chunk unless a field says otherwise.
 //
 // Prefix
 //   [0, 4)    magic 'Y','F','T','I'
-//   [4, 8)    u32 format_version = 1
+//   [4, 8)    u32 format_version = 2
 //   [8, 12)   u32 header_length
 //             The header occupies [12, 12 + header_length).
 //             The dictionary starts at absolute offset 12 + header_length.
@@ -20,13 +22,18 @@ namespace NKikimr::NOlap::NIndexes::NFulltext {
 // Header, relative to byte 12
 //   [0, 4)           u32 column_id
 //   [4, 8)           u32 index_id
-//   [8, 16)          u64 analyzer_revision
-//                    CityHash64(SerializeAsString(normalized analyzers))
+//   [8, 16)          u64 analyzer_semantic_revision
+//                    NFulltext::FulltextAnalyzerSemanticRevision
 //   [16, 20)         u32 canonical_settings_size
 //   [20, 20 + S)     canonical analyzer settings (S = canonical_settings_size)
 //   [20 + S, 24 + S) u32 chunk_row_count
 //   [24 + S, 28 + S) u32 token_count
 //   header_length = 28 + S
+//
+// Version 1 used the same layout with CityHash64(SerializeAsString(normalized
+// analyzers)) at [8, 16). Its implicit semantic revision is permanently 1.
+// Readers validate its legacy fingerprint before exposing it as revision 1.
+// Older readers fall back to text when they encounter a version 2 chunk.
 //
 // Canonical analyzer settings, relative to the settings bytes. Explicit defaults are stored
 // even when the protobuf omits them, in this fixed order:
@@ -63,8 +70,9 @@ namespace NKikimr::NOlap::NIndexes::NFulltext {
 //
 // A row with no tokens still counts in chunk_row_count. An empty token is a normal dictionary key.
 
-inline constexpr char FulltextChunkMagic[4] = {'Y', 'F', 'T', 'I'};
-inline constexpr ui32 FulltextChunkFormatVersion = 1;
+inline constexpr char FulltextChunkMagic[4] = { 'Y', 'F', 'T', 'I' };
+inline constexpr ui32 FulltextChunkLegacyFormatVersion = 1;
+inline constexpr ui32 FulltextChunkFormatVersion = 2;
 inline constexpr ui32 FulltextChunkPrefixBytes = 12;
 inline constexpr ui32 FulltextChunkHeaderFixedBytes = 28;
 inline constexpr i32 FulltextCanonicalNgramMinDefault = 3;
@@ -81,7 +89,7 @@ inline ui32 FulltextVarintSize(ui64 value) {
 
 inline ui64 FulltextChunkSerializedBytes(ui32 canonicalSettingsBytes, ui64 dictionaryEntryBytes, ui64 postingBytes) {
     return static_cast<ui64>(FulltextChunkPrefixBytes) + FulltextChunkHeaderFixedBytes + canonicalSettingsBytes + dictionaryEntryBytes +
-        postingBytes;
+           postingBytes;
 }
 
 struct TFulltextPostingList {
@@ -92,18 +100,38 @@ struct TFulltextPostingList {
 struct TFulltextChunkPlain {
     ui32 ColumnId = 0;
     ui32 IndexId = 0;
-    ui64 AnalyzerRevision = 0;
+    ui64 AnalyzerSemanticRevision = 0;
     TString CanonicalSettings;
     Ydb::Table::FulltextIndexSettings::Analyzers Analyzers;
     ui32 ChunkRowCount = 0;
     std::vector<TFulltextPostingList> Postings;
 };
 
+// Views borrow the blob; no token or decoded posting array is copied. The decoder
+// validates every posting, including tokens that are not requested by a query.
+struct TFulltextPostingView {
+    TStringBuf Token;
+    TStringBuf EncodedRows;
+    ui32 Count = 0;
+
+    void VisitRows(const std::function<void(ui32)>& visitor) const;
+};
+
+struct TFulltextChunkView {
+    ui32 ColumnId = 0;
+    ui32 IndexId = 0;
+    ui64 AnalyzerSemanticRevision = 0;
+    TString CanonicalSettings;
+    ui32 ChunkRowCount = 0;
+    std::vector<TFulltextPostingView> Postings;
+};
+
 TString CanonicalAnalyzerSettings(const Ydb::Table::FulltextIndexSettings::Analyzers& normalized);
 TConclusion<Ydb::Table::FulltextIndexSettings::Analyzers> ParseCanonicalAnalyzerSettings(TStringBuf bytes);
 
 // Encoder failure is a caller invariant failure. Decoder failure is malformed stored bytes.
-TConclusion<TString> EncodeFulltextChunk(const TFulltextChunkPlain& chunk);
+TConclusion<TString> EncodeFulltextChunk(TFulltextChunkPlain chunk);
 TConclusion<TFulltextChunkPlain> DecodeFulltextChunk(TStringBuf bytes);
+TConclusion<TFulltextChunkView> DecodeFulltextChunkView(TStringBuf bytes);
 
-} // namespace NKikimr::NOlap::NIndexes::NFulltext
+}   // namespace NKikimr::NOlap::NIndexes::NFulltext

@@ -19,6 +19,17 @@ using TStatus = IGraphTransformer::TStatus;
 
 namespace {
 
+bool HasColumnFulltextWrites(const TKikimrTableDescription& table) {
+    if (table.Metadata->Kind != EKikimrTableKind::Olap) {
+        return false;
+    }
+    return std::any_of(table.Metadata->Indexes.begin(), table.Metadata->Indexes.end(), [](const auto& index) {
+        const auto* fulltext = std::get_if<NKikimrSchemeOp::TFulltextIndexDescription>(&index.SpecializedIndexDescription);
+        return index.ItUsedForWrite() && fulltext
+            && fulltext->GetDocIdPolicy() != NKikimrSchemeOp::TFulltextIndexDescription::DOC_ID_POLICY_UNSPECIFIED;
+    });
+}
+
 std::pair<const TTypeAnnotationNode*, TCoAtomList> BuildReturningType(const TCoAtomList& returningColumns, const TKikimrTableDescription& tableDescription, TExprContext& ctx) {
     TVector<const TItemExprType*> rowItems;
     rowItems.reserve(returningColumns.Size());
@@ -364,7 +375,14 @@ bool BuildUpsertRowsEffect(const TKqlUpsertRows& node, TExprContext& ctx, const 
     const bool isIndexImplTable = table.Metadata->IsIndexImplTable;
 
     const bool isOlap = (table.Metadata->Kind == EKikimrTableKind::Olap);
-    const i64 priority = (isOlap || settings.AllowInconsistentWrites) ? 0 : order;
+    const bool columnFulltext = HasColumnFulltextWrites(table);
+    const i64 priority = ((isOlap && !columnFulltext) || settings.AllowInconsistentWrites) ? 0 : order;
+
+    if (columnFulltext && settings.AllowInconsistentWrites) {
+        ctx.AddError(TIssue(ctx.GetPosition(node.Pos()),
+            "Column-table fulltext indexes require transactional writes."));
+        return false;
+    }
 
     if (isOlap && !(kqpCtx.IsGenericQuery() || (kqpCtx.IsDataQuery() && kqpCtx.Config->GetAllowOlapDataQuery()))) {
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()),
@@ -461,7 +479,9 @@ bool BuildUpsertRowsEffect(const TKqlUpsertRows& node, TExprContext& ctx, const 
             .Done();
 
         auto stageInput = [&]() {
-            if ((table.Metadata->Kind == EKikimrTableKind::Olap && useStreamWrite)
+            // The transaction buffer needs one ordered producer per effect.
+            // Parallel OLAP sinks otherwise reuse the same task priority.
+            if ((isOlap && useStreamWrite && !columnFulltext)
                     || settings.AllowInconsistentWrites) {
                 auto mapCn = Build<TDqCnMap>(ctx, node.Pos())
                     .Output(dqUnion.Output())
@@ -538,7 +558,8 @@ bool BuildDeleteRowsEffect(const TKqlDeleteRows& node, TExprContext& ctx, const 
     const bool isIndexImplTable = table.Metadata->IsIndexImplTable;
 
     const bool isOlap = (table.Metadata->Kind == EKikimrTableKind::Olap);
-    const i64 priority = isOlap ? 0 : order;
+    const bool columnFulltext = HasColumnFulltextWrites(table);
+    const i64 priority = isOlap && !columnFulltext ? 0 : order;
 
     if (isOlap && !(kqpCtx.IsGenericQuery() || (kqpCtx.IsDataQuery() && kqpCtx.Config->GetAllowOlapDataQuery()))) {
         ctx.AddError(TIssue(ctx.GetPosition(node.Pos()),
@@ -634,7 +655,7 @@ bool BuildDeleteRowsEffect(const TKqlDeleteRows& node, TExprContext& ctx, const 
             .Done();
 
         auto stageInput = [&]() {
-            if (table.Metadata->Kind == EKikimrTableKind::Olap) {
+            if (isOlap && !columnFulltext) {
                 auto mapCn = Build<TDqCnMap>(ctx, node.Pos())
                     .Output(dqUnion.Output())
                     .Done();

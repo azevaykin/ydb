@@ -2690,7 +2690,8 @@ private:
             options.DefaultOperator = Settings->GetDefaultOperator();
             options.MinimumShouldMatch = Settings->GetMinimumShouldMatch();
             options.Mode = Settings->GetMode();
-            options.Checks = ::NKikimr::NFulltext::EFulltextQueryChecks::RowTable;
+            options.Checks = IsColumnTableFulltext() ? ::NKikimr::NFulltext::EFulltextQueryChecks::Column
+                : ::NKikimr::NFulltext::EFulltextQueryChecks::RowTable;
             const auto validation = ::NKikimr::NFulltext::CompileFulltextQuery(expr, *matchedAnalyzers, options);
             if (!validation) {
                 RuntimeError(validation.Error, NYql::NDqProto::StatusIds::BAD_REQUEST);
@@ -4168,7 +4169,8 @@ public:
             return;
         }
         for (auto& row : rows) {
-            const TString token = TSerializedCellVec::Serialize(row.Cells);
+            const TString token = TSerializedCellVec::Serialize(
+                TConstArrayRef<TCell>(row.Cells).subspan(0, Settings->KeyColumnsSize()));
             auto it = FetchByPk.find(token);
             YQL_ENSURE(it != FetchByPk.end(), "Column fetch returned an unexpected primary key");
             it->second->AddRow(row.Cells);

@@ -361,6 +361,11 @@ public:
     virtual void OnIndexSelectProcessed(const std::optional<bool> /*result*/) {
     }
 
+    // Column blob ranges requested by scans, after chunk-level filtering. This
+    // also observes text fetched outside a fulltext predicate (e.g. projection).
+    virtual void OnColumnBlobRead(const ui32 /*columnId*/, const ui64 /*bytes*/) {
+    }
+
     TDuration GetMaxReadStaleness() const {
         const TDuration defaultValue = TDuration::MilliSeconds(GetConfig().GetMaxReadStaleness_ms());
         return DoGetMaxReadStaleness(defaultValue);

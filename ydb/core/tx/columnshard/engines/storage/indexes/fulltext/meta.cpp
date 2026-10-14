@@ -23,7 +23,7 @@ TConclusionStatus TFulltextIndexMeta::DoCheckModificationCompatibility(const IIn
         return TConclusionStatus::Fail(TString(NKikimr::NFulltext::LocalFulltextIndexAlterRejected));
     }
     if (other->ColumnId != ColumnId
-        || NKikimr::NFulltext::FulltextAnalyzerIdentity(other->Analyzers) != NKikimr::NFulltext::FulltextAnalyzerIdentity(Analyzers))
+        || NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(other->Analyzers) != NKikimr::NFulltext::CanonicalFulltextAnalyzerSettings(Analyzers))
     {
         return TConclusionStatus::Fail(TString(NKikimr::NFulltext::LocalFulltextIndexAlterRejected));
     }

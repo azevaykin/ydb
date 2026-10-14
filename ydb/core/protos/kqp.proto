@@ -968,6 +968,8 @@ message TKqpTableSinkIndexSettings {
     repeated string PrefixColumns = 32;
     repeated string CoveredColumns = 33;
     optional string TtlColumn = 34;
+    // Deletes can use forward-state tokens without reading the text column.
+    optional TKqpColumnMetadataProto TextColumnMetadata = 35;
 }
 
 enum EInputRowFormat {

@@ -762,10 +762,11 @@
             "Children": [
                 {"Index": 0, "Name": "IndexName", "Type": "TCoAtom"},
                 {"Index": 1, "Name": "ColumnName", "Type": "TCoAtom"},
-                {"Index": 2, "Name": "DefaultOperator", "Type": "TCoAtom"},
-                {"Index": 3, "Name": "MinimumShouldMatch", "Type": "TCoAtom"},
+                {"Index": 2, "Name": "DefaultOperator", "Type": "TExprBase"},
+                {"Index": 3, "Name": "MinimumShouldMatch", "Type": "TExprBase"},
                 {"Index": 4, "Name": "Mode", "Type": "TCoAtom"},
-                {"Index": 5, "Name": "Query", "Type": "TExprBase"}
+                {"Index": 5, "Name": "Query", "Type": "TExprBase"},
+                {"Index": 6, "Name": "Text", "Type": "TExprBase", "Optional": true}
             ]
         },
         {

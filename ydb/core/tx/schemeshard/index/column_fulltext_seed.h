@@ -53,6 +53,7 @@ struct TColumnFulltextSeedSettings {
     // Index meta flattened for the factory (no TColumnFulltextMaintainer dependency here).
     TPathId PostingId;
     TPathId StateId;
+    ui64 StateSchemaVersion = 0;
     TPathId DocsId;
     TPathId StatsId;
     TPathId MapId;

@@ -1672,7 +1672,16 @@ struct TFulltextQuery {
         for(auto& child : NamedOptions->Children()) {
             auto arg = TExprBase(child).Cast<TCoNameValueTuple>();
             if (arg.Name().StringValue() == "Mode") {
-                return arg.Value().Cast<TCoString>().Literal().StringValue();
+                TExprBase value = arg.Value().Cast();
+                if (auto just = value.Maybe<TCoJust>()) {
+                    value = just.Cast().Input();
+                }
+                if (value.Maybe<TCoString>() || value.Maybe<TCoUtf8>()) {
+                    return TString(value.Ref().Child(0)->Content());
+                }
+                // Validation reports unsupported parameterized modes; never cast
+                // an unvalidated option to a string literal here.
+                return {};
             }
         }
 
@@ -2116,6 +2125,9 @@ TFullTextApplyParseResult FindMatchingApply(const TExprBase& node, TExprContext&
     if (result.FulltextScore >= 1 && result.FulltextMatch >= 1) {
         result.HasErrors = true;
         explain = " Multiple fulltext predicates in a single read are not supported.";
+    } else if (columnTableFulltext && result.FulltextMatch > 1) {
+        result.HasErrors = true;
+        explain = " Multiple fulltext predicates in a single read are not supported.";
     } else if (result.FulltextScore > 1) {
         result.HasErrors = true;
         explain = " Multiple fulltext score predicates in a single read are not supported.";
@@ -2133,6 +2145,38 @@ TFullTextApplyParseResult FindMatchingApply(const TExprBase& node, TExprContext&
         explain = columnTableFulltext
             ? TString(TStringBuilder() << " " << NKikimr::NTableIndex::ColumnTableGlobalFulltextPrefixEquality)
             : " Prefixed fulltext index requires an equality predicate (column = <value>) on every prefix column.";
+    }
+
+    if (columnTableFulltext && !result.HasErrors) {
+        for (const auto& query : result.Queries) {
+            if (!query.NamedOptions) {
+                continue;
+            }
+            THashSet<TString> names;
+            for (const auto& child : query.NamedOptions->Children()) {
+                const auto arg = TExprBase(child).Cast<TCoNameValueTuple>();
+                const TString name(arg.Name().Value());
+                const bool allowed = name == "DefaultOperator" || name == "MinimumShouldMatch"
+                    || (query.IsMatchQuery() && name == "Mode")
+                    || (query.IsScoreQuery() && (name == "K1" || name == "B"));
+                if (!allowed || !names.insert(name).second) {
+                    result.HasErrors = true;
+                    explain = TStringBuilder() << " Unsupported or duplicate fulltext option: " << name;
+                    break;
+                }
+                if (name == "Mode") {
+                    auto value = arg.Value().Cast();
+                    if (auto just = value.Maybe<TCoJust>()) {
+                        value = just.Cast().Input();
+                    }
+                    if (!value.Maybe<TCoString>() && !value.Maybe<TCoUtf8>()) {
+                        result.HasErrors = true;
+                        explain = " Fulltext mode must be a String or Utf8 literal.";
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     if (result.HasErrors) {
@@ -2419,27 +2463,23 @@ TExprBase UnwrapJust(TExprBase value) {
 TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExprContext& ctx, const TKqpOptimizeContext& kqpCtx,
     const TParentsMap& parentsMap)
 {
+    Y_UNUSED(parentsMap);
     if (const auto readOnly = node.Maybe<TKqlReadTableRanges>()) {
         const auto settings = TKqpReadTableSettings::Parse(readOnly.Cast());
         if (settings.LocalFulltextIndex.empty()) {
             return node;
         }
-        if (const auto parents = parentsMap.find(node.Raw()); parents != parentsMap.end()) {
-            for (const auto* parent : parents->second) {
-                if (TCoFlatMap::Match(parent)) {
-                    return node;
-                }
-            }
-        }
         return FailColumnFulltext(ctx, node.Pos(), TStringBuilder()
             << "VIEW " << settings.LocalFulltextIndex << " requires FulltextMatch in WHERE");
     }
 
-    if (!node.Maybe<TCoFlatMap>()) {
+    if (!node.Maybe<TCoFlatMapBase>()) {
         return node;
     }
-    const auto flatMap = node.Cast<TCoFlatMap>();
-    const auto maybeRead = flatMap.Input().Maybe<TKqlReadTableRanges>();
+    const auto flatMap = node.Cast<TCoFlatMapBase>();
+    const auto input = flatMap.Input().Maybe<TCoExtractMembers>()
+        ? flatMap.Input().Cast<TCoExtractMembers>().Input() : flatMap.Input();
+    const auto maybeRead = input.Maybe<TKqlReadTableRanges>();
     if (!maybeRead) {
         return node;
     }
@@ -2490,8 +2530,9 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
         return FailColumnFulltext(ctx, node.Pos(), TString(NKikimr::NFulltext::LocalFulltextScoreRejected));
     }
     if (matchCount == 0) {
-        return FailColumnFulltext(ctx, node.Pos(), TStringBuilder()
-            << "VIEW " << indexName << " requires FulltextMatch in WHERE");
+        // Projection FlatMaps can precede the filter. Validate an unconsumed
+        // VIEW only after the logical rules have finished rewriting the read.
+        return node;
     }
     if (matchCount > 1) {
         return FailColumnFulltext(ctx, node.Pos(), "Multiple fulltext predicates in a single read are not supported");
@@ -2513,6 +2554,8 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
     TString mode;
     TString defaultOperator;
     TString minimumShouldMatch;
+    TExprNode::TPtr operatorParameter;
+    TExprNode::TPtr thresholdParameter;
     if (query.NamedOptions) {
         THashSet<TString> seen;
         for (const auto& arg : query.NamedOptions->Children()) {
@@ -2526,9 +2569,16 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
             }
             const auto value = UnwrapJust(tuple.Value().Cast());
             if (value.Maybe<TCoParameter>()) {
-                return FailColumnFulltext(ctx, value.Pos(), name == "Mode"
-                    ? "Parameterized fulltext mode is not supported"
-                    : "Parameterized fulltext options are not supported");
+                if (name == "Mode") {
+                    return FailColumnFulltext(ctx, value.Pos(), "Parameterized fulltext mode is not supported");
+                }
+                const auto type = value.Ref().GetTypeAnn();
+                const auto* data = type && type->GetKind() == ETypeAnnotationKind::Data ? type->Cast<TDataExprType>() : nullptr;
+                if (!data || (data->GetSlot() != EDataSlot::String && data->GetSlot() != EDataSlot::Utf8)) {
+                    return FailColumnFulltext(ctx, value.Pos(), "Fulltext options must be non-null String or Utf8 values");
+                }
+                (name == "DefaultOperator" ? operatorParameter : thresholdParameter) = value.Ptr();
+                continue;
             }
             if (!IsFulltextLiteral(value)) {
                 return FailColumnFulltext(ctx, value.Pos(), TStringBuilder() << "Fulltext option " << name << " must be a literal");
@@ -2568,12 +2618,13 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
     if (!optionError.empty() || parsedOperator == NTableIndex::NFulltext::EDefaultOperator::Invalid) {
         return FailColumnFulltext(ctx, node.Pos(), optionError ? optionError : "Invalid fulltext default operator");
     }
-    if (!minimumShouldMatch.empty() && parsedOperator != NTableIndex::NFulltext::EDefaultOperator::Or) {
+    if (!operatorParameter && !minimumShouldMatch.empty() && parsedOperator != NTableIndex::NFulltext::EDefaultOperator::Or) {
         return FailColumnFulltext(ctx, node.Pos(), "MinimumShouldMatch is not supported for AND default operator");
     }
     if (!minimumShouldMatch.empty()) {
         optionError.clear();
-        NTableIndex::NFulltext::MinimumShouldMatchFromString(1, parsedOperator, minimumShouldMatch, optionError);
+        NTableIndex::NFulltext::MinimumShouldMatchFromString(1, operatorParameter ? NTableIndex::NFulltext::EDefaultOperator::Or : parsedOperator,
+            minimumShouldMatch, optionError);
         if (!optionError.empty()) {
             return FailColumnFulltext(ctx, node.Pos(), optionError);
         }
@@ -2581,7 +2632,7 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
     if (modeLower == "wildcard" && !analyzers.use_filter_ngram() && !analyzers.use_filter_edge_ngram()) {
         return FailColumnFulltext(ctx, node.Pos(), "Wildcard mode requires an analyzer with use_filter_ngram or use_filter_edge_ngram");
     }
-    if (queryIsLiteral) {
+    if (queryIsLiteral && !operatorParameter && !thresholdParameter) {
         NKikimr::NFulltext::TFulltextQueryOptions options;
         options.Checks = NKikimr::NFulltext::EFulltextQueryChecks::Column;
         options.Mode = mode;
@@ -2596,10 +2647,14 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
     const auto fulltextNode = Build<TKqpOlapFulltextMatch>(ctx, query.Node->Pos())
         .IndexName().Build(indexName)
         .ColumnName().Build(textColumn)
-        .DefaultOperator().Build(defaultOperator)
-        .MinimumShouldMatch().Build(minimumShouldMatch)
+        .DefaultOperator(TExprBase(operatorParameter ? operatorParameter : ctx.NewAtom(node.Pos(), defaultOperator)))
+        .MinimumShouldMatch(TExprBase(thresholdParameter ? thresholdParameter : ctx.NewAtom(node.Pos(), minimumShouldMatch)))
         .Mode().Build(mode)
         .Query(queryExpr)
+        .Text<TCoMember>()
+            .Struct(flatMap.Lambda().Args().Arg(0))
+            .Name().Build(textColumn)
+            .Build()
         .Done();
     parsed.Replaces[query.Node.Get()] = fulltextNode.Ptr();
 
@@ -2629,10 +2684,10 @@ TMaybeNode<TExprBase> KqpRewriteColumnLocalFulltext(const TExprBase& node, TExpr
         flatMap.Lambda().Pos(),
         std::move(flatMap.Lambda().Args().Ptr()),
         ctx.ReplaceNodes(TExprNode::TListType{flatMap.Lambda().Body().Ptr()}, parsed.Replaces))};
-    return Build<TCoFlatMap>(ctx, flatMap.Pos())
-        .Input(newRead)
-        .Lambda(NewLambdaFrom(ctx, flatMap.Lambda().Pos(), parsed.Replaces, flatMap.Lambda().Args().Ref(), newLambdaBody.Body()))
-        .Done();
+    return TExprBase(ctx.ChangeChildren(flatMap.Ref(), {
+        ctx.ReplaceNode(flatMap.Input().Ptr(), read.Ref(), newRead.Ptr()),
+        NewLambdaFrom(ctx, flatMap.Lambda().Pos(), parsed.Replaces, flatMap.Lambda().Args().Ref(), newLambdaBody.Body()).Ptr()
+    }));
 }
 
 TMaybeNode<TExprBase> KqpSelectJsonIndex(const NYql::NNodes::TExprBase& node, NYql::TExprContext& ctx, const TKqpOptimizeContext& kqpCtx) {

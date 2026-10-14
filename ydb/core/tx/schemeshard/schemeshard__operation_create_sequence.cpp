@@ -367,9 +367,13 @@ public:
 
             if (checks) {
                 if (parentPath.Parent()->IsTableIndex()) {
-                    // Only __ydb_id sequence can be created in the prefixed index
+                    // Index-owned sequences are only created with their support
+                    // table, as part of the same schema operation.
+                    const bool columnFulltextDocId = name == NTableIndex::NFulltext::DocIdSequence
+                        && parentPath->Name == NTableIndex::NFulltext::DocIdMapTable
+                        && parentPath.Parent().Parent()->IsColumnTable();
                     if (name != NTableIndex::NKMeans::IdColumnSequence &&
-                        name != NTableIndex::NFulltext::GenSequence) {
+                        name != NTableIndex::NFulltext::GenSequence && !columnFulltextDocId) {
                         result->SetError(NKikimrScheme::EStatus::StatusNameConflict, "sequences are not allowed in indexes");
                         return result;
                     }

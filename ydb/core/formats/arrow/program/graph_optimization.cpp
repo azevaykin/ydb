@@ -415,6 +415,13 @@ bool TGraph::SetDictionaryOnlyOnFetch(const ui32 columnId) {
 // - distinct marker: a stateless DISTINCT marker on that single column, or on JsonValue(column, path) computed
 //   over the dedicated single sub-column fetch of that column (the sub-column dictionary values are the DISTINCT domain).
 TConclusion<bool> TGraph::OptimizeForFetchDictionaryOnly(TGraphNode* node, const THashSet<ui32>& requiredDataColumnIds) {
+    // Fulltext masks use source-row coordinates even when text is fetched lazily.
+    // A dictionary-only fetch changes that domain and cannot be filtered by those masks.
+    for (const auto& [_, candidate] : Nodes) {
+        if (candidate->Is(EProcessorType::FulltextMatch)) {
+            return false;
+        }
+    }
     if (requiredDataColumnIds.size() != 1) {
         return false;
     }

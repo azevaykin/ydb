@@ -17,6 +17,9 @@
 #include <yql/essentials/public/issue/yql_issue_message.h>
 
 #include <util/string/builder.h>
+#include <util/generic/ylimits.h>
+
+#include <algorithm>
 
 namespace NKikimr::NKqp {
 
@@ -56,14 +59,26 @@ void TColumnShardPkFetch::Fail(NYql::NDqProto::StatusIds::StatusCode status, con
         return;
     }
     Failed = true;
-    Scans.clear();
-    PendingKeys.clear();
-    InFlight = 0;
+    StopScans();
     OnError(status, message);
 }
 
 void TColumnShardPkFetch::Cancel() {
     Cancelled = true;
+    StopScans();
+}
+
+void TColumnShardPkFetch::StopScan(const TScan& scan) {
+    if (scan.ScanActor) {
+        TActivationContext::Send(new IEventHandle(scan.ScanActor, SelfId, new TEvents::TEvPoisonPill()));
+    }
+}
+
+void TColumnShardPkFetch::StopScans() {
+    for (const auto& [id, scan] : Scans) {
+        Y_UNUSED(id);
+        StopScan(scan);
+    }
     Scans.clear();
     PendingKeys.clear();
     InFlight = 0;
@@ -73,6 +88,27 @@ void TColumnShardPkFetch::Submit(std::vector<TOwnedCellVec> keys) {
     if (Failed || Cancelled || keys.empty()) {
         return;
     }
+    if (!Idle()) {
+        Fail(NYql::NDqProto::StatusIds::INTERNAL_ERROR, "Column fetch already has an outstanding wave.");
+        return;
+    }
+    std::vector<NScheme::TTypeInfo> keyTypes;
+    for (ui32 i = 0; i < Config.KeyColumnCount; ++i) {
+        keyTypes.push_back(ColumnType(Config.Columns.at(i)));
+    }
+    for (const auto& key : keys) {
+        if (key.size() != keyTypes.size()) {
+            Fail(NYql::NDqProto::StatusIds::INTERNAL_ERROR, "Column fetch requires a complete primary key.");
+            return;
+        }
+    }
+    const auto compare = [&](const TOwnedCellVec& left, const TOwnedCellVec& right) {
+        return CompareTypedCellVectors(left.data(), right.data(), keyTypes.data(), keyTypes.size());
+    };
+    std::sort(keys.begin(), keys.end(), [&](const auto& left, const auto& right) { return compare(left, right) < 0; });
+    keys.erase(std::unique(keys.begin(), keys.end(), [&](const auto& left, const auto& right) {
+        return compare(left, right) == 0;
+    }), keys.end());
     if (!Sharding) {
         PendingKeys.insert(PendingKeys.end(), std::make_move_iterator(keys.begin()), std::make_move_iterator(keys.end()));
         if (!Resolving) {
@@ -213,13 +249,27 @@ void TColumnShardPkFetch::StartScans(std::vector<TOwnedCellVec> keys) {
 }
 
 void TColumnShardPkFetch::SendScan(ui64 shardId, std::vector<TOwnedCellVec> keys) {
+    // Pending and retried slices can be combined in a different order.
+    std::sort(keys.begin(), keys.end(), [&](const auto& left, const auto& right) {
+        for (ui32 i = 0; i < Config.KeyColumnCount; ++i) {
+            const int order = CompareTypedCells(left[i], right[i], ColumnType(Config.Columns[i]));
+            if (order) {
+                return order < 0;
+            }
+        }
+        return false;
+    });
+    if (NextScanId == Max<ui32>()) {
+        Fail(NYql::NDqProto::StatusIds::INTERNAL_ERROR, "Column fetch exhausted scan generations.");
+        return;
+    }
     const ui64 scanId = ++NextScanId;
     auto ev = std::make_unique<TEvDataShard::TEvKqpScan>();
     ev->Record.SetLocalPathId(Config.TableId.PathId.LocalPathId);
     ev->Record.SetTablePath(Config.TablePath);
     ev->Record.SetSchemaVersion(Config.TableId.SchemaVersion);
     ev->Record.SetScanId(scanId);
-    ev->Record.SetGeneration(1);
+    ev->Record.SetGeneration(scanId);
     ev->Record.SetTxId(Config.LockTxId ? Config.LockTxId : Config.Snapshot.TxId);
     if (Config.LockTxId) {
         ev->Record.SetLockTxId(Config.LockTxId);
@@ -244,6 +294,7 @@ void TColumnShardPkFetch::SendScan(ui64 shardId, std::vector<TOwnedCellVec> keys
     auto* ranges = ev->Record.MutableRanges();
     TScan scan;
     scan.ShardId = shardId;
+    scan.Generation = scanId;
     scan.Keys = keys;
     scan.KeyTokens.reserve(keys.size());
     for (const auto& key : keys) {
@@ -260,17 +311,16 @@ void TColumnShardPkFetch::SendScan(ui64 shardId, std::vector<TOwnedCellVec> keys
 }
 
 void TColumnShardPkFetch::HandleScanInit(TEvKqpCompute::TEvScanInitActor::TPtr& ev) {
-    if (Failed || Cancelled) {
-        return;
-    }
+    const auto actor = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
     auto it = Scans.find(ev->Get()->Record.GetScanId());
-    if (it == Scans.end() || it->second.Finished) {
+    if (Failed || Cancelled || it == Scans.end() || it->second.Finished
+        || it->second.Generation != ev->Get()->Record.GetGeneration()) {
+        TActivationContext::Send(new IEventHandle(actor, SelfId, new TEvents::TEvPoisonPill()));
         return;
     }
-    it->second.Generation = ev->Get()->Record.GetGeneration();
-    it->second.ScanActor = ActorIdFromProto(ev->Get()->Record.GetScanActorId());
+    it->second.ScanActor = actor;
     TActivationContext::Send(new IEventHandle(
-        it->second.ScanActor, SelfId, new TEvKqpCompute::TEvScanDataAck(8ull << 20, it->second.Generation)));
+        it->second.ScanActor, SelfId, new TEvKqpCompute::TEvScanDataAck(8ull << 20, it->second.Generation, 1)));
 }
 
 void TColumnShardPkFetch::HandleScanData(TEvKqpCompute::TEvScanData::TPtr& ev) {
@@ -282,17 +332,20 @@ void TColumnShardPkFetch::HandleScanData(TEvKqpCompute::TEvScanData::TPtr& ev) {
         return;
     }
     auto& scan = it->second;
-    if (scan.ScanActor && ev->Get()->Generation != scan.Generation) {
+    if (ev->Get()->Generation != scan.Generation || ev->Sender != scan.ScanActor) {
         return;
     }
     if (OnLocks && (!ev->Get()->LocksInfo.Locks.empty() || !ev->Get()->LocksInfo.BrokenLocks.empty())) {
         OnLocks(ev->Get()->LocksInfo.Locks, ev->Get()->LocksInfo.BrokenLocks);
-        if (Failed) {
+        if (Failed || Cancelled) {
             return;
         }
     }
 
     auto consume = [&](TConstArrayRef<TCell> cells) {
+        if (Failed || Cancelled) {
+            return;
+        }
         if (cells.size() != Config.Columns.size()) {
             Fail(NYql::NDqProto::StatusIds::INTERNAL_ERROR, "Column fetch returned an unexpected column count.");
             return;
@@ -360,7 +413,7 @@ void TColumnShardPkFetch::HandleScanData(TEvKqpCompute::TEvScanData::TPtr& ev) {
     if (!ev->Get()->Finished) {
         const auto actor = scan.ScanActor ? scan.ScanActor : ev->Sender;
         TActivationContext::Send(new IEventHandle(
-            actor, SelfId, new TEvKqpCompute::TEvScanDataAck(8ull << 20, scan.Generation)));
+            actor, SelfId, new TEvKqpCompute::TEvScanDataAck(8ull << 20, scan.Generation, 1)));
         return;
     }
     FinishScan(it->first);
@@ -376,7 +429,7 @@ void TColumnShardPkFetch::FinishScan(ui64 scanId) {
     if (InFlight > 0) {
         --InFlight;
     }
-    if (scan.Returned.size() != scan.KeyTokens.size()) {
+    if (Config.MissingRows == EMissingRows::RequirePresent && scan.Returned.size() != scan.KeyTokens.size()) {
         Fail(NYql::NDqProto::StatusIds::ABORTED,
             TStringBuilder() << "Indexed document is missing from the column table `" << Config.TablePath << "`.");
         return;
@@ -399,6 +452,7 @@ void TColumnShardPkFetch::ScheduleRetry(ui64 scanId, bool allowInstant) {
         return;
     }
     const ui64 shardId = it->second.ShardId;
+    StopScan(it->second);
     auto keys = std::move(it->second.Keys);
     Scans.erase(it);
     if (InFlight > 0) {
@@ -446,10 +500,15 @@ void TColumnShardPkFetch::HandleScanError(TEvKqpCompute::TEvScanError::TPtr& ev)
     const TString message = issues.ToOneLineString();
     ui64 scanId = 0;
     for (const auto& [id, scan] : Scans) {
-        if (ev->Get()->Record.GetTabletId() == 0 || scan.ShardId == ev->Get()->Record.GetTabletId()) {
+        if (scan.Generation == ev->Get()->Record.GetGeneration()
+            && (ev->Get()->Record.GetTabletId() == 0 || scan.ShardId == ev->Get()->Record.GetTabletId())
+            && (!scan.ScanActor || scan.ScanActor == ev->Sender)) {
             scanId = id;
             break;
         }
+    }
+    if (!scanId) {
+        return; // A delayed error from a cancelled or retried attempt.
     }
     switch (status) {
         case Ydb::StatusIds::OVERLOADED:

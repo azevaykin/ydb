@@ -24,6 +24,11 @@ namespace NKikimr::NKqp {
 // every requested key of that scan has arrived, so a retry cannot emit twice.
 class TColumnShardPkFetch {
 public:
+    enum class EMissingRows {
+        RequirePresent,
+        AllowAbsent,
+    };
+
     struct TRow {
         TOwnedCellVec Cells;
     };
@@ -38,6 +43,7 @@ public:
         NKikimrDataEvents::ELockMode LockMode = NKikimrDataEvents::OPTIMISTIC;
         std::vector<NKikimrKqp::TKqpColumnMetadataProto> Columns;
         ui32 KeyColumnCount = 0;
+        EMissingRows MissingRows = EMissingRows::RequirePresent;
     };
 
     using TRowsCallback = std::function<void(std::vector<TRow>)>;
@@ -79,6 +85,8 @@ private:
     };
 
     void Fail(NYql::NDqProto::StatusIds::StatusCode status, const TString& message);
+    void StopScans();
+    void StopScan(const TScan& scan);
     void Resolve();
     void StartScans(std::vector<TOwnedCellVec> keys);
     void SendScan(ui64 shardId, std::vector<TOwnedCellVec> keys);
