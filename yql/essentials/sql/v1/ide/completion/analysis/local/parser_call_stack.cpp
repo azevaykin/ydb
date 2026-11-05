@@ -127,7 +127,8 @@ bool IsLikelyObjectRefStack(const TParserCallStack& stack) {
 }
 
 bool IsLikelyExistingTableStack(const TParserCallStack& stack) {
-    return (IsTableRefStack(stack) && !IsDropViewStack(stack)) || IsDropTableStack(stack);
+    return (IsTableRefStack(stack) && !IsDropViewStack(stack)) || IsDropTableStack(stack) ||
+           Contains({RULE(Checksum_table_stmt), RULE(Simple_table_ref_core), RULE(Object_ref)}, stack);
 }
 
 bool IsLikelyExistingViewStack(const TParserCallStack& stack) {

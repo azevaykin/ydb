@@ -1662,6 +1662,68 @@ Y_UNIT_TEST(InvalidExpression) {
 
 } // Y_UNIT_TEST_SUITE(Analyze)
 
+Y_UNIT_TEST_SUITE(ChecksumTable) {
+Y_UNIT_TEST(DefaultAndAlgorithms) {
+    for (const TString algorithm : {"CityHash64", "CityHash128", "Sha256"}) {
+        const auto result = SqlToYql("CHECKSUM TABLE plato.Input WITH (ALGORITHM = \"" + algorithm + "\");");
+        UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+        const auto ast = GetPrettyPrint(result);
+        UNIT_ASSERT_STRING_CONTAINS(ast, "/lib/yql/digest.sql");
+        UNIT_ASSERT_STRING_CONTAINS(ast, "Aggregate");
+        UNIT_ASSERT_STRING_CONTAINS(ast, "Read!");
+        UNIT_ASSERT_STRING_CONTAINS(ast, algorithm);
+    }
+    const auto result = SqlToYql("CHECKSUM TABLE plato.Input;");
+    UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+    UNIT_ASSERT_STRING_CONTAINS(GetPrettyPrint(result), "CityHash64");
+}
+
+Y_UNIT_TEST(TableReferencesAndOptionCase) {
+    for (const TString query : {
+             "USE plato; CHECKSUM TABLE Input;",
+             "CHECKSUM TABLE plato.`path with spaces` WITH (algorithm = 'Sha256');",
+             "USE plato; DECLARE $table AS String; CHECKSUM TABLE $table WITH (aLgOrItHm = 'CityHash128',);",
+             "USE plato; PRAGMA TablePathPrefix = '/Root'; CHECKSUM TABLE my_table;"}) {
+        const auto result = SqlToYql(query);
+        UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+    }
+    const auto result = SqlToYqlWithAnsiLexer("CHECKSUM TABLE plato.\"my table\" WITH (ALGORITHM = 'Sha256');");
+    UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+}
+
+Y_UNIT_TEST(InvalidOptions) {
+    for (const auto& [options, error] : TVector<std::pair<TString, TString>>{
+             {"UNKNOWN = 'Sha256'", "Unknown CHECKSUM TABLE setting"},
+             {"ALGORITHM = 'Sha256', algorithm = 'CityHash64'", "Duplicate CHECKSUM TABLE setting"},
+             {"ALGORITHM = 1", "CHECKSUM TABLE ALGORITHM value should be a string literal"},
+             {"ALGORITHM = Sha256", "CHECKSUM TABLE ALGORITHM value should be a string literal"},
+             {"ALGORITHM = 'Unknown'", "Unsupported CHECKSUM TABLE algorithm"},
+             {"ALGORITHM = 'sha256'", "Unsupported CHECKSUM TABLE algorithm"}}) {
+        const auto result = SqlToYql("CHECKSUM TABLE plato.Input WITH (" + options + ");");
+        UNIT_ASSERT(!result.IsOk());
+        UNIT_ASSERT_STRING_CONTAINS(Err2Str(result), error);
+    }
+    for (const TString options : {"ALGORITHM = $algorithm", "ALGORITHM = 'Sha' || '256'"}) {
+        const auto result = SqlToYql("$algorithm = 'Sha256'; CHECKSUM TABLE plato.Input WITH (" + options + ");");
+        UNIT_ASSERT(!result.IsOk());
+    }
+}
+
+Y_UNIT_TEST(ChecksumRemainsAnIdentifier) {
+    const auto result = SqlToYql("SELECT checksum AS checksum FROM plato.checksum;");
+    UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+}
+
+Y_UNIT_TEST(RejectsViewAndSubqueryDefinitions) {
+    for (const auto mode : {NSQLTranslation::ESqlMode::LIMITED_VIEW, NSQLTranslation::ESqlMode::SUBQUERY}) {
+        const auto result = SqlToYqlWithMode("CHECKSUM TABLE plato.Input;", mode);
+        UNIT_ASSERT(!result.IsOk());
+        UNIT_ASSERT_STRING_CONTAINS(Err2Str(result), "CHECKSUM TABLE statement is not supported");
+    }
+}
+
+} // Y_UNIT_TEST_SUITE(ChecksumTable)
+
 Y_UNIT_TEST_SUITE(Transfer) {
 
 Y_UNIT_TEST(Lambda) {

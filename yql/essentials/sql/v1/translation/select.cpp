@@ -3502,6 +3502,57 @@ TSourcePtr BuildSelect(TPosition pos, TSourcePtr source, TNodePtr skipTake) {
     return new TSelect(pos, std::move(source), skipTake);
 }
 
+class TChecksumSource final: public IProxySource {
+public:
+    TChecksumSource(TPosition pos, TSourcePtr source, TString algorithm)
+        : IProxySource(pos, source.Get())
+        , SourcePtr_(std::move(source))
+        , Algorithm_(std::move(algorithm))
+    {
+    }
+
+    bool DoInit(TContext& ctx, ISource* src) final {
+        ctx.RequiredModules.emplace("digest_module", "/lib/yql/digest.sql");
+        SourcePtr_->AllColumns();
+        return SourcePtr_->Init(ctx, src) && IProxySource::DoInit(ctx, src);
+    }
+
+    TNodePtr Build(TContext& ctx) final {
+        auto input = SourcePtr_->Build(ctx);
+        if (!input) {
+            return nullptr;
+        }
+
+        auto row = RemoveSystemColumns(AstNode("row"), ctx.Settings.ExtraSystemColumnPrefixes);
+        auto extractor = BuildLambda(Pos_, Y("row"), Y("PersistableRepr", row));
+        auto factory = Y("Apply", BuildBind(Pos_, "digest_module", "$DigestFactory"), Y("String", Q(Algorithm_)));
+        auto traits = Y("Apply", factory, Y("ListItemType", Y("TypeOf", "checksum_input")), extractor);
+        auto aggregate = Y("Aggregate", "checksum_input", Q(Y()), Q(Y(Q(Y(Q("digest"), traits)))));
+        auto output = Y("Map", aggregate, BuildLambda(Pos_, Y("row"), Y("Member", "row", Q("digest"))));
+        return Y("block", Q(Y(Y("let", "checksum_input", input), Y("return", output))));
+    }
+
+    bool HasSelectResult() const final {
+        return true;
+    }
+
+    EOrderKind GetOrderKind() const final {
+        return EOrderKind::None;
+    }
+
+    TNodePtr DoClone() const final {
+        return MakeIntrusive<TChecksumSource>(Pos_, SourcePtr_->CloneSource(), Algorithm_);
+    }
+
+private:
+    TSourcePtr SourcePtr_;
+    const TString Algorithm_;
+};
+
+TSourcePtr BuildChecksumSource(TPosition pos, TSourcePtr source, const TString& algorithm) {
+    return MakeIntrusive<TChecksumSource>(pos, std::move(source), algorithm);
+}
+
 class TAnyColumnSource final: public ISource {
 public:
     explicit TAnyColumnSource(TPosition pos)

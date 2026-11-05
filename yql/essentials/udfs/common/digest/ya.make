@@ -9,5 +9,6 @@ INCLUDE(ya.make.inc)
 END()
 
 RECURSE_FOR_TESTS(
+    lib/ut
     test
 )

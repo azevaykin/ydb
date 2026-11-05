@@ -1,0 +1,3 @@
+<tmp_path>/program.sql:/home/aggregate.sql:14:33: Error: yql/essentials/udfs/common/digest/lib/aggregate.cpp:xxx: Unsupported Digest algorithm: Unknown
+	
+	                                ^

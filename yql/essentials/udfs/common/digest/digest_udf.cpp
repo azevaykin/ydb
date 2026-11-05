@@ -1,3 +1,5 @@
+#include "aggregate_udf.h"
+
 #include <yql/essentials/public/udf/udf_helpers.h>
 #include <yql/essentials/public/udf/udf_value_builder.h>
 #include <yql/essentials/core/langver/feature.gen.h>
@@ -517,7 +519,13 @@ SIMPLE_MODULE(TDigestModule,
               TSha512,
               TIntHash64,
               TXXH3,
-              TXXH3_128)
+              TXXH3_128,
+              NYql::NDigest::TAggregateCreate,
+              NYql::NDigest::TAggregateAddValue,
+              NYql::NDigest::TAggregateMerge,
+              NYql::NDigest::TAggregateSerialize,
+              NYql::NDigest::TAggregateDeserialize,
+              NYql::NDigest::TAggregateFinalize)
 
 } // namespace
 

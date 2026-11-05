@@ -9,6 +9,7 @@ SRCS(
 )
 
 PEERDIR(
+    yql/essentials/udfs/common/digest/lib
     yql/essentials/core/langver
     contrib/libs/farmhash
     contrib/libs/highwayhash

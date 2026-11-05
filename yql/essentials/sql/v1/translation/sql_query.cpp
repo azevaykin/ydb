@@ -1742,6 +1742,64 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             AddStatementToBlocks(blocks, node);
             break;
         }
+        case TRule_sql_stmt_core::kAltSqlStmtCore74: {
+            if (Ctx_.ParallelModeCount > 0) {
+                Error() << statementName.Human << " statement is not supported in parallel mode";
+                return false;
+            }
+            Ctx_.BodyPart();
+            const auto& rule = core.GetAlt_sql_stmt_core74().GetRule_checksum_table_stmt1();
+            Token(rule.GetToken1());
+            const auto pos = Ctx_.Pos();
+
+            TString algorithm = "CityHash64";
+            bool algorithmSet = false;
+            const auto parseSetting = [&](const TRule_table_settings_entry& entry) {
+                const TString key = to_lower(Id(entry.GetRule_an_id1(), *this));
+                if (key != "algorithm") {
+                    Error() << "Unknown CHECKSUM TABLE setting: " << key;
+                    return false;
+                }
+                if (algorithmSet) {
+                    Error() << "Duplicate CHECKSUM TABLE setting: ALGORITHM";
+                    return false;
+                }
+                TDeferredAtom value;
+                if (!StoreString(entry.GetRule_table_setting_value3(), value, Ctx_, "CHECKSUM TABLE ALGORITHM")) {
+                    return false;
+                }
+                algorithm = *value.GetLiteral();
+                if (algorithm != "CityHash64" && algorithm != "CityHash128" && algorithm != "Sha256") {
+                    Error() << "Unsupported CHECKSUM TABLE algorithm: " << algorithm;
+                    return false;
+                }
+                algorithmSet = true;
+                return true;
+            };
+            if (rule.HasBlock4()) {
+                const auto& settings = rule.GetBlock4().GetRule_with_table_settings1();
+                if (!parseSetting(settings.GetRule_table_settings_entry3())) {
+                    return false;
+                }
+                for (const auto& block : settings.GetBlock4()) {
+                    if (!parseSetting(block.GetRule_table_settings_entry2())) {
+                        return false;
+                    }
+                }
+            }
+
+            TTableRef table;
+            if (!SimpleTableRefCoreImpl(rule.GetRule_simple_table_ref_core3(), table)) {
+                return false;
+            }
+            const auto hints = GetContextHints(Ctx_);
+            if (!hints.empty()) {
+                table.Options = BuildInputOptions(pos, hints);
+            }
+            auto source = BuildChecksumSource(pos, BuildTableSource(pos, table), algorithm);
+            blocks.push_back(BuildSelectResult(pos, std::move(source), /*writeResult=*/true, /*inSubquery=*/false, Ctx_.Scoped));
+            break;
+        }
         case TRule_sql_stmt_core::ALT_NOT_SET:
             YQL_ENSURE(false, "Unreachable");
     }
