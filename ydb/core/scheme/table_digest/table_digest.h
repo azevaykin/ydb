@@ -2,7 +2,7 @@
 
 #include <ydb/core/scheme/scheme_tablecell.h>
 #include <ydb/core/scheme_types/scheme_type_info.h>
-#include <yql/essentials/udfs/common/digest/lib/aggregate.h>
+#include <ydb/library/table_digest/aggregate.h>
 
 #include <util/generic/array_ref.h>
 #include <util/generic/vector.h>

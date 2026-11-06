@@ -1,3 +1,0 @@
-<tmp_path>/program.sql:<main>:1:42: Error: yql/essentials/udfs/common/digest/lib/aggregate.cpp:xxx: Invalid Digest hash byte length
-	SELECT Digest::AggregateFinalize(Digest::AggregateAddValue(
-	                                         ^

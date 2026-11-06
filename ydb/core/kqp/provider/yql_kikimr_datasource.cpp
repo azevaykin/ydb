@@ -10,12 +10,14 @@
 #include <ydb/core/kqp/tracing/kqp_compile_trace.h>
 #include <ydb/core/kqp/provider/yql_kikimr_settings.h>
 #include <ydb/core/protos/kqp_lookup_source.pb.h>
+#include <ydb/library/table_digest/aggregate.h>
 #include <ydb/library/yql/dq/expr_nodes/dq_expr_nodes.h>
 #include <ydb/library/yql/providers/dq/expr_nodes/dqs_expr_nodes.h>
 #include <ydb/public/sdk/cpp/include/ydb-cpp-sdk/client/value/value.h>
 
 #include <yql/essentials/core/yql_expr_optimize.h>
 #include <yql/essentials/core/yql_expr_type_annotation.h>
+#include <yql/essentials/core/yql_module_helpers.h>
 #include <yql/essentials/core/yql_opt_utils.h>
 #include <yql/essentials/providers/common/config/transformer/yql_configuration_transformer.h>
 #include <yql/essentials/providers/common/dq/yql_dq_integration_impl.h>
@@ -59,6 +61,36 @@ bool IsShowCreate(const TExprNode& read) {
         return false;
     }
     return !GetShowCreateSetting(*read.Child(TKiReadTable::idx_Settings)).empty();
+}
+
+TExprNode::TPtr BuildChecksum(const TExprNode::TPtr& input, const TExprNode& setting,
+                             TTypeAnnotationContext& types, TExprContext& ctx) {
+    const auto pos = setting.Pos();
+    auto factory = ImportDeeplyCopied(ctx.GetPosition(pos), "/lib/yql/digest.sql", "$DigestFactory", ctx, types);
+    if (!factory) {
+        return nullptr;
+    }
+
+    auto row = ctx.NewArgument(pos, "row");
+    auto value = ctx.NewCallable(pos, "RemoveSystemMembers", {row});
+    if (setting.Child(2)->ChildrenSize()) {
+        value = ctx.NewCallable(pos, "RemovePrefixMembers", {value, setting.ChildPtr(2)});
+    }
+    auto extractor = ctx.NewLambda(pos, ctx.NewArguments(pos, {row}),
+                                   ctx.NewCallable(pos, "PersistableRepr", {value}));
+    factory = ctx.NewCallable(pos, "Apply", {factory, ctx.NewCallable(pos, "String", {setting.ChildPtr(1)})});
+    auto itemType = ctx.NewCallable(pos, "ListItemType", {ctx.NewCallable(pos, "TypeOf", {input})});
+    auto traits = ctx.NewCallable(pos, "Apply", {factory, itemType, extractor});
+    auto handler = ctx.NewList(pos, {ctx.NewAtom(pos, "digest"), traits});
+    auto aggregate = ctx.NewCallable(pos, "Aggregate", {
+        input, ctx.NewList(pos, {}), ctx.NewList(pos, {handler}), ctx.NewList(pos, {})
+    });
+
+    auto result = ctx.NewArgument(pos, "row");
+    auto project = ctx.NewLambda(pos, ctx.NewArguments(pos, {result}),
+                                 ctx.NewCallable(pos, "Member", {result, ctx.NewAtom(pos, "digest")}));
+    ctx.Step.Repeat(TExprStep::ExpandApplyForLambdas);
+    return ctx.NewCallable(pos, "Map", {aggregate, project});
 }
 
 class TKiSourceIntentDeterminationTransformer: public TKiSourceVisitorTransformer {
@@ -796,6 +828,37 @@ public:
         auto read = node->Child(0);
         if (!read->IsCallable(ReadName)) {
             ythrow yexception() << "Expected Read!";
+        }
+
+        if (read->ChildrenSize() > TKiReadTable::idx_Settings) {
+            const auto& settings = *read->Child(TKiReadTable::idx_Settings);
+            if (auto checksum = GetSetting(settings, "checksum")) {
+                if (!EnsureTupleSize(*checksum, 3, ctx) || !EnsureAtom(*checksum->Child(1), ctx) ||
+                    !EnsureTuple(*checksum->Child(2), ctx))
+                {
+                    return nullptr;
+                }
+                for (const auto& prefix : checksum->Child(2)->Children()) {
+                    if (!EnsureAtom(*prefix, ctx)) {
+                        return nullptr;
+                    }
+                }
+                try {
+                    NDigest::ParseAlgorithm(checksum->Child(1)->Content());
+                } catch (const yexception&) {
+                    ctx.AddError(TIssue(ctx.GetPosition(checksum->Pos()), TStringBuilder()
+                        << "Unsupported CHECKSUM TABLE algorithm: " << checksum->Child(1)->Content()));
+                    return nullptr;
+                }
+
+                auto normalRead = ctx.ChangeChild(*read, TKiReadTable::idx_Settings,
+                                                  RemoveSetting(settings, "checksum", ctx));
+                auto input = RewriteIO(ctx.ChangeChild(*node, 0, std::move(normalRead)), ctx);
+                if (!input || node->IsCallable(LeftName)) {
+                    return input;
+                }
+                return BuildChecksum(input, *checksum, Types, ctx);
+            }
         }
 
         TKiDataSource source(read->ChildPtr(1));

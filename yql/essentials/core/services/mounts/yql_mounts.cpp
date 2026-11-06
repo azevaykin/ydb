@@ -113,7 +113,6 @@ void LoadYqlDefaultMounts(TUserDataTable& userData) {
     AddLibraryFromResource(userData, "/lib/yql/core.yqls");
     AddLibraryFromResource(userData, "/lib/yql/walk_folders.yqls");
     AddLibraryFromResource(userData, "/lib/yql/spark.yqls");
-    AddLibraryFromResource(userData, "/lib/yql/digest.sql");
 }
 
 TUserDataTable GetYqlModuleResolverImpl(

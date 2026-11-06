@@ -1,6 +1,4 @@
-#pragma once
-
-#include "lib/aggregate.h"
+#include <ydb/library/table_digest/aggregate.h>
 
 #include <yql/essentials/public/udf/udf_helpers.h>
 #include <yql/essentials/public/udf/udf_type_inspection.h>
@@ -8,18 +6,21 @@
 #include <util/generic/yexception.h>
 #include <util/string/builder.h>
 
-namespace NYql::NDigest {
+namespace {
 
-inline constexpr char AggregateResourceName[] = "Digest.AggregateState";
+using namespace NYql;
+using namespace NYql::NDigest;
+
+constexpr char AggregateResourceName[] = "Digest.AggregateState";
 using TAggregateResource = NUdf::TBoxedResource<TState, AggregateResourceName>;
 
-inline TState& GetState(const NUdf::TUnboxedValuePod& value) {
+TState& GetState(const NUdf::TUnboxedValuePod& value) {
     Y_ENSURE(value.GetResourceTag() == NUdf::TStringRef(AggregateResourceName),
              "Invalid Digest aggregate state resource");
     return *static_cast<TState*>(value.GetResource());
 }
 
-inline NUdf::TUnboxedValue GetWritableState(const NUdf::TUnboxedValuePod& value) {
+NUdf::TUnboxedValue GetWritableState(const NUdf::TUnboxedValuePod& value) {
     const auto& state = GetState(value);
     // Constant initializers can share a resource across aggregate groups.
     if (value.RefCount() == 1) {
@@ -213,4 +214,14 @@ private:
     const TAggregateResultFields Fields_;
 };
 
-} // namespace NYql::NDigest
+SIMPLE_MODULE(TDigestAggregateModule,
+              TAggregateCreate,
+              TAggregateAddValue,
+              TAggregateMerge,
+              TAggregateSerialize,
+              TAggregateDeserialize,
+              TAggregateFinalize)
+
+} // namespace
+
+REGISTER_MODULES(TDigestAggregateModule)

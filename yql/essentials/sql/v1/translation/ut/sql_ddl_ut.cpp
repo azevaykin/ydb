@@ -1668,14 +1668,44 @@ Y_UNIT_TEST(DefaultAndAlgorithms) {
         const auto result = SqlToYql("CHECKSUM TABLE plato.Input WITH (ALGORITHM = \"" + algorithm + "\");");
         UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
         const auto ast = GetPrettyPrint(result);
-        UNIT_ASSERT_STRING_CONTAINS(ast, "/lib/yql/digest.sql");
-        UNIT_ASSERT_STRING_CONTAINS(ast, "Aggregate");
+        UNIT_ASSERT_STRING_CONTAINS(ast, "checksum");
         UNIT_ASSERT_STRING_CONTAINS(ast, "Read!");
         UNIT_ASSERT_STRING_CONTAINS(ast, algorithm);
+        UNIT_ASSERT(!ast.Contains("Aggregate"));
+        UNIT_ASSERT(!ast.Contains("/lib/yql/digest.sql"));
     }
     const auto result = SqlToYql("CHECKSUM TABLE plato.Input;");
     UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
     UNIT_ASSERT_STRING_CONTAINS(GetPrettyPrint(result), "CityHash64");
+}
+
+Y_UNIT_TEST(AlgorithmValidationBelongsToProvider) {
+    for (const TString algorithm : {"Unknown", "sha256"}) {
+        const auto result = SqlToYql("CHECKSUM TABLE plato.Input WITH (ALGORITHM = '" + algorithm + "');");
+        UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+        UNIT_ASSERT_STRING_CONTAINS(GetPrettyPrint(result), algorithm);
+    }
+}
+
+Y_UNIT_TEST(SystemColumnPrefixesArePassedToProvider) {
+    NSQLTranslation::TTranslationSettings settings;
+    settings.ExtraSystemColumnPrefixes = {"__ydb_row_id", "__internal_"};
+    const auto result = SqlToYqlWithSettings("CHECKSUM TABLE plato.Input;", settings);
+    UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+    const auto ast = GetPrettyPrint(result);
+    UNIT_ASSERT_STRING_CONTAINS(ast, "checksum");
+    UNIT_ASSERT_STRING_CONTAINS(ast, "__ydb_row_id");
+    UNIT_ASSERT_STRING_CONTAINS(ast, "__internal_");
+    UNIT_ASSERT(!ast.Contains("RemoveSystemMembers"));
+    UNIT_ASSERT(!ast.Contains("RemovePrefixMembers"));
+}
+
+Y_UNIT_TEST(ContextReadHintsArePreserved) {
+    const auto result = SqlToYql("PRAGMA DirectRead; CHECKSUM TABLE plato.Input;");
+    UNIT_ASSERT_C(result.IsOk(), Err2Str(result));
+    const auto ast = GetPrettyPrint(result);
+    UNIT_ASSERT_STRING_CONTAINS(ast, "checksum");
+    UNIT_ASSERT_STRING_CONTAINS(ast, "directread");
 }
 
 Y_UNIT_TEST(TableReferencesAndOptionCase) {
@@ -1696,9 +1726,7 @@ Y_UNIT_TEST(InvalidOptions) {
              {"UNKNOWN = 'Sha256'", "Unknown CHECKSUM TABLE setting"},
              {"ALGORITHM = 'Sha256', algorithm = 'CityHash64'", "Duplicate CHECKSUM TABLE setting"},
              {"ALGORITHM = 1", "CHECKSUM TABLE ALGORITHM value should be a string literal"},
-             {"ALGORITHM = Sha256", "CHECKSUM TABLE ALGORITHM value should be a string literal"},
-             {"ALGORITHM = 'Unknown'", "Unsupported CHECKSUM TABLE algorithm"},
-             {"ALGORITHM = 'sha256'", "Unsupported CHECKSUM TABLE algorithm"}}) {
+             {"ALGORITHM = Sha256", "CHECKSUM TABLE ALGORITHM value should be a string literal"}}) {
         const auto result = SqlToYql("CHECKSUM TABLE plato.Input WITH (" + options + ");");
         UNIT_ASSERT(!result.IsOk());
         UNIT_ASSERT_STRING_CONTAINS(Err2Str(result), error);

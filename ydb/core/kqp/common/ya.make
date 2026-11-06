@@ -10,6 +10,8 @@ SRCS(
     kqp_event_impl.cpp
     kqp_lwtrace_probes.cpp
     kqp_lwtrace_probes.h
+    kqp_module_resolver.cpp
+    kqp_module_resolver.h
     kqp_resolve.cpp
     kqp_resolve.h
     kqp_row_builder.cpp
@@ -31,6 +33,7 @@ PEERDIR(
     library/cpp/json/writer
     library/cpp/lwtrace
     library/cpp/protobuf/json
+    library/cpp/resource
     library/cpp/threading/hot_swap
     ydb/core/base
     ydb/core/engine
@@ -56,6 +59,7 @@ PEERDIR(
     yql/essentials/core/dq_integration
     yql/essentials/core/issue
     yql/essentials/core/services
+    yql/essentials/core/services/mounts
     yql/essentials/minikql
     yql/essentials/parser/pg_wrapper/interface
     yql/essentials/public/issue
@@ -64,6 +68,10 @@ PEERDIR(
 GENERATE_ENUM_SERIALIZATION(kqp_tx_info.h)
 GENERATE_ENUM_SERIALIZATION(kqp_yql.h)
 GENERATE_ENUM_SERIALIZATION(kqp_resolve.h)
+
+RESOURCE(
+    ydb/library/yql/udfs/digest/aggregate.sql /lib/yql/digest.sql
+)
 
 END()
 

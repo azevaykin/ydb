@@ -1,7 +1,7 @@
 #pragma once
 
 #include <ydb/core/kqp/ut/common/kqp_ut_common.h>
-#include <yql/essentials/udfs/common/digest/lib/aggregate.h>
+#include <ydb/library/table_digest/aggregate.h>
 
 #include <library/cpp/resource/resource.h>
 

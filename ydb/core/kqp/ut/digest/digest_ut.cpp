@@ -1,5 +1,9 @@
 #include "digest_test_common.h"
 
+#include <ydb/core/kqp/common/kqp_module_resolver.h>
+
+#include <yql/essentials/core/services/mounts/yql_mounts.h>
+
 #include <util/digest/city.h>
 #include <util/string/hex.h>
 
@@ -100,6 +104,22 @@ TDataQueryResult QueryChecksum(TSession& session, TStringBuf table,
 } // namespace
 
 Y_UNIT_TEST_SUITE(Digest) {
+    Y_UNIT_TEST(FactoryModuleIsScopedToKqp) {
+        NYql::TExprContext yqlContext;
+        NYql::IModuleResolver::TPtr yqlResolver;
+        UNIT_ASSERT_C(NYql::GetYqlDefaultModuleResolver(yqlContext, yqlResolver),
+                      yqlContext.IssueManager.GetIssues().ToString());
+        UNIT_ASSERT(!yqlResolver->GetModule("/lib/yql/digest.sql"));
+
+        NYql::TExprContext kqpContext;
+        NYql::IModuleResolver::TPtr kqpResolver;
+        UNIT_ASSERT_C(GetKqpDefaultModuleResolver(kqpContext, kqpResolver),
+                      kqpContext.IssueManager.GetIssues().ToString());
+        const auto* module = kqpResolver->GetModule("/lib/yql/digest.sql");
+        UNIT_ASSERT(module);
+        UNIT_ASSERT(module->Symbols().contains("$DigestFactory"));
+    }
+
     Y_UNIT_TEST(AlgorithmsPartitionsAndRanges) {
         TKikimrRunner kikimr(TKikimrSettings().SetWithSampleTables(false));
         auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
@@ -266,14 +286,17 @@ Y_UNIT_TEST_SUITE(Digest) {
         auto session =
             kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
         PrepareTables(session);
-        const auto result =
-            session
-                .ExecuteDataQuery(
-                    "CHECKSUM TABLE digest_empty WITH (ALGORITHM = \"Sha512\");",
-                    TTxControl::BeginTx().CommitTx())
-                .GetValueSync();
-        UNIT_ASSERT(!result.IsSuccess());
-        UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(), "Sha512");
+        for (TStringBuf table : {"digest_a", "digest_empty"}) {
+            for (TStringBuf algorithm : {"Sha512", "sha256", ""}) {
+                const auto result = session.ExecuteDataQuery(
+                    TStringBuilder() << "CHECKSUM TABLE " << table
+                                     << " WITH (ALGORITHM = \"" << algorithm << "\");",
+                    TTxControl::BeginTx().CommitTx()).GetValueSync();
+                UNIT_ASSERT(!result.IsSuccess());
+                UNIT_ASSERT_STRING_CONTAINS(result.GetIssues().ToString(),
+                    TStringBuilder() << "Unsupported CHECKSUM TABLE algorithm: " << algorithm);
+            }
+        }
     }
 
     Y_UNIT_TEST(CommandQueryService) {
@@ -332,6 +355,33 @@ Y_UNIT_TEST_SUITE(Digest) {
                                  ExpectedDigest(algorithm));
                 }
             }
+        }
+    }
+
+    Y_UNIT_TEST(CommandIgnoresExtraSystemColumnPrefixes) {
+        TKikimrRunner kikimr(TKikimrSettings().SetWithSampleTables(false));
+        auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+        PrepareTables(session);
+        const auto schema = session.ExecuteSchemeQuery(R"(
+            CREATE TABLE digest_extra_system_columns (
+                key Uint64 NOT NULL, value Utf8, __ydb_row_id Uint64,
+                PRIMARY KEY (key)
+            );
+        )").GetValueSync();
+        UNIT_ASSERT_C(schema.IsSuccess(), schema.GetIssues().ToString());
+        const auto data = session.ExecuteDataQuery(R"(
+            UPSERT INTO digest_extra_system_columns (key, value)
+            SELECT key, value FROM digest_a;
+        )", TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(data.IsSuccess(), data.GetIssues().ToString());
+        // KQP configures __ydb_row_id as an extra system-column prefix.
+        const auto visible = session.ExecuteDataQuery("SELECT * FROM digest_extra_system_columns;",
+            TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(visible.IsSuccess(), visible.GetIssues().ToString());
+        UNIT_ASSERT_VALUES_EQUAL(visible.GetResultSet(0).ColumnsCount(), 2);
+        for (auto algorithm : {NDigest::EAlgorithm::CityHash64, NDigest::EAlgorithm::CityHash128, NDigest::EAlgorithm::Sha256}) {
+            const auto result = QueryChecksum(session, "digest_extra_system_columns", NDigest::GetAlgorithmName(algorithm));
+            AssertDigest(ReadChecksum(result.GetResultSet(0)), ExpectedDigest(algorithm));
         }
     }
 

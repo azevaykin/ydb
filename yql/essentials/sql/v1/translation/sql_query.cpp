@@ -1769,10 +1769,6 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
                     return false;
                 }
                 algorithm = *value.GetLiteral();
-                if (algorithm != "CityHash64" && algorithm != "CityHash128" && algorithm != "Sha256") {
-                    Error() << "Unsupported CHECKSUM TABLE algorithm: " << algorithm;
-                    return false;
-                }
                 algorithmSet = true;
                 return true;
             };
@@ -1792,11 +1788,15 @@ bool TSqlQuery::Statement(TVector<TNodePtr>& blocks, const TRule_sql_stmt_core& 
             if (!SimpleTableRefCoreImpl(rule.GetRule_simple_table_ref_core3(), table)) {
                 return false;
             }
-            const auto hints = GetContextHints(Ctx_);
-            if (!hints.empty()) {
-                table.Options = BuildInputOptions(pos, hints);
+            auto hints = GetContextHints(Ctx_);
+            TVector<TNodePtr> prefixes;
+            for (const auto& prefix : Ctx_.Settings.ExtraSystemColumnPrefixes) {
+                prefixes.push_back(BuildQuotedAtom(pos, prefix));
             }
-            auto source = BuildChecksumSource(pos, BuildTableSource(pos, table), algorithm);
+            hints["checksum"] = {BuildQuotedAtom(pos, algorithm), BuildQuote(pos, BuildList(pos, std::move(prefixes)))};
+            table.Options = BuildInputOptions(pos, hints);
+            auto source = BuildTableSource(pos, table);
+            source->AllColumns();
             blocks.push_back(BuildSelectResult(pos, std::move(source), /*writeResult=*/true, /*inSubquery=*/false, Ctx_.Scoped));
             break;
         }

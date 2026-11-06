@@ -2,13 +2,13 @@ $zero8 = "\x00\x00\x00\x00\x00\x00\x00\x00";
 $ones8 = "\xff\xff\xff\xff\xff\xff\xff\xff";
 
 $check = ($algorithm, $first, $second, $expected) -> {
-    $empty = Digest::AggregateCreate($algorithm);
-    $left = Digest::AggregateAddValue($empty, $first);
-    $right = Digest::AggregateAddValue($empty, $second);
-    $merged = Digest::AggregateFinalize(Digest::AggregateMerge($left, $right));
-    RETURN Digest::AggregateFinalize($empty).count = 0ul
-        AND Digest::AggregateFinalize($left).count = 1ul
-        AND Digest::AggregateFinalize($right).count = 1ul
+    $empty = DigestAggregate::AggregateCreate($algorithm);
+    $left = DigestAggregate::AggregateAddValue($empty, $first);
+    $right = DigestAggregate::AggregateAddValue($empty, $second);
+    $merged = DigestAggregate::AggregateFinalize(DigestAggregate::AggregateMerge($left, $right));
+    RETURN DigestAggregate::AggregateFinalize($empty).count = 0ul
+        AND DigestAggregate::AggregateFinalize($left).count = 1ul
+        AND DigestAggregate::AggregateFinalize($right).count = 1ul
         AND $merged.count = 2ul
         AND $merged.hash = $expected;
 };

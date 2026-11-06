@@ -323,7 +323,6 @@ TSourcePtr BuildSelectCore(
     TColumnsSets&& uniqueSets,
     TColumnsSets&& distinctSets);
 TSourcePtr BuildSelect(TPosition pos, TSourcePtr source, TNodePtr skipTake);
-TSourcePtr BuildChecksumSource(TPosition pos, TSourcePtr source, const TString& algorithm);
 TSourcePtr BuildAnyColumnSource(TPosition pos);
 TSourcePtr BuildWatermarkSource(TPosition pos, TSourcePtr src, TNodePtr watermarkLambda, TNodePtr watermarkSettings);
 

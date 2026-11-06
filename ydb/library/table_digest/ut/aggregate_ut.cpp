@@ -1,4 +1,4 @@
-#include <yql/essentials/udfs/common/digest/lib/aggregate.h>
+#include <ydb/library/table_digest/aggregate.h>
 
 #include <library/cpp/testing/unittest/registar.h>
 

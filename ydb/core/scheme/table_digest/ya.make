@@ -7,10 +7,10 @@ SRCS(
 PEERDIR(
     contrib/libs/openssl
     ydb/core/scheme
+    ydb/library/table_digest
     yql/essentials/minikql
     yql/essentials/minikql/computation
     yql/essentials/public/decimal
-    yql/essentials/udfs/common/digest/lib
 )
 
 YQL_LAST_ABI_VERSION()
