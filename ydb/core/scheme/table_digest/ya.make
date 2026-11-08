@@ -11,6 +11,7 @@ PEERDIR(
     yql/essentials/minikql
     yql/essentials/minikql/computation
     yql/essentials/public/decimal
+    yql/essentials/types/binary_json
 )
 
 YQL_LAST_ABI_VERSION()

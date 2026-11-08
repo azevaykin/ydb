@@ -38,5 +38,10 @@
         {
             "uri": "file://test.test_aggregate_types-Results_/results.txt"
         }
+    ],
+    "test.test[canonical_json-Results]": [
+        {
+            "uri": "file://test.test_canonical_json-Results_/results.txt"
+        }
     ]
 }

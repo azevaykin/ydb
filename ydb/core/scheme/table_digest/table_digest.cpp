@@ -1,5 +1,7 @@
 #include "table_digest.h"
 
+#include <ydb/library/table_digest/json_document.h>
+
 #include <yql/essentials/minikql/computation/mkql_computation_node_holders.h>
 #include <yql/essentials/minikql/computation/mkql_computation_node_pack.h>
 #include <yql/essentials/minikql/mkql_alloc.h>
@@ -58,6 +60,9 @@ NUdf::TUnboxedValue CellToValue(const NScheme::TTypeInfo &type,
              "Invalid Digest Decimal coefficient");
     return NUdf::TUnboxedValuePod(coefficient);
   }
+  case NTypeIds::JsonDocument:
+    return NMiniKQL::MakeString(
+        NYql::NDigest::CanonicalJsonDocument(cell.AsBuf()));
   case NTypeIds::Uuid:
     Y_ENSURE(cell.Size() == 16,
              "Invalid TableDigest Uuid cell size: " << cell.Size());
@@ -66,7 +71,6 @@ NUdf::TUnboxedValue CellToValue(const NScheme::TTypeInfo &type,
   case NTypeIds::Utf8:
   case NTypeIds::Yson:
   case NTypeIds::Json:
-  case NTypeIds::JsonDocument:
   case NTypeIds::DyNumber:
     return NMiniKQL::MakeString(NUdf::TStringRef(cell.Data(), cell.Size()));
   default:
@@ -107,7 +111,11 @@ struct TAccumulator::TImpl {
         type = NMiniKQL::TDataDecimalType::Create(decimal.GetPrecision(),
                                                   decimal.GetScale(), Env);
       } else {
-        type = NMiniKQL::TDataType::Create(column.Type.GetTypeId(), Env);
+        const auto packedType =
+            column.Type.GetTypeId() == NScheme::NTypeIds::JsonDocument
+                ? NScheme::NTypeIds::Json
+                : column.Type.GetTypeId();
+        type = NMiniKQL::TDataType::Create(packedType, Env);
       }
       if (column.Nullable) {
         type = NMiniKQL::TOptionalType::Create(type, Env);

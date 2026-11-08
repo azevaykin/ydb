@@ -1,4 +1,5 @@
 #include <ydb/core/scheme/table_digest/table_digest.h>
+#include <ydb/library/table_digest/json_document.h>
 
 #include <yql/essentials/types/binary_json/write.h>
 #include <yql/essentials/types/dynumber/dynumber.h>
@@ -146,6 +147,84 @@ Y_UNIT_TEST_SUITE(TNativeTableDigest) {
                            algorithm);
       renamed.AddRow(row);
       AssertSameState(renamed.GetState(), native.GetState());
+    }
+  }
+
+  Y_UNIT_TEST(JsonDocumentIgnoresBinaryDictionaryOrder) {
+    // Both documents encode [1,"alpha",2,"beta"]. The second reverses the
+    // string and number indexes and adjusts the four tree offsets accordingly.
+    const std::array<TString, 2> documents = {
+        HexDecode("0103000080000000e405000083030000e406000003040000"
+                  "0200000040050000e0050000616c706861006265746100"
+                  "000000000000f03f0000000000000040"),
+        HexDecode("0103000080000000e406000003040000e405000083030000"
+                  "0200000020050000e00500006265746100616c70686100"
+                  "0000000000000040000000000000f03f"),
+    };
+    UNIT_ASSERT(documents[0] != documents[1]);
+    const TString text = NBinaryJson::SerializeToJson(documents[0]);
+    for (const auto &document : documents) {
+      UNIT_ASSERT(NBinaryJson::IsValidBinaryJson(document));
+      UNIT_ASSERT_VALUES_EQUAL(NBinaryJson::SerializeToJson(document), text);
+    }
+    const auto restored = std::get<NBinaryJson::TBinaryJson>(
+        NBinaryJson::SerializeToBinaryJson(text));
+
+    for (auto algorithm :
+         {NDigest::EAlgorithm::CityHash64, NDigest::EAlgorithm::CityHash128,
+          NDigest::EAlgorithm::Sha256}) {
+      auto calculate = [&](NScheme::TTypeId typeId, TStringBuf value) {
+        TAccumulator accumulator({{"doc", TTypeInfo(typeId), true}}, algorithm);
+        accumulator.AddRow({TCell(value.data(), value.size())});
+        accumulator.AddRow(TVector<TCell>(1));
+        return accumulator.GetState();
+      };
+      const auto expected = calculate(NTypeIds::Json, text);
+      for (const auto &document : documents) {
+        AssertSameState(calculate(NTypeIds::JsonDocument, document), expected);
+      }
+      AssertSameState(calculate(NTypeIds::JsonDocument,
+                                TStringBuf(restored.Data(), restored.Size())),
+                      expected);
+    }
+  }
+
+  Y_UNIT_TEST(JsonDocumentCanonicalTextPreservesMembers) {
+    const TStringBuf text =
+        R"({"a":[true,false,null,{"k":1,"k":1.0000000000000002}],"s":"мир"})";
+    const auto document = std::get<NBinaryJson::TBinaryJson>(
+        NBinaryJson::SerializeToBinaryJson(text));
+    UNIT_ASSERT_VALUES_EQUAL(NDigest::CanonicalJsonDocument(
+        TStringBuf(document.Data(), document.Size())), text);
+  }
+
+  Y_UNIT_TEST(JsonDocumentPreservesDoublePrecision) {
+    const std::array<TString, 2> documents = {
+        HexDecode("81010000220000000402000000000000000000000000f03f"),
+        HexDecode("81010000220000000402000000000000010000000000f03f"),
+    };
+    const TStringBuf texts[] = {"1", "1.0000000000000002"};
+    for (const auto &document : documents) {
+      UNIT_ASSERT(NBinaryJson::IsValidBinaryJson(document));
+    }
+    for (auto algorithm :
+         {NDigest::EAlgorithm::CityHash64, NDigest::EAlgorithm::CityHash128,
+          NDigest::EAlgorithm::Sha256}) {
+      TString previousHash;
+      for (size_t i = 0; i < documents.size(); ++i) {
+        TAccumulator native({{"doc", TTypeInfo(NTypeIds::JsonDocument), false}},
+                            algorithm);
+        native.AddRow({TCell(documents[i].data(), documents[i].size())});
+        TAccumulator expected({{"doc", TTypeInfo(NTypeIds::Json), false}},
+                              algorithm);
+        expected.AddRow({TCell(texts[i].data(), texts[i].size())});
+        AssertSameState(native.GetState(), expected.GetState());
+        const auto hash = native.GetState().GetHashBytes();
+        if (i) {
+          UNIT_ASSERT(hash != previousHash);
+        }
+        previousHash = hash;
+      }
     }
   }
 

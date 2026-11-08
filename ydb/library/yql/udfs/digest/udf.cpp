@@ -1,3 +1,5 @@
+#include "canonicalize.h"
+
 #include <ydb/library/table_digest/aggregate.h>
 
 #include <yql/essentials/public/udf/udf_helpers.h>
@@ -58,6 +60,52 @@ private:
                                         const NUdf::TUnboxedValuePod* args) const = 0;
 
     const NUdf::TSourcePosition Pos_;
+};
+
+class TCanonicalize: public TAggregateFunction {
+public:
+    using TTypeAwareMarker = bool;
+
+    TCanonicalize(TCanonicalizePlan plan, NUdf::TSourcePosition pos)
+        : TAggregateFunction(pos)
+        , Plan_(std::move(plan))
+    {
+    }
+
+    static const NUdf::TStringRef& Name() {
+        static const auto name = NUdf::TStringRef::Of("Canonicalize");
+        return name;
+    }
+
+    static bool DeclareSignature(const NUdf::TStringRef& name, NUdf::TType* userType,
+                                 NUdf::IFunctionTypeInfoBuilder& builder, bool typesOnly) {
+        if (name != Name()) {
+            return false;
+        }
+        Y_ENSURE(userType, "Digest canonicalization requires its input type");
+        const auto helper = builder.TypeInfoHelper();
+        const NUdf::TTupleTypeInspector user(*helper, userType);
+        Y_ENSURE(user && user.GetElementsCount() == 3, "Invalid Digest canonicalization user type");
+        const NUdf::TTupleTypeInspector args(*helper, user.GetElementType(0));
+        Y_ENSURE(args && args.GetElementsCount() == 1, "Canonicalize expects one argument");
+        const auto* inputType = args.GetElementType(0);
+        auto plan = TCanonicalizePlan::Build(inputType, builder);
+        builder.UserType(userType);
+        builder.Args(1)->Add(inputType).Done();
+        builder.Returns(plan.GetResultType());
+        if (!typesOnly) {
+            builder.Implementation(new TCanonicalize(std::move(plan), NUdf::GetSourcePosition(builder)));
+        }
+        return true;
+    }
+
+private:
+    NUdf::TUnboxedValue RunImpl(const NUdf::IValueBuilder* builder,
+                                const NUdf::TUnboxedValuePod* args) const override {
+        return Plan_.Apply(builder, args[0]);
+    }
+
+    const TCanonicalizePlan Plan_;
 };
 
 class TAggregateAddValue: public TAggregateFunction {
@@ -215,6 +263,7 @@ private:
 };
 
 SIMPLE_MODULE(TDigestAggregateModule,
+              TCanonicalize,
               TAggregateCreate,
               TAggregateAddValue,
               TAggregateMerge,

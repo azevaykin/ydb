@@ -232,6 +232,48 @@ Y_UNIT_TEST_SUITE(Digest) {
         }
     }
 
+    Y_UNIT_TEST(CanonicalizationIsTypeDirectedInPhysicalPlan) {
+        TKikimrRunner kikimr(TKikimrSettings().SetWithSampleTables(false));
+        auto session = kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+        PrepareTables(session);
+        const auto schema = session.ExecuteSchemeQuery(R"(
+            CREATE TABLE digest_json_doc (
+                key Uint64 NOT NULL, doc JsonDocument, PRIMARY KEY (key)
+            );
+        )").GetValueSync();
+        UNIT_ASSERT_C(schema.IsSuccess(), schema.GetIssues().ToString());
+        const auto data = session.ExecuteDataQuery(R"(
+            UPSERT INTO digest_json_doc (key, doc)
+            VALUES (1, JsonDocument('[1,"alpha",2,"beta"]')), (2, NULL);
+        )", TTxControl::BeginTx().CommitTx()).GetValueSync();
+        UNIT_ASSERT_C(data.IsSuccess(), data.GetIssues().ToString());
+
+        for (auto algorithm : {NDigest::EAlgorithm::CityHash64, NDigest::EAlgorithm::CityHash128, NDigest::EAlgorithm::Sha256}) {
+            const auto name = NDigest::GetAlgorithmName(algorithm);
+            auto direct = [&](TStringBuf row, TStringBuf table) -> TString {
+                return TStringBuilder() << DigestFactorySql() << "SELECT "
+                                        << DigestExpression(row, name) << " FROM " << table << ";";
+            };
+            const TVector<std::pair<TString, bool>> cases = {
+                {ChecksumStatement("digest_a", name), false},
+                {direct("TableRow()", "digest_a"), false},
+                {direct("AsStruct(AsList(value) AS `JsonDocument`)", "digest_a"), false},
+                {ChecksumStatement("digest_json_doc", name), true},
+                {direct("AsStruct(AsList(doc) AS nested)", "digest_json_doc"), true},
+            };
+            for (const auto& [query, needsCanonicalization] : cases) {
+                const auto result = session.ExplainDataQuery(query).GetValueSync();
+                UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+                const auto& ast = result.GetAst();
+                UNIT_ASSERT(!ast.empty());
+                UNIT_ASSERT_STRING_CONTAINS(ast, "DigestAggregate.AggregateAddValue");
+                UNIT_ASSERT_VALUES_EQUAL_C(
+                    ast.find("DigestAggregate.Canonicalize") != std::string::npos,
+                    needsCanonicalization, TStringBuilder() << query << "\n" << ast);
+            }
+        }
+    }
+
     Y_UNIT_TEST(CommandResolvesTablePaths) {
         TKikimrRunner kikimr(TKikimrSettings().SetWithSampleTables(false));
         auto session =

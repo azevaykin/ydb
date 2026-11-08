@@ -5,6 +5,9 @@
 #include <yql/essentials/types/dynumber/dynumber.h>
 
 #include <util/string/cast.h>
+#include <util/string/hex.h>
+
+#include <string>
 
 namespace NKikimr::NKqp {
 namespace {
@@ -136,6 +139,214 @@ Y_UNIT_TEST_SUITE(DigestNativeParity) {
               .GetValueSync();
       UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
       AssertDigest(ReadDigest(result.GetResultSet(0)), native.GetState());
+    }
+  }
+
+  Y_UNIT_TEST(JsonDocumentBinaryLayoutsAndTextRestore) {
+    // Same array, different physical order of the string and number indexes.
+    const std::array<TString, 2> documents = {
+        HexDecode("0103000080000000e405000083030000e406000003040000"
+                  "0200000040050000e0050000616c706861006265746100"
+                  "000000000000f03f0000000000000040"),
+        HexDecode("0103000080000000e406000003040000e405000083030000"
+                  "0200000020050000e00500006265746100616c70686100"
+                  "0000000000000040000000000000f03f"),
+    };
+    UNIT_ASSERT(documents[0] != documents[1]);
+    const TString text = NBinaryJson::SerializeToJson(documents[0]);
+    for (const auto &document : documents) {
+      UNIT_ASSERT(NBinaryJson::IsValidBinaryJson(document));
+      UNIT_ASSERT_VALUES_EQUAL(NBinaryJson::SerializeToJson(document), text);
+    }
+
+    TKikimrRunner kikimr(TKikimrSettings().SetWithSampleTables(false));
+    auto session =
+        kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+    const auto schema = session
+                            .ExecuteSchemeQuery(R"(
+      CREATE TABLE json_original (key Uint64 NOT NULL, doc JsonDocument, PRIMARY KEY (key));
+      CREATE TABLE json_reordered (key Uint64 NOT NULL, doc JsonDocument, PRIMARY KEY (key));
+      CREATE TABLE json_restored (key Uint64 NOT NULL, doc JsonDocument, PRIMARY KEY (key));
+    )")
+                            .GetValueSync();
+    UNIT_ASSERT_C(schema.IsSuccess(), schema.GetIssues().ToString());
+    const TStringBuf tables[] = {"json_original", "json_reordered"};
+    for (size_t i = 0; i < documents.size(); ++i) {
+      const auto params =
+          TParamsBuilder()
+              .AddParam("$bytes")
+              .String(std::string(documents[i].data(), documents[i].size()))
+              .Build()
+              .Build();
+      // String and JsonDocument use the same existing pickle representation.
+      // Unpickle preserves the fixture bytes instead of reparsing JSON text.
+      const auto inserted =
+          session
+              .ExecuteDataQuery(
+                  TStringBuilder()
+                      << "DECLARE $bytes AS String; UPSERT INTO " << tables[i]
+                      << " (key, doc) VALUES (1, Unpickle(JsonDocument, "
+                         "StablePickle($bytes))), (2, NULL);",
+                  TTxControl::BeginTx().CommitTx(), params)
+              .GetValueSync();
+      UNIT_ASSERT_C(inserted.IsSuccess(), inserted.GetIssues().ToString());
+    }
+
+    // Public JsonDocument values are exported as text, then parsed again on
+    // import.
+    const auto exported =
+        session
+            .ExecuteDataQuery("SELECT doc FROM json_original WHERE key = 1;",
+                              TTxControl::BeginTx().CommitTx())
+            .GetValueSync();
+    UNIT_ASSERT_C(exported.IsSuccess(), exported.GetIssues().ToString());
+    TResultSetParser rows(exported.GetResultSet(0));
+    UNIT_ASSERT(rows.TryNextRow());
+    const auto exportedText =
+        rows.ColumnParser("doc").GetOptionalJsonDocument();
+    UNIT_ASSERT(exportedText);
+    UNIT_ASSERT_VALUES_EQUAL(TString(*exportedText), text);
+    UNIT_ASSERT(!rows.TryNextRow());
+    const auto restoredParams = TParamsBuilder()
+                                    .AddParam("$doc")
+                                    .JsonDocument(*exportedText)
+                                    .Build()
+                                    .Build();
+    const auto restored = session
+                              .ExecuteDataQuery(R"(
+      DECLARE $doc AS JsonDocument;
+      UPSERT INTO json_restored (key, doc) VALUES (1, $doc), (2, NULL);
+    )", TTxControl::BeginTx().CommitTx(), restoredParams)
+                              .GetValueSync();
+    UNIT_ASSERT_C(restored.IsSuccess(), restored.GetIssues().ToString());
+
+    for (auto algorithm :
+         {NDigest::EAlgorithm::CityHash64, NDigest::EAlgorithm::CityHash128,
+          NDigest::EAlgorithm::Sha256}) {
+      const TVector<NNative::TColumn> columns = {
+          {"key", TTypeInfo(NTypeIds::Uint64), false},
+          {"doc", TTypeInfo(NTypeIds::JsonDocument), true},
+      };
+      NNative::TAccumulator native(columns, algorithm);
+      native.AddRow({TCell::Make(ui64(1)),
+                     TCell(documents[0].data(), documents[0].size())});
+      native.AddRow({TCell::Make(ui64(2)), TCell()});
+      for (const auto &document : documents) {
+        const auto params =
+            TParamsBuilder()
+                .AddParam("$bytes")
+                .String(std::string(document.data(), document.size()))
+                .Build()
+                .Build();
+        const auto result =
+            session
+                .ExecuteDataQuery(
+                    TStringBuilder()
+                        << "DECLARE $bytes AS String;\n"
+                        << DigestFactorySql()
+                        << "$data = (SELECT 1ul AS key, "
+                           "Just(Unpickle(JsonDocument, StablePickle($bytes))) "
+                           "AS doc "
+                        << "UNION ALL SELECT 2ul AS key, CAST(NULL AS "
+                           "JsonDocument?) AS doc);\n"
+                        << "SELECT AGGREGATE_BY(TableRow(), $DigestFactory(\""
+                        << NDigest::GetAlgorithmName(algorithm)
+                        << "\")) FROM $data;", TTxControl::BeginTx().CommitTx(),
+                    params)
+                .GetValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        AssertDigest(ReadDigest(result.GetResultSet(0)), native.GetState());
+      }
+      for (TStringBuf table :
+           {"json_original", "json_reordered", "json_restored"}) {
+        const auto result =
+            session
+                .ExecuteDataQuery(
+                    TStringBuilder()
+                        << "CHECKSUM TABLE " << table << " WITH (ALGORITHM = \""
+                        << NDigest::GetAlgorithmName(algorithm)
+                        << "\");", TTxControl::BeginTx().CommitTx())
+                .GetValueSync();
+        UNIT_ASSERT_C(result.IsSuccess(), result.GetIssues().ToString());
+        AssertDigest(ReadChecksum(result.GetResultSet(0)), native.GetState());
+      }
+    }
+  }
+
+  Y_UNIT_TEST(JsonDocumentPreservesDoublePrecision) {
+    // These adjacent double values collapse under 16-significant-digit output.
+    const std::array<TString, 2> documents = {
+        HexDecode("81010000220000000402000000000000000000000000f03f"),
+        HexDecode("81010000220000000402000000000000010000000000f03f"),
+    };
+    const TStringBuf texts[] = {"1", "1.0000000000000002"};
+    TKikimrRunner kikimr(TKikimrSettings().SetWithSampleTables(false));
+    auto session =
+        kikimr.GetTableClient().CreateSession().GetValueSync().GetSession();
+    const auto schema = session
+                            .ExecuteSchemeQuery(R"(
+      CREATE TABLE json_precision (key Uint64 NOT NULL, doc JsonDocument, PRIMARY KEY (key));
+    )")
+                            .GetValueSync();
+    UNIT_ASSERT_C(schema.IsSuccess(), schema.GetIssues().ToString());
+    TVector<TString> previousHashes;
+    for (size_t i = 0; i < documents.size(); ++i) {
+      UNIT_ASSERT(NBinaryJson::IsValidBinaryJson(documents[i]));
+      const auto params =
+          TParamsBuilder()
+              .AddParam("$doc")
+              .JsonDocument(std::string(texts[i].data(), texts[i].size()))
+              .Build()
+              .Build();
+      const auto inserted = session
+                                .ExecuteDataQuery(R"(
+        DECLARE $doc AS JsonDocument;
+        UPSERT INTO json_precision (key, doc) VALUES (1, $doc);
+      )", TTxControl::BeginTx().CommitTx(), params)
+                                .GetValueSync();
+      UNIT_ASSERT_C(inserted.IsSuccess(), inserted.GetIssues().ToString());
+      size_t algorithmIndex = 0;
+      for (auto algorithm :
+           {NDigest::EAlgorithm::CityHash64, NDigest::EAlgorithm::CityHash128,
+            NDigest::EAlgorithm::Sha256}) {
+        NNative::TAccumulator native(
+            {{"key", TTypeInfo(NTypeIds::Uint64), false},
+             {"doc", TTypeInfo(NTypeIds::JsonDocument), true}}, algorithm);
+        native.AddRow({TCell::Make(ui64(1)),
+                       TCell(documents[i].data(), documents[i].size())});
+        const auto direct =
+            session
+                .ExecuteDataQuery(
+                    TStringBuilder()
+                        << "DECLARE $doc AS JsonDocument;\n"
+                        << DigestFactorySql()
+                        << "$data = AsList(AsStruct(1ul AS key, Just($doc) AS "
+                           "doc));\n"
+                        << "SELECT AGGREGATE_BY(TableRow(), $DigestFactory(\""
+                        << NDigest::GetAlgorithmName(algorithm)
+                        << "\")) FROM AS_TABLE($data);",
+                    TTxControl::BeginTx().CommitTx(), params)
+                .GetValueSync();
+        UNIT_ASSERT_C(direct.IsSuccess(), direct.GetIssues().ToString());
+        AssertDigest(ReadDigest(direct.GetResultSet(0)), native.GetState());
+        const auto command =
+            session
+                .ExecuteDataQuery(
+                    TStringBuilder()
+                        << "CHECKSUM TABLE json_precision WITH (ALGORITHM = \""
+                        << NDigest::GetAlgorithmName(algorithm)
+                        << "\");", TTxControl::BeginTx().CommitTx())
+                .GetValueSync();
+        UNIT_ASSERT_C(command.IsSuccess(), command.GetIssues().ToString());
+        const auto digest = ReadChecksum(command.GetResultSet(0));
+        AssertDigest(digest, native.GetState());
+        if (!i) {
+          previousHashes.push_back(digest.Hash);
+        } else {
+          UNIT_ASSERT(digest.Hash != previousHashes[algorithmIndex]);
+        }
+        ++algorithmIndex;
+      }
     }
   }
 }

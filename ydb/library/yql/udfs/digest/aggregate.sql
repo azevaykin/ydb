@@ -1,6 +1,13 @@
+PRAGMA Warning("disable", "4510");
+
 $DigestFactory = ($algorithm) -> {
     $add = ($state, $row) -> {
-        $bytes = StablePickle($row);
+        -- IfType selects a branch during compilation; TypeOf never evaluates the value.
+        $bytes = YQL::IfType(
+            $row, TypeOf(DigestAggregate::Canonicalize($row)),
+            ($value) -> (StablePickle($value)),
+            ($value) -> (StablePickle(DigestAggregate::Canonicalize($value)))
+        );
         RETURN CASE $algorithm
             WHEN "CityHash64" THEN DigestAggregate::AggregateAddValue($state, Digest::CityHash($bytes))
             WHEN "CityHash128" THEN DigestAggregate::AggregateAddValue($state, Digest::CityHash128($bytes))

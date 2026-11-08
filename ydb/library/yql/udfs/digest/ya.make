@@ -7,11 +7,13 @@ YQL_ABI_VERSION(
 )
 
 SRCS(
+    canonicalize.h
     udf.cpp
 )
 
 PEERDIR(
     ydb/library/table_digest
+    yql/essentials/types/binary_json
 )
 
 END()
