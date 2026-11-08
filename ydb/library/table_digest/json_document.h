@@ -63,10 +63,11 @@ inline void WriteCanonicalJson(const NKikimr::NBinaryJson::TContainerCursor& cur
 } // namespace NDetail
 
 // Decode the logical document instead of hashing its physical string/number
-// indexes. Shortest-roundtrip formatting preserves every stored double value.
-inline TString CanonicalJsonDocument(TStringBuf document) {
+// indexes. Shortest-roundtrip formatting preserves finite double values.
+inline TString CanonicalJsonDocument(TStringBuf document, bool writeNanAsString = false) {
     NJson::TJsonWriterConfig config;
     config.FloatToStringMode = PREC_AUTO;
+    config.WriteNanAsString = writeNanAsString;
     TStringStream output;
     NJson::TJsonWriter writer(&output, config);
     const auto reader = NKikimr::NBinaryJson::TBinaryJsonReader::Make(document);
